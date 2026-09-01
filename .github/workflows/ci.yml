@@ -1,0 +1,42 @@
+name: release-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  portable:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build and runtime dependencies
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install '.[test]'
+      - name: Verify exported files
+        run: |
+          if test -f PUBLIC_MANIFEST.sha256; then sha256sum --check PUBLIC_MANIFEST.sha256; fi
+      - name: Run portable release tests
+        run: |
+          python3 -m pytest -q \
+            tests/test_hello_ot_public_api.py \
+            tests/test_hello_ot_dependency_boundary.py \
+            tests/test_hello_ot_numerical_equivalence.py \
+            tests/release_tooling_test.py \
+            tests/torch_backend_end_to_end_test.py \
+            tests/torch_packaging_test.py \
+            tests/torch_prewarm_test.py \
+            tests/torch_restricted_ot_pdlp_test.py \
+            tests/torch_scan_test.py \
+            tests/hello_inplace_feature_layout_test.py
+      - name: Build portable wheel and source distribution
+        run: python3 -m build
+      - name: Run quickstart from the installed package
+        run: python3 examples/quickstart.py

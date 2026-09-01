@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hello-ot"
+version = "0.1.0rc2"
+description = "HELLO: dual-guided hierarchical optimal transport with native CUDA and portable PyTorch backends"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+dependencies = [
+    "numpy>=1.26,<3",
+    "scipy>=1.11,<2",
+    "torch>=2.5",
+    "POT>=0.9.7,<1",
+    "numba>=0.59,<1",
+]
+
+[project.optional-dependencies]
+experiments = ["pyyaml>=6", "pandas>=2", "matplotlib>=3.8"]
+test = ["pytest>=8"]
+native-build = ["ninja>=1.11", "pybind11==2.12.*"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hello_ot*"]

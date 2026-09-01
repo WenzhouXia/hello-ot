@@ -1,0 +1,361 @@
+/*
+Copyright 2025 Haihao Lu
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <getopt.h>
+#include <string.h>
+#include <libgen.h>
+#include "io.h"
+#include "cupdlpx.h"
+#include "struct.h"
+#include "solver.h"
+
+const char *termination_reason_tToString(termination_reason_t reason)
+{
+    switch (reason)
+    {
+    case TERMINATION_REASON_OPTIMAL:
+        return "OPTIMAL";
+    case TERMINATION_REASON_PRIMAL_INFEASIBLE:
+        return "PRIMAL_INFEASIBLE";
+    case TERMINATION_REASON_DUAL_INFEASIBLE:
+        return "DUAL_INFEASIBLE";
+    case TERMINATION_REASON_TIME_LIMIT:
+        return "TIME_LIMIT";
+    case TERMINATION_REASON_ITERATION_LIMIT:
+        return "ITERATION_LIMIT";
+    case TERMINATION_REASON_SUPPORT_LIMIT_REACHED:
+        return "SUPPORT_LIMIT_REACHED";
+    case TERMINATION_REASON_OPTIMAL_WITH_SUPPORT_LIMIT:
+        return "OPTIMAL_WITH_SUPPORT_LIMIT";
+    case TERMINATION_REASON_NUMERICAL_DIVERGENCE:
+        return "NUMERICAL_DIVERGENCE";
+    case TERMINATION_REASON_UNSPECIFIED:
+    default:
+        return "UNSPECIFIED";
+    }
+}
+
+char *get_output_path(const char *output_dir, const char *instance_name, const char *suffix)
+{
+    size_t path_len = strlen(output_dir) + strlen(instance_name) + strlen(suffix) + 2;
+    char *full_path = safe_malloc(path_len * sizeof(char));
+    snprintf(full_path, path_len, "%s/%s%s", output_dir, instance_name, suffix);
+    return full_path;
+}
+
+char *extract_instance_name(const char *filename)
+{
+    char *filename_copy = strdup(filename);
+    if (filename_copy == NULL)
+    {
+        perror("Memory allocation failed");
+        return NULL;
+    }
+
+    char *base = basename(filename_copy);
+    char *dot = strchr(base, '.');
+    if (dot)
+    {
+        *dot = '\0';
+    }
+
+    char *instance_name = strdup(base);
+    free(filename_copy);
+    return instance_name;
+}
+
+void save_solution(const double *data_d, int size, const char *output_dir,
+                   const char *instance_name, const char *suffix)
+{
+    char *file_path = get_output_path(output_dir, instance_name, suffix);
+    if (file_path == NULL)
+    {
+        return;
+    }
+
+    FILE *outfile = fopen(file_path, "w");
+    if (outfile == NULL)
+    {
+        perror("Error opening solution file");
+        free(file_path);
+        return;
+    }
+
+    double *solution_host = (double *)safe_malloc(size * sizeof(double));
+    CUDA_CHECK(cudaMemcpy(solution_host, data_d, size * sizeof(double), cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < size; ++i)
+    {
+        fprintf(outfile, "%.10g\n", solution_host[i]);
+    }
+
+    fclose(outfile);
+    free(file_path);
+    free(solution_host);
+}
+
+void save_solver_summary(const pdhg_solver_state_t *solver_state, const char *output_dir, const char *instance_name)
+{
+    char *file_path = get_output_path(output_dir, instance_name, "_summary.txt");
+    if (file_path == NULL)
+    {
+        return;
+    }
+
+    FILE *outfile = fopen(file_path, "w");
+    if (outfile == NULL)
+    {
+        perror("Error opening summary file");
+        free(file_path);
+        return;
+    }
+    fprintf(outfile, "Termination Reason: %s\n", termination_reason_tToString(solver_state->termination_reason));
+    fprintf(outfile, "Runtime (sec): %e\n", solver_state->cumulative_time_sec);
+    fprintf(outfile, "Iterations Count: %d\n", solver_state->total_count);
+    fprintf(outfile, "Primal Objective Value: %e\n", solver_state->primal_objective_value);
+    fprintf(outfile, "Dual Objective Value: %e\n", solver_state->dual_objective_value);
+    fprintf(outfile, "Absolute Primal Residual: %e\n", solver_state->absolute_primal_residual);
+    fprintf(outfile, "Relative Primal Residual: %e\n", solver_state->relative_primal_residual);
+    fprintf(outfile, "Absolute Dual Residual: %e\n", solver_state->absolute_dual_residual);
+    fprintf(outfile, "Relative Dual Residual: %e\n", solver_state->relative_dual_residual);
+    fprintf(outfile, "Termination Norm: %s\n", solver_state->termination_norm == TERMINATION_NORM_L_INF ? "linf" : "l2");
+    fprintf(outfile, "Termination Relative Primal Residual: %e\n", solver_state->termination_relative_primal_residual);
+    fprintf(outfile, "Termination Relative Dual Residual: %e\n", solver_state->termination_relative_dual_residual);
+    fprintf(outfile, "Absolute Objective Gap: %e\n", solver_state->objective_gap);
+    fprintf(outfile, "Relative Objective Gap: %e\n", solver_state->relative_objective_gap);
+    fclose(outfile);
+    free(file_path);
+}
+void print_solver_summary(const pdhg_solver_state_t *solver_state)
+{
+    printf("Termination Reason: %s\n", termination_reason_tToString(solver_state->termination_reason));
+    printf("Runtime (sec): %e\n", solver_state->cumulative_time_sec);
+    printf("Iterations Count: %d\n", solver_state->total_count);
+    printf("Primal Objective Value: %e\n", solver_state->primal_objective_value);
+    printf("Dual Objective Value: %e\n", solver_state->dual_objective_value);
+    printf("Absolute Primal Residual: %e\n", solver_state->absolute_primal_residual);
+    printf("Relative Primal Residual: %e\n", solver_state->relative_primal_residual);
+    printf("Absolute Dual Residual: %e\n", solver_state->absolute_dual_residual);
+    printf("Relative Dual Residual: %e\n", solver_state->relative_dual_residual);
+    printf("Termination Norm: %s\n", solver_state->termination_norm == TERMINATION_NORM_L_INF ? "linf" : "l2");
+    printf("Termination Relative Primal Residual: %e\n", solver_state->termination_relative_primal_residual);
+    printf("Termination Relative Dual Residual: %e\n", solver_state->termination_relative_dual_residual);
+    printf("Absolute Objective Gap: %e\n", solver_state->objective_gap);
+    printf("Relative Objective Gap: %e\n", solver_state->relative_objective_gap);
+}
+void set_default_parameters(pdhg_parameters_t *params)
+{
+    params->l_inf_ruiz_iterations = 10;
+    params->has_pock_chambolle_alpha = true;
+    params->pock_chambolle_alpha = 1.0;
+    params->bound_objective_rescaling = true;
+    params->verbose = false;
+    params->termination_evaluation_frequency = 200;
+    params->termination_norm = TERMINATION_NORM_L2;
+    params->reflection_coefficient = 1.0;
+
+    params->termination_criteria.eps_optimal_relative = 1e-4;
+    params->termination_criteria.eps_feasible_relative = 1e-4;
+    params->termination_criteria.eps_feasible_relative_primal = 1e-4;
+    params->termination_criteria.eps_feasible_relative_dual = 1e-4;
+    params->termination_criteria.eps_infeasible = 1e-10;
+    params->termination_criteria.time_sec_limit = 3600.0;
+    params->termination_criteria.iteration_limit = INT32_MAX;
+
+    params->restart_params.artificial_restart_threshold = 0.36;
+    params->restart_params.sufficient_reduction_for_restart = 0.2;
+    params->restart_params.necessary_reduction_for_restart = 0.5;
+    params->restart_params.k_p = 0.99;
+    // params->restart_params.k_p = 0.2;
+    params->restart_params.k_i = 0.01;
+    params->restart_params.k_d = 0.0;
+    params->restart_params.i_smooth = 0.3;
+
+    params->initial_primal_unscaled = NULL;
+    params->initial_dual_unscaled = NULL;
+    params->has_initial_iterate = false;
+    params->continuation.anchor_primal_unscaled = NULL;
+    params->continuation.anchor_dual_unscaled = NULL;
+    params->continuation.current_primal_unscaled = NULL;
+    params->continuation.current_dual_unscaled = NULL;
+    params->continuation.has_anchor_primal = false;
+    params->continuation.has_anchor_dual = false;
+    params->continuation.has_current_primal = false;
+    params->continuation.has_current_dual = false;
+    params->continuation.enabled = false;
+    params->continuation.reuse_step_size = false;
+    params->continuation.apply_restart_on_entry = false;
+    params->continuation.step_size = 0.0;
+    params->continuation.primal_weight = 0.0;
+    params->continuation.primal_weight_error_sum = 0.0;
+    params->continuation.primal_weight_last_error = 0.0;
+    params->continuation.best_primal_weight = 0.0;
+    params->continuation.best_primal_dual_residual_gap = 0.0;
+    params->continuation.previous_restart_dual_residual = 0.0;
+    params->continuation.previous_restart_gap = 0.0;
+    params->continuation.total_count = 0;
+    params->continuation.inner_count = 0;
+    params->has_continuation = false;
+
+    // ****** 新增默认值：checkSparsity相关 ******
+    params->termination_criteria.use_dual_nnz_gate = 0;
+    params->termination_criteria.dual_nnz_factor = 2.0;
+    params->termination_criteria.dual_nnz_abs_tol = 0.0;
+
+    // CN: 这一组步长默认值与 Python wrapper 里的通用默认保持严格一致，
+    // CN: 这样无论是 host loadData、device loadData_device_csr，还是直接调用底层 cupdlpx，都不会出现默认值分叉。
+    // EN: Keep this step-size default bundle strictly aligned with the common defaults in the Python wrapper,
+    // EN: so host loadData, device loadData_device_csr, and direct low-level cupdlpx calls all share the same behavior.
+    params->step_size_method = STEP_SIZE_CONSTANT;
+    params->step_size_safety = 0.998;
+
+    params->power_max_iterations = 5000;
+    params->power_tolerance = 1e-4;
+    params->hybrid_refine_iterations = 100;
+
+    params->stepsize_power_reference = 0;
+    params->stepsize_reference_max_iterations = 5000;
+    params->stepsize_reference_tolerance = 1e-4;
+    params->trace_enabled = false;
+    params->trace_max_snapshots = 100;
+    params->support_stop_nnz = 0;
+    params->support_stop_threshold = 1e-8;
+    // CN: 暂时沿用旧参数名；当前语义是 support-stop 触发时要求 0 < (primal-dual)/primal <= tol。
+    // EN: Temporarily keep the legacy parameter name; its current meaning is the support-stop condition 0 < (primal-dual)/primal <= tol.
+    params->support_stop_obj_rel_change_tol = 1e-3;
+    params->support_limit_mode = SUPPORT_LIMIT_MODE_OPTIMAL_ONLY;
+    params->enable_objective_gap_divergence_check = false;
+    params->vector_sum_mode = VECTOR_SUM_RESIDENT_ONES;
+}
+
+void print_usage(const char *prog_name)
+{
+    fprintf(stderr, "Usage: %s [OPTIONS] <mps_file> <output_dir>\n\n", prog_name);
+
+    fprintf(stderr, "Arguments:\n");
+    fprintf(stderr, "  <mps_file>               Path to the input problem in MPS format (.mps or .mps.gz).\n");
+    fprintf(stderr, "  <output_dir>             Directory where output files will be saved. It will contain:\n");
+    fprintf(stderr, "                             - <basename>_summary.txt\n");
+    fprintf(stderr, "                             - <basename>_primal_solution.txt\n");
+    fprintf(stderr, "                             - <basename>_dual_solution.txt\n\n");
+
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -h, --help                          Display this help message.\n");
+    fprintf(stderr, "  -v, --verbose                       Enable verbose logging (default: false).\n");
+    fprintf(stderr, "      --time_limit <seconds>          Time limit in seconds (default: 3600.0).\n");
+    fprintf(stderr, "      --iter_limit <iterations>       Iteration limit (default: %d).\n", INT32_MAX);
+    fprintf(stderr, "      --eps_opt <tolerance>           Relative optimality tolerance (default: 1e-4).\n");
+    fprintf(stderr, "      --eps_feas <tolerance>          Relative feasibility tolerance (default: 1e-4).\n");
+    fprintf(stderr, "      --eps_infeas_detect <tolerance> Infeasibility detection tolerance (default: 1e-10).\n");
+}
+
+int main(int argc, char *argv[])
+{
+    pdhg_parameters_t params;
+    set_default_parameters(&params);
+
+    static struct option long_options[] = {
+        {"help", no_argument, 0, 'h'},
+        {"verbose", no_argument, 0, 'v'},
+        {"time_limit", required_argument, 0, 1001},
+        {"iter_limit", required_argument, 0, 1002},
+        {"eps_opt", required_argument, 0, 1003},
+        {"eps_feas", required_argument, 0, 1004},
+        {"eps_infeas_detect", required_argument, 0, 1005},
+        {0, 0, 0, 0}};
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "hv", long_options, NULL)) != -1)
+    {
+        switch (opt)
+        {
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        case 'v':
+            params.verbose = true;
+            break;
+        case 1001: // --time_limit
+            params.termination_criteria.time_sec_limit = atof(optarg);
+            break;
+        case 1002: // --iter_limit
+            params.termination_criteria.iteration_limit = atoi(optarg);
+            break;
+        case 1003: // --eps_optimal
+            params.termination_criteria.eps_optimal_relative = atof(optarg);
+            break;
+        case 1004: // --eps_feas
+            params.termination_criteria.eps_feasible_relative = atof(optarg);
+            break;
+        case 1005: // --eps_infeas_detect
+            params.termination_criteria.eps_infeasible = atof(optarg);
+            break;
+        case '?': // Unknown option
+            return 1;
+        }
+    }
+
+    if (argc - optind != 2)
+    {
+        fprintf(stderr, "Error: You must specify an input file and an output directory.\n\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const char *filename = argv[optind];
+    const char *output_dir = argv[optind + 1];
+
+    char *instance_name = extract_instance_name(filename);
+    if (instance_name == NULL)
+    {
+        return 1;
+    }
+
+    lp_problem_t *problem = read_mps_file(filename);
+
+    if (problem == NULL)
+    {
+        fprintf(stderr, "Failed to read or parse the file.\n");
+        free(instance_name);
+        return 1;
+    }
+
+    pdhg_solver_state_t *solver_state = optimize(&params, problem);
+
+    if (solver_state == NULL)
+    {
+        fprintf(stderr, "Solver failed.\n");
+    }
+    else
+    {
+        save_solver_summary(solver_state, output_dir, instance_name);
+        // print_solver_summary(solver_state);
+        save_solution(solver_state->pdhg_primal_solution, problem->num_variables, output_dir,
+                      instance_name, "_primal_solution.txt");
+        save_solution(solver_state->pdhg_dual_solution, problem->num_constraints, output_dir,
+                      instance_name, "_dual_solution.txt");
+        pdhg_solver_state_free(solver_state);
+    }
+
+    lp_problem_free(problem);
+    free(instance_name);
+
+    return 0;
+}

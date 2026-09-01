@@ -1,0 +1,24 @@
+include LICENSE
+include THIRD_PARTY_NOTICES.md
+include README.zh-CN.md
+include TERMINOLOGY.md
+include docs/algorithm.md
+include examples/quickstart.py
+include examples/verify_native.py
+include scripts/build_native_wheel.sh
+include scripts/export_public.py
+include scripts/validate_release.py
+recursive-include experiments *.py *.json *.md
+include tests/hello_inplace_feature_layout_test.py
+include tests/test_hello_ot_public_api.py
+include tests/test_hello_ot_dependency_boundary.py
+include tests/test_hello_ot_numerical_equivalence.py
+include tests/release_tooling_test.py
+include tests/torch_backend_end_to_end_test.py
+include tests/torch_packaging_test.py
+include tests/torch_prewarm_test.py
+include tests/torch_restricted_ot_pdlp_test.py
+include tests/torch_scan_test.py
+recursive-include src/hello_ot/_native *.c *.cpp *.cu *.h *.md LICENSE
+prune src/hierarchical_ot
+prune paper_experiments
