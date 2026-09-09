@@ -4,20 +4,82 @@ EN: Run HELLO on a device with only PyTorch, POT, and basic scientific packages.
 
 from __future__ import annotations
 
+import argparse
+from collections.abc import Sequence
+
 import numpy as np
 
 import hello_ot
 
 
-def _brenier_problem(*, size: int, dimension: int, seed: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _positive_int(value: str) -> int:
+    """
+    CN: 解析严格为正的命令行整数。
+    EN: Parse a strictly positive command-line integer.
+    """
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _hierarchical_size(value: str) -> int:
+    """
+    CN: 要求 quickstart 规模足以触发 hierarchy。
+    EN: Require a quickstart size large enough to trigger the hierarchy.
+    """
+    parsed = int(value)
+    if parsed <= 1024:
+        raise argparse.ArgumentTypeError(
+            "must be greater than 1024 to trigger the hierarchy"
+        )
+    return parsed
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """
+    CN: 解析 quickstart 的问题规模、代价与 backend。
+    EN: Parse the quickstart problem size, cost, and backend.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run HELLO on a synthetic Brenier problem."
+    )
+    parser.add_argument(
+        "--n",
+        type=_hierarchical_size,
+        default=2048,
+        help="points per marginal (default: 2048)",
+    )
+    parser.add_argument(
+        "--dim",
+        type=_positive_int,
+        default=32,
+        help="point dimension (default: 32)",
+    )
+    parser.add_argument(
+        "--cost-type",
+        choices=("l2^2", "l2", "l1", "linf"),
+        default="l2^2",
+        help="ground cost (default: l2^2)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("native", "torch"),
+        default="torch",
+        help="solver backend (default: torch)",
+    )
+    return parser.parse_args(argv)
+
+
+def _brenier_problem(*, n: int, dim: int, seed: int) -> tuple[np.ndarray, np.ndarray, float]:
     """
     CN: 生成严格凸 Brenier 映射 T(x)=x+2 tanh(x) 对应的离散 OT 问题。
     EN: Generate a discrete OT problem from the strictly convex Brenier map T(x)=x+2 tanh(x).
     """
     rng = np.random.default_rng(seed)
-    source = rng.normal(size=(size, dimension)).astype(np.float32)
+    source = rng.normal(size=(n, dim)).astype(np.float32)
     mapped = source + np.float32(2.0) * np.tanh(source)
-    target = mapped[rng.permutation(size)]
+    target = mapped[rng.permutation(n)]
     displacement = source.astype(np.float64) - mapped.astype(np.float64)
     ground_truth_objective = float(np.mean(np.sum(displacement * displacement, axis=1)))
     return np.ascontiguousarray(source), np.ascontiguousarray(target), ground_truth_objective
@@ -52,36 +114,55 @@ def _elapsed(value: float) -> str:
     return f"{value:.2f}s" if value < 10.0 else f"{value:.1f}s"
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """
-    CN: 显式选择 portable Torch backend，并打印可复核的求解摘要。
-    EN: Explicitly select the portable Torch backend and print a checkable solve summary.
+    CN: 在可选 backend 上求解合成问题，并打印可复核的求解摘要。
+    EN: Solve the synthetic problem on the selected backend and print a checkable summary.
     """
-    size = 2048
-    dimension = 32
+    args = _parse_args(argv)
+    n = args.n
+    dim = args.dim
+    cost_type = args.cost_type
+    backend = args.backend
     seed = 42
     source, target, ground_truth_objective = _brenier_problem(
-        size=size, dimension=dimension, seed=seed
+        n=n, dim=dim, seed=seed
     )
     options = hello_ot.SolverOptions(
-        backend="torch",
+        backend=backend,
         torch_device="auto",
         coarsest_size_threshold=1024,
         cost_perturbation="auto",
         verbose="compact",
     )
-    result = hello_ot.solve(source, target, cost="l2^2", random_seed=seed, options=options)
+    result = hello_ot.solve(
+        source,
+        target,
+        cost=cost_type,
+        random_seed=seed,
+        options=options,
+    )
     pfeas, dfeas, gap, kkt = _final_diagnostics(result)
     perturbation = dict(result.metadata["cost_perturbation"])
-    relative_objective_error = abs(result.objective - ground_truth_objective) / abs(ground_truth_objective)
 
     print("Quickstart result")
+    print(f"problem: n={n} dim={dim} cost={cost_type}")
     print(f"backend: {result.metadata['backend']}")
     print(f"device: {result.metadata['device']}")
-    print(f"cost perturbation: policy={perturbation['policy']} activated={perturbation['activated']}")
+    print(
+        "cost perturbation: "
+        f"policy={perturbation['policy']} activated={perturbation['activated']}"
+    )
     print(f"objective: {result.objective:.8f}")
-    print(f"ground-truth objective: {ground_truth_objective:.8f}")
-    print(f"relative objective error: {relative_objective_error:.2e}")
+    if cost_type == "l2^2":
+        relative_objective_error = (
+            abs(result.objective - ground_truth_objective)
+            / abs(ground_truth_objective)
+        )
+        print(f"ground-truth objective: {ground_truth_objective:.8f}")
+        print(f"relative objective error: {relative_objective_error:.2e}")
+    else:
+        print("ground-truth objective: unavailable (Brenier certificate requires l2^2)")
     print(f"primal feasibility: {pfeas:.2e}")
     print(f"dual feasibility: {dfeas:.2e}")
     print(f"primal-dual gap: {gap:.2e}")

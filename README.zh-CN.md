@@ -35,21 +35,20 @@ quickstart 使用显式 `backend="torch"`，规模为 `2048×2048, d=32`。它�
 
 ## Native wheel
 
-`v0.1.0-rc2` 的目标环境为 Linux x86-64（glibc 2.29 或更新）、Python 3.10/3.11、PyTorch 2.5.1+cu118，并包含 `sm_80`、`sm_86`、`sm_89`、`sm_90` 与最高目标 PTX，覆盖 A100、RTX 3080 Ti/3090、RTX 4060 Ti/4090 和 H100。这个候选版本使用平台相关的 `linux_x86_64` tag，不宣称是 manylinux wheel。
+`v0.1.0` 的目标环境为 Linux x86-64（glibc 2.29 或更新）、Python 3.10/3.11、PyTorch 2.5.1+cu118，并包含 `sm_80`、`sm_86`、`sm_89`、`sm_90` 与最高目标 PTX，覆盖 A100、RTX 3080 Ti/3090、RTX 4060 Ti/4090 和 H100。这个版本使用平台相关的 `linux_x86_64` tag，不宣称是 manylinux wheel。
 
-先安装指定 PyTorch，再安装与 Python 版本匹配的 GitHub Release wheel：
+先安装指定 PyTorch，再执行与 Python 版本对应的一行命令。当前 Release 是滚动开发构建，`--no-cache-dir --force-reinstall` 会取得最新 wheel：
 
 ```bash
 python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu118
-python3 -m pip install --no-deps --only-binary=:all: ./hello_ot-0.1.0rc2-*.whl
+# Python 3.10
+python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp310-cp310-linux_x86_64.whl
+# Python 3.11
+python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp311-cp311-linux_x86_64.whl
 python3 -m hello_ot.diagnose --require-native
 python3 examples/verify_native.py
 python3 scripts/validate_release.py --backend both --output hello_ot_validation.json
 ```
-
-WSL2 使用同一个 Linux wheel，CUDA driver 来自 Windows 主机；不要在 WSL2 内安装 Linux NVIDIA display driver。首版不支持原生 Windows Python。
-
-portable `torch` backend 可以使用包元数据允许的较新 PyTorch；预编译 native wheel 则与上述发行矩阵的 ABI 绑定。PyTorch/CUDA runtime 不匹配时，程序会在加载扩展前明确报错。
 
 需要从源码构建时：
 
@@ -59,8 +58,3 @@ scripts/build_native_wheel.sh dist
 ```
 
 源码构建需要 CUDA 11.8、兼容的 C++ compiler、Ninja 和 pybind11；安装预编译 wheel 不需要这些工具。
-
-算法与代码的对应关系见 `docs/algorithm.md`，公开实验入口见 `export_experiments/README.md`。
-
-完整实验复现请使用 GitHub 仓库；wheel 和 sdist 用于安装、构建 HELLO 包，不附带实验套件。
-后续 GPU 检查、wheel 验收及内部 adapter 迁移见 [发布清单](docs/release_checklist.md)。

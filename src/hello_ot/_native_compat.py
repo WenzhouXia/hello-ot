@@ -33,6 +33,6 @@ def require_native_runtime_compatibility() -> None:
     compatible, detail = native_runtime_compatibility()
     if not compatible:
         raise RuntimeError(
-            "The native backend requires the v0.1.0-rc2 binary compatibility stack: "
+            "The native backend requires the v0.1.0 binary compatibility stack: "
             f"{detail}. The explicit torch backend remains available."
         )

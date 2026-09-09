@@ -70,13 +70,16 @@ python3 -m pip install '.[native-build]'
 scripts/build_native_wheel.sh dist
 ```
 
-The `v0.1.0-rc2` native wheels target Linux x86-64 with glibc 2.29 or newer, Python 3.10/3.11, PyTorch 2.5.1+cu118, and CUDA compute capabilities 8.0, 8.6, 8.9, and 9.0, with PTX at 9.0 for forward compatibility. This covers A100, RTX 3080 Ti/3090, RTX 4060 Ti/4090, and H100. These release-candidate wheels use the platform-specific `linux_x86_64` tag rather than a manylinux tag. Building from source needs CUDA 11.8, a compatible C++ compiler, Ninja, and pybind11; installing a prebuilt wheel does not.
+The `v0.1.0` native wheels target Linux x86-64 with glibc 2.29 or newer, Python 3.10/3.11, PyTorch 2.5.1+cu118, and CUDA compute capabilities 8.0, 8.6, 8.9, and 9.0, with PTX at 9.0 for forward compatibility. This covers A100, RTX 3080 Ti/3090, RTX 4060 Ti/4090, and H100. These wheels use the platform-specific `linux_x86_64` tag rather than a manylinux tag. Building from source needs CUDA 11.8, a compatible C++ compiler, Ninja, and pybind11; installing a prebuilt wheel does not.
 
-Install PyTorch first, then the wheel matching the Python version from the GitHub Release:
+Install PyTorch first, then run the line matching the Python version. The release is a rolling development build, so `--no-cache-dir --force-reinstall` always fetches its current wheel:
 
 ```bash
 python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu118
-python3 -m pip install --no-deps --only-binary=:all: ./hello_ot-0.1.0rc2-*.whl
+# Python 3.10
+python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp310-cp310-linux_x86_64.whl
+# Python 3.11
+python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp311-cp311-linux_x86_64.whl
 python3 -m hello_ot.diagnose --require-native
 python3 examples/verify_native.py
 ```

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hello-ot"
-version = "0.1.0rc2"
+version = "0.1.0"
 description = "HELLO: dual-guided hierarchical optimal transport with native CUDA and portable PyTorch backends"
 readme = "README.md"
 requires-python = ">=3.10"
