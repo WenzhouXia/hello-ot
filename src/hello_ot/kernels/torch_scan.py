@@ -174,6 +174,7 @@ def directional_assignment(
     topk: int,
     device: str | torch.device,
     max_tile_bytes: int = 64 * 1024 * 1024,
+    perturbation: Optional[dict[str, Any]] = None,
 ) -> tuple[GPUWarmStartState, dict[str, Any], dict[str, Any], TorchCompletionCandidate]:
     """
     CN: 用共享 blockwise dual-score primitive 执行一个方向的 dual assignment。
@@ -213,6 +214,8 @@ def directional_assignment(
                     target_offset=None if target_bias is None else target_bias[target_start:target_stop],
                     dot_scale=dot_scale,
                 )
+                if perturbation is not None:
+                    cost = _perturb_tile(cost, perturbation, source_start, target_start)
                 score = dual[n_source + target_start : n_source + target_stop][None, :] - cost
                 local_values, local_indices = _merge_topk(
                     local_values,
@@ -245,6 +248,8 @@ def directional_assignment(
                     target_offset=None if target_bias is None else target_bias[target_start:target_stop],
                     dot_scale=dot_scale,
                 )
+                if perturbation is not None:
+                    cost = _perturb_tile(cost, perturbation, source_start, target_start)
                 score = dual[source_start:source_stop][:, None] - cost
                 local_values, local_indices = _merge_topk(
                     local_values,
@@ -341,6 +346,7 @@ def bidirectional_violation_scan(
     device: str | torch.device,
     collect_linf_diagnostics: bool = True,
     max_tile_bytes: int = 64 * 1024 * 1024,
+    perturbation: Optional[dict[str, Any]] = None,
 ) -> TorchViolationScan:
     """
     CN: 一次 blockwise traversal 同时计算双向违例候选和 full dual-feasibility certificate。
@@ -385,6 +391,8 @@ def bidirectional_violation_scan(
                 target_offset=None if target_bias is None else target_bias[target_start:target_stop],
                 dot_scale=dot_scale,
             )
+            if perturbation is not None:
+                cost = _perturb_tile(cost, perturbation, source_start, target_start)
             score = (
                 source_dual_t[source_start:source_stop, None]
                 + target_dual_t[None, target_start:target_stop]
@@ -470,3 +478,19 @@ __all__ = [
     "directional_assignment",
     "resolve_torch_device",
 ]
+
+
+def _perturb_tile(cost: torch.Tensor, perturbation: dict, source_start: int, target_start: int) -> torch.Tensor:
+    """
+    CN: 在当前有界 tile 上生成全局边噪声，与稀疏边成本共用定义。
+    EN: Generate global-edge noise for this bounded tile using the sparse-cost definition.
+    """
+    from .norm_cost_scan import _apply_metric_pair_perturbation
+
+    perturbation = {**perturbation,
+                    "source_global_index": perturbation["source_global_index"][source_start:source_start + cost.shape[0]],
+                    "target_global_index": perturbation["target_global_index"][target_start:target_start + cost.shape[1]]}
+    rows = torch.arange(cost.shape[0], device=cost.device)
+    cols = torch.arange(cost.shape[1], device=cost.device)
+    rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+    return _apply_metric_pair_perturbation(cost.reshape(-1), rr.reshape(-1), cc.reshape(-1), perturbation).reshape(cost.shape)

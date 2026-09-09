@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import time
 import sys
-from contextlib import nullcontext
+import time
+from contextlib import nullcontext, redirect_stdout
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
@@ -10,7 +10,7 @@ import torch
 
 from hello_ot._internal.trace import _ChromeTraceCollector
 from hello_ot._internal.instrumentation.memory_accounting import use_solve_memory_tracker
-from hello_ot.config import SolverRuntimeConfig
+from hello_ot.config import SolverRuntimeConfig, finest_stopping_norm
 
 from .algorithm import _solve_hello_stage
 from .cost import (
@@ -24,6 +24,7 @@ from .types import (
     ActiveSupportStats,
     BudgetedPruningStats,
     CoarsestSolveStats,
+    CostStageResult,
     ConvergenceStats,
     DualViolationStats,
     Result,
@@ -128,8 +129,14 @@ def _iteration_stats(records: Iterable[Mapping[str, Any]], *, config: _Algorithm
             IterationStats(
                 index=int(record.get("iter", len(output) + 1)),
                 objective=float(record.get("objective", float("nan"))),
-                wall_time=float(record.get("lp_time", 0.0)) + sum(float(v or 0.0) for v in components.values()),
+                wall_time=float(
+                    record.get(
+                        "wall_time",
+                        float(record.get("lp_time", 0.0)) + sum(float(v or 0.0) for v in components.values()),
+                    )
+                ),
                 bookkeeping_time=float(components.get("state_update", 0.0)) + float(components.get("convergence_check", 0.0)),
+                full_scan_time=float(record.get("full_scan_time", 0.0) or 0.0),
                 solve_lp=SolveLPStats(
                     wall_time=float(record.get("lp_time", 0.0)),
                     backend_iterations=(None if record.get("lp_iters") is None else int(record["lp_iters"])),
@@ -203,7 +210,7 @@ def _stage_result(
     for traversal_index, raw_level in enumerate(raw_levels):
         # CN: tuple 保持执行顺序 coarsest->finest；论文层号固定 finest=0。
         # EN: Keep tuple traversal coarsest->finest while paper level indices use finest=0.
-        level_index = int(len(raw_levels) - 1 - traversal_index)
+        level_index = int(raw_level.get("depth", len(raw_levels) - 1 - traversal_index))
         kind = str(raw_level.get("kind", "node"))
         n_source = int(raw_level.get("n_source", 0))
         n_target = int(raw_level.get("n_target", 0))
@@ -240,11 +247,19 @@ def _stage_result(
                 n_source=n_source,
                 n_target=n_target,
                 initialization=InitializationStats(
-                    wall_time=sum(float(value or 0.0) for value in components.values()),
+                    wall_time=float(
+                        raw_level.get(
+                            "initialization_time",
+                            sum(float(value or 0.0) for value in components.values()),
+                        )
+                    ),
                     dual_propagation_time=float((raw_level.get("dual_completion_profile") or {}).get("total_time", 0.0) or 0.0),
                     dual_assignment_time=float((raw_level.get("augment_profile") or {}).get("total_time", 0.0) or 0.0),
                     northwest_augmentation_time=float(components.get("bfs_skeleton", 0.0) or 0.0),
-                    inherited_dual_side=("target" if raw_level.get("split_axis") == "source" else "source"),
+                    inherited_dual_side=(
+                        None if raw_level.get("split_axis") == "both" else
+                        "target" if raw_level.get("split_axis") == "source" else "source"
+                    ),
                     assignment_topk=int(config.assignment_topk),
                     support_after_forward=support_after_forward,
                     support_after_reverse=(None if reverse_value is None else int(reverse_value)),
@@ -259,7 +274,7 @@ def _stage_result(
                         final_objective=float(solve_summary.get("distance", float("nan"))),
                         final_active_support_size=int(raw_level.get("support_after_solve", 0) or 0),
                         peak_active_support_size=max((item.support.peak for item in iterations), default=support_before),
-                        stop_reason="converged" if converged else "max_refinement_iterations",
+                        stop_reason=raw_level.get("stop_reason", "converged" if converged else "max_refinement_iterations"),
                         converged=converged,
                     ),
                 ),
@@ -335,23 +350,24 @@ def _solve_raw(
             assignment_topk=int(config.assignment_topk),
             split_count=int(config.split_count),
             dual_feasibility_tol=float(config.dual_feasibility_tolerance),
-            finest_dual_feasibility_norm=config.dual_feasibility_norm,
-            finest_lp_stopping_norm=config.lp_stopping_norm,
+            stopping_norm=config.stopping_norm,
             node_seed=int(config.random_seed),
             tracer=tracer,
             pricing_index_pool=None,
             log=True,
             return_coupling=True,
             return_state=True,
-            progress=bool(config.verbose),
+            progress=config.verbose == "detailed",
             consume_input_features=bool(config.consume_input_features),
+            cost_perturbation=config.cost_perturbation,
+            cost_perturbation_relative_scale=config.cost_perturbation_relative_scale,
     )
     if not isinstance(raw, dict):
         raise RuntimeError("HELLO runtime did not return its structured result.")
     return raw, (None if tracer is None else TraceResult(tracer.export()))
 
 
-def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> Result:
+def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> Result:
     if config.backend == "native":
         from hello_ot._native_compat import require_native_runtime_compatibility
 
@@ -360,17 +376,18 @@ def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> R
         solve_device = torch.device("cuda", torch.cuda.current_device())
     else:
         solve_device = resolve_torch_device(config.torch_device)
-        print(
-            f"[hello_ot] backend=torch device={solve_device}",
-            file=sys.stderr,
-            flush=True,
-        )
-        print(
-            "[hello_ot] Portable PyTorch backend selected; timings are not representative "
-            "of the native paper backend.",
-            file=sys.stderr,
-            flush=True,
-        )
+    from .progress import report_final, report_header
+
+    report_header(
+        config.verbose,
+        backend=str(config.backend),
+        device=str(solve_device),
+        cost=_reported_cost_type(problem),
+        n_source=int(problem.shape[0]),
+        n_target=int(problem.shape[1]),
+        dimension=int(_cost_runtime(problem).source_points.shape[1]),
+        perturbation=config.cost_perturbation,
+    )
     if solve_device.type == "cuda":
         _synchronize_cuda_for_timing()
     memory_enabled = bool(config.profile_memory)
@@ -385,19 +402,21 @@ def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> R
             memory_tracker.start()
         started = time.perf_counter()
         stage_started = time.perf_counter()
-        try:
+        output_context = redirect_stdout(sys.stderr) if config.verbose == "detailed" else nullcontext()
+        with output_context:
             raw, trace = _solve_raw(problem, config)
-        except Exception:
-            if config.backend == "torch":
-                print("[hello_ot] backend=torch failed", file=sys.stderr, flush=True)
-            raise
         if solve_device.type == "cuda":
             _synchronize_cuda_for_timing()
         stage_wall_time = float(time.perf_counter() - stage_started)
+        cost_stages = tuple(
+            CostStageResult(item["name"], _stage_result(
+                {"hello_diagnostics": {"levels": item["levels"]}}, config=config, wall_time=item["wall_time"]
+            )) for item in raw.get("cost_stages", [])
+        )
         stage = _stage_result(
             raw,
             config=config,
-            wall_time=stage_wall_time,
+            wall_time=cost_stages[-1].solve.wall_time if cost_stages else stage_wall_time,
         )
         solution = _solution(raw, shape=problem.shape)
         if solve_device.type == "cuda":
@@ -420,8 +439,17 @@ def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> R
         "device": str(solve_device),
         "coarsest_solver": "pot",
         "consume_input_features": bool(config.consume_input_features),
+        "stopping_norm": str(config.stopping_norm),
+        "intermediate_stopping_norm": "l2",
+        "finest_stopping_norm": finest_stopping_norm(config.stopping_norm),
+        "cost_perturbation": raw.get("cost_perturbation", {"policy": "off", "activated": False}),
+        "total_lp_solve_time": float(raw.get("lp_solve_time_total", 0.0)),
+        "total_refinement_iterations": sum(
+            len(level.solve.iterations) for cost_stage in cost_stages
+            for level in cost_stage.solve.levels if isinstance(level.solve, RefinementResult)
+        ),
     }
-    if memory_summary is not None and bool(config.verbose):
+    if memory_summary is not None and config.verbose == "detailed":
         metadata["memory_debug"] = memory_summary
     result = Result(
         objective=float(raw.get("distance", float("nan"))),
@@ -431,14 +459,25 @@ def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> R
         peak_gpu_memory_mib=peak_gpu_memory_mib,
         trace=trace,
         metadata=metadata,
+        cost_stages=cost_stages,
     )
-    if config.backend == "torch":
-        print(
-            f"[hello_ot] backend=torch finished in {total_wall_time:.3f}s",
-            file=sys.stderr,
-            flush=True,
-        )
+    report_final(config.verbose, result)
     return result
+
+
+def _solve(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> Result:
+    """
+    CN: 在公开输出边界报告失败，同时保留原始异常与 traceback。
+    EN: Report failures at the public output boundary while preserving the original exception and traceback.
+    """
+    started = time.perf_counter()
+    try:
+        return _solve_impl(problem, config)
+    except Exception as error:
+        from .progress import report_failure
+
+        report_failure(config.verbose, error, time.perf_counter() - started)
+        raise
 
 
 def solve_problem(problem: Problem, config: _AlgorithmConfig) -> Result:

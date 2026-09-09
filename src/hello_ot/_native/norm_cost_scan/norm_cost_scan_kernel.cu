@@ -11,25 +11,29 @@ namespace {
 
 // CN: 方案D 两套 kernel：
 //   A. d <= 32：block 对应一个 query 行，thread-per-column，query 行放 shared
-//      memory（采用固定容量的局部 top-k 归并结构）。
+//      memory（结构借鉴 faiss_fused_kernel.cu 的 update_topk_stats_kernel）。
 //   B. d > 32：block 处理一组 R 个 query 行（每 warp 一行），db 按列分块进
 //      shared memory 复用，每 warp 在列分片上按维度分片计算距离并维护该行 top-k。
-// 两者都在 kernel 内就地计算 l1/linf/l2 距离，并减去对偶。
+// 两者都在 kernel 内就地计算 l1/linf/l2 距离 + 可选 cost perturbation
+// （rank2 / index_hash，按 (row, col) 全局索引即时生成噪声），并减去对偶。
 // EN: Plan D uses two kernels:
 //   A. d <= 32: one block per query row, thread-per-column, query row in shared
-//      memory (using a fixed-capacity local top-k merge structure).
+//      memory (structure borrowed from update_topk_stats_kernel).
 //   B. d > 32: one block per group of R query rows (one warp per row); db columns
 //      are tiled into shared memory for reuse, each warp computes distances over
 //      lane-sliced dimensions and maintains the row's top-k.
-// Both compute l1/linf/l2 distance on the fly and subtract the database dual
-// inside the kernel.
+// Both compute l1/linf/l2 distance on the fly, optionally add cost perturbation
+// (rank2 / index_hash, generated per (row, col) global index pair), and subtract
+// the database dual inside the kernel.
 constexpr int kSmallThreads = 128;
 constexpr int kSmallThreadsK32 = 64;
 constexpr int kLargeThreads = 256;
 constexpr int kLargeRows = 8;
 constexpr int64_t kThreadPerColMaxD = 32;
+constexpr int kMaxTopK = 32;
 
 enum CostKind { kL1 = 0, kLinf = 1, kL2 = 2 };
+enum PerturbMode { kRank2 = 0, kIndexHash = 1 };
 
 __device__ __forceinline__ void atomic_max_nonnegative_double(double* address, double value) {
     auto* raw = reinterpret_cast<unsigned long long*>(address);
@@ -41,6 +45,82 @@ __device__ __forceinline__ void atomic_max_nonnegative_double(double* address, d
             break;
         }
     }
+}
+
+// CN: index_hash 噪声的常数与系数；系数在 host 端用 numpy 的
+//     _index_hash_parameters(seed) 生成（与 KeOps 路径完全一致）。
+// EN: Constants and per-seed coefficients for index_hash noise; coefficients are
+//     generated host-side with _index_hash_parameters(seed), identical to KeOps.
+constexpr int64_t kHashPrime0 = 2003;
+constexpr int64_t kHashPrime1 = 2011;
+constexpr float kHashModulusF = 4028033.0f;
+// CN: KeOps 把“除以 IntCst”改写成“乘以 RatCst((float)(1/prime))”的 fp32 常数，
+//     复刻噪声时必须用同一常数才能逐位一致。
+// EN: KeOps rewrites division by an IntCst as a multiply by the fp32 constant
+//     (float)(1/prime); bitwise replication needs the same constants.
+constexpr float kRecipHash0 = (float)(1.0 / 2003.0);
+constexpr float kRecipHash1 = (float)(1.0 / 2011.0);
+
+struct NoiseCoeffs {
+    float sc0, tc0, off0;
+    float sc1, tc1, off1;
+};
+
+// CN: 扰动的运行参数；sigma == 0 时关闭扰动，seed_term 为
+//     (float)((double)seed * 0.001)，与 KeOps 的 fp32 标量嵌入一致。
+// EN: Runtime perturbation parameters; sigma == 0 disables it. seed_term is
+//     (float)((double)seed * 0.001), matching KeOps fp32 scalar embedding.
+struct NoiseParams {
+    int perturb_mode;
+    double sigma;
+    float seed_term;
+    bool row_is_source;
+    NoiseCoeffs coeffs;
+};
+
+__device__ __forceinline__ double sigma_noise(
+        const NoiseParams& params,
+        int64_t q_idx,
+        int64_t d_idx) {
+    if (params.perturb_mode == kRank2) {
+        float src = static_cast<float>(q_idx);
+        float tgt = static_cast<float>(d_idx);
+        if (!params.row_is_source) {
+            const float tmp = src;
+            src = tgt;
+            tgt = tmp;
+        }
+        // CN: 复刻 KeOps（pykeops 默认 --use_fast_math 编译）：
+        //     z 的乘加被 NVRTC 收缩为 fmaf(tgt, 78.233, src*12.9898)，
+        //     sin 解析为 __sinf，两者都是确定性硬件指令，可逐位一致。
+        // EN: Replicate KeOps compiled with pykeops' default --use_fast_math:
+        //     NVRTC contracts z's mul-add into fmaf(tgt, 78.233, src*12.9898)
+        //     and sin resolves to __sinf; both are deterministic HW ops.
+        const float z = __fadd_rn(fmaf(tgt, 78.233f, __fmul_rn(src, 12.9898f)), params.seed_term);
+        return __fmul_rn(params.sigma, __fadd_rn(__fmul_rn(__sinf(z), 0.5f), 0.5f));
+    }
+    int64_t s0 = q_idx % kHashPrime0;
+    int64_t t0 = d_idx % kHashPrime0;
+    int64_t s1 = q_idx % kHashPrime1;
+    int64_t t1 = d_idx % kHashPrime1;
+    if (!params.row_is_source) {
+        const int64_t tmp0 = s0;
+        s0 = t0;
+        t0 = tmp0;
+        const int64_t tmp1 = s1;
+        s1 = t1;
+            t1 = tmp1;
+        }
+    // CN: 与 NumPy/Torch 共用 FP32 近似取模；显式舍入禁止 FMA 改变顺序。
+    // EN: Share FP32 approximate remainders with NumPy/Torch; explicit rounding prevents FMA reordering.
+    const float s0f = static_cast<float>(s0), t0f = static_cast<float>(t0);
+    const float s1f = static_cast<float>(s1), t1f = static_cast<float>(t1);
+    const float x0 = __fadd_rn(__fadd_rn(__fadd_rn(__fmul_rn(params.coeffs.sc0, s0f), __fmul_rn(params.coeffs.tc0, t0f)), __fmul_rn(s0f, t0f)), params.coeffs.off0);
+    const float x1 = __fadd_rn(__fadd_rn(__fadd_rn(__fmul_rn(params.coeffs.sc1, s1f), __fmul_rn(params.coeffs.tc1, t1f)), __fmul_rn(s1f, t1f)), params.coeffs.off1);
+    const float h0 = __fsub_rn(x0, __fmul_rn(2003.0f, floorf(__fmul_rn(kRecipHash0, x0))));
+    const float h1 = __fsub_rn(x1, __fmul_rn(2011.0f, floorf(__fmul_rn(kRecipHash1, x1))));
+    const float value = __fmul_rn(__fadd_rn(__fadd_rn(h0, __fmul_rn(2003.0f, h1)), 0.5f), (float)(1.0 / 4028033.0));
+    return __dmul_rn(params.sigma, static_cast<double>(value));
 }
 
 template <typename ValueT, typename IndexT>
@@ -145,16 +225,20 @@ __device__ __forceinline__ float warp_column_dist(const float* drow, const float
 
 // CN: 小 d 路径（d <= kThreadPerColMaxD）。query 行进 shared memory，线程按列
 //     步进，最后 shared 树合并。无 shuffle、无 tile 同步。
-//     rc = dual_db[col] - dist，取最大；输出取负得到 (cost - dual) 升序。
+//     rc = dual_db[col] - dist - noise，取最大；输出取负得到
+//     (cost + perturb - dual) 升序，与 _keops_metric_kmin 约定一致。
 // EN: Small-d path (d <= kThreadPerColMaxD). Query row lives in shared memory;
 //     threads stride over columns; a shared-memory tree merges per-thread top-k.
-//     rc = dual_db[col] - dist is maximized; outputs are negated to obtain the
-//     ascending (cost - dual) convention.
+//     rc = dual_db[col] - dist - noise is maximized; outputs are negated to match
+//     the (cost + perturb - dual) ascending convention of _keops_metric_kmin.
 template <int K, int COST, int THREADS>
 __global__ void fused_gcost_topk_thread_per_col_kernel(
         const float* __restrict__ query,
         const float* __restrict__ db,
         const double* __restrict__ dual_db,
+        const int64_t* __restrict__ query_global_idx,
+        const int64_t* __restrict__ db_global_idx,
+        NoiseParams noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -171,6 +255,8 @@ __global__ void fused_gcost_topk_thread_per_col_kernel(
     }
     __syncthreads();
 
+    const int64_t q_gidx = (noise.sigma > 0.0f) ? query_global_idx[row] : 0LL;
+
     double local_vals[K];
     int local_idxs[K];
     init_topk<K>(local_vals, local_idxs);
@@ -182,6 +268,9 @@ __global__ void fused_gcost_topk_thread_per_col_kernel(
             acc = accumulate_dim<COST>(acc, db_row[k], s_query[k]);
         }
         double rc = dual_db[col] - static_cast<double>((COST == kL2) ? sqrtf(acc) : acc);
+        if (noise.sigma > 0.0f) {
+            rc -= static_cast<double>(sigma_noise(noise, q_gidx, db_global_idx[col]));
+        }
         insert_topk<K>(local_vals, local_idxs, rc, static_cast<int>(col));
     }
 
@@ -233,6 +322,9 @@ __global__ void fused_gcost_topk_large_d_kernel(
         const float* __restrict__ query,
         const float* __restrict__ db,
         const double* __restrict__ dual_db,
+        const int64_t* __restrict__ query_global_idx,
+        const int64_t* __restrict__ db_global_idx,
+        NoiseParams noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -271,6 +363,7 @@ __global__ void fused_gcost_topk_large_d_kernel(
     init_topk<K>(local_vals, local_idxs);
 
     const float* qrow = s_q + warp * d;
+    const int64_t q_gidx = (row_active && noise.sigma > 0.0f) ? query_global_idx[row] : 0LL;
     const int64_t n_tiles = (n_db + db_tile - 1) / db_tile;
     for (int64_t tile = 0; tile < n_tiles; ++tile) {
         const int64_t c0 = tile * db_tile;
@@ -287,6 +380,9 @@ __global__ void fused_gcost_topk_large_d_kernel(
                 const float dist = warp_column_dist<COST>(s_db + c * d, qrow, d, lane);
                 if (lane == 0) {
                     double rc = dual_db[c0 + c] - static_cast<double>(dist);
+                    if (noise.sigma > 0.0f) {
+                        rc -= static_cast<double>(sigma_noise(noise, q_gidx, db_global_idx[c0 + c]));
+                    }
                     insert_topk<K>(local_vals, local_idxs, rc, static_cast<int>(c0 + c));
                 }
             }
@@ -312,6 +408,9 @@ __global__ void fused_gcost_bidir_certificate_kernel(
         const float* __restrict__ db,
         const double* __restrict__ query_dual,
         const double* __restrict__ db_dual,
+        const int64_t* __restrict__ query_global_idx,
+        const int64_t* __restrict__ db_global_idx,
+        NoiseParams noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -356,6 +455,7 @@ __global__ void fused_gcost_bidir_certificate_kernel(
     double acc_cost_linf = 0.0;
     unsigned long long acc_positive_count = 0;
     const float* qrow = s_q + warp * d;
+    const int64_t q_gidx = (row_active && noise.sigma > 0.0f) ? query_global_idx[row] : 0LL;
     const double u_row = row_active ? query_dual[row] : 0.0;
     const int64_t n_tiles = (n_db + db_tile - 1) / db_tile;
     for (int64_t tile = 0; tile < n_tiles; ++tile) {
@@ -373,6 +473,9 @@ __global__ void fused_gcost_bidir_certificate_kernel(
                 const float dist = warp_column_dist<COST>(s_db + c * d, qrow, d, lane);
                 if (lane == 0) {
                     double cij = static_cast<double>(dist);
+                    if (noise.sigma > 0.0f) {
+                        cij += static_cast<double>(sigma_noise(noise, q_gidx, db_global_idx[c0 + c]));
+                    }
                     const double score = u_row + db_dual[c0 + c] - cij;
                     s_scores[warp][c] = score;
                     insert_topk<K>(local_values, local_indices, score, static_cast<int>(c0 + c));
@@ -484,12 +587,12 @@ __global__ void reduce_gcost_col_partials_kernel(
 
 // CN: 证书归约 kernel：一次全矩阵遍历同时计算
 //     numerator = sum relu(u_i + v_j - c_ij)^2 与
-//     denominator = sum c_ij^2。
+//     denominator = sum c_ij^2（c_ij 为含扰动的 cost）。
 //     结构与大 d top-k 相同（warp 按 query 行、db 列分块进 shared），每个 warp
 //     用 double 累加，block 归约后 atomicAdd 到全局 fp64。
 // EN: Certificate reduction kernel: one full-matrix pass computes
 //     numerator = sum relu(u_i + v_j - c_ij)^2 and
-//     denominator = sum c_ij^2.
+//     denominator = sum c_ij^2 (c_ij is the perturbed cost).
 //     Same structure as the large-d top-k kernel; each warp accumulates in double
 //     and block-reduced partials are atomicAdded into global fp64.
 template <int COST>
@@ -498,6 +601,9 @@ __global__ void fused_gcost_certificate_kernel(
         const float* __restrict__ db,
         const double* __restrict__ query_dual,
         const double* __restrict__ db_dual,
+        const int64_t* __restrict__ query_global_idx,
+        const int64_t* __restrict__ db_global_idx,
+        NoiseParams noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -533,6 +639,7 @@ __global__ void fused_gcost_certificate_kernel(
     }
 
     const float* qrow = s_q + warp * d;
+    const int64_t q_gidx = (row_active && noise.sigma > 0.0f) ? query_global_idx[row] : 0LL;
     const double u_row = row_active ? query_dual[row] : 0.0;
     double acc_num = 0.0;
     double acc_den = 0.0;
@@ -555,6 +662,9 @@ __global__ void fused_gcost_certificate_kernel(
                 const float dist = warp_column_dist<COST>(s_db + c * d, qrow, d, lane);
                 if (lane == 0) {
                     double cij = static_cast<double>(dist);
+                    if (noise.sigma > 0.0f) {
+                        cij += static_cast<double>(sigma_noise(noise, q_gidx, db_global_idx[c0 + c]));
+                    }
                     const double viol = u_row + db_dual[c0 + c] - cij;
                     if (viol > 0.0) {
                         acc_num += viol * viol;
@@ -610,7 +720,11 @@ void check_cuda_inputs(
         torch::Tensor db,
         torch::Tensor dual_db,
         int64_t k,
-        int64_t cost_type) {
+        int64_t cost_type,
+        torch::Tensor query_global_index,
+        torch::Tensor database_global_index,
+        double sigma,
+        int64_t perturb_mode) {
     TORCH_CHECK(query.is_cuda(), "query must be a CUDA tensor");
     TORCH_CHECK(db.is_cuda(), "db must be a CUDA tensor");
     TORCH_CHECK(dual_db.is_cuda(), "dual_db must be a CUDA tensor");
@@ -627,6 +741,14 @@ void check_cuda_inputs(
     TORCH_CHECK(k == 1 || k == 2 || k == 4 || k == 8 || k == 16 || k == 32, "k must be one of {1, 2, 4, 8, 16, 32}");
     TORCH_CHECK(cost_type == kL1 || cost_type == kLinf || cost_type == kL2, "cost_type must be 0 (l1), 1 (linf), 2 (l2)");
     TORCH_CHECK(query.numel() > 0 && db.numel() > 0, "inputs must be non-empty");
+    if (sigma != 0.0) {
+        TORCH_CHECK(perturb_mode == kRank2 || perturb_mode == kIndexHash, "perturb_mode must be 0 (rank2) or 1 (index_hash)");
+        TORCH_CHECK(query_global_index.defined() && database_global_index.defined(), "global indices required when sigma != 0");
+        TORCH_CHECK(query_global_index.scalar_type() == torch::kInt64 && database_global_index.scalar_type() == torch::kInt64, "global indices must be int64");
+        TORCH_CHECK(query_global_index.is_contiguous() && database_global_index.is_contiguous(), "global indices must be contiguous");
+        TORCH_CHECK(query_global_index.numel() == query.size(0), "query_global_index length must equal query rows");
+        TORCH_CHECK(database_global_index.numel() == db.size(0), "database_global_index length must equal db rows");
+    }
 }
 
 void check_certificate_inputs(
@@ -634,7 +756,11 @@ void check_certificate_inputs(
         torch::Tensor db,
         torch::Tensor query_dual,
         torch::Tensor db_dual,
-        int64_t cost_type) {
+        int64_t cost_type,
+        torch::Tensor query_global_index,
+        torch::Tensor database_global_index,
+        double sigma,
+        int64_t perturb_mode) {
     TORCH_CHECK(query.is_cuda() && db.is_cuda() && query_dual.is_cuda() && db_dual.is_cuda(), "inputs must be CUDA tensors");
     TORCH_CHECK(query.scalar_type() == torch::kFloat32 && db.scalar_type() == torch::kFloat32, "query/db must be float32");
     TORCH_CHECK(query_dual.scalar_type() == torch::kFloat64 && db_dual.scalar_type() == torch::kFloat64, "duals must be float64");
@@ -645,6 +771,49 @@ void check_certificate_inputs(
     TORCH_CHECK(db_dual.numel() == db.size(0), "db_dual length must equal db rows");
     TORCH_CHECK(cost_type == kL1 || cost_type == kLinf || cost_type == kL2, "cost_type must be 0 (l1), 1 (linf), 2 (l2)");
     TORCH_CHECK(query.numel() > 0 && db.numel() > 0, "inputs must be non-empty");
+    if (sigma != 0.0) {
+        TORCH_CHECK(perturb_mode == kRank2 || perturb_mode == kIndexHash, "perturb_mode must be 0 (rank2) or 1 (index_hash)");
+        TORCH_CHECK(query_global_index.defined() && database_global_index.defined(), "global indices required when sigma != 0");
+        TORCH_CHECK(query_global_index.scalar_type() == torch::kInt64 && database_global_index.scalar_type() == torch::kInt64, "global indices must be int64");
+        TORCH_CHECK(query_global_index.is_contiguous() && database_global_index.is_contiguous(), "global indices must be contiguous");
+        TORCH_CHECK(query_global_index.numel() == query.size(0), "query_global_index length must equal query rows");
+        TORCH_CHECK(database_global_index.numel() == db.size(0), "database_global_index length must equal db rows");
+    }
+}
+
+NoiseParams make_noise_params(
+        const torch::Tensor& query_global_index,
+        const torch::Tensor& database_global_index,
+        double sigma,
+        int64_t seed,
+        int64_t perturb_mode,
+        bool row_is_source,
+        const torch::Tensor& index_hash_coeffs) {
+    NoiseParams params;
+    params.perturb_mode = static_cast<int>(perturb_mode);
+    params.sigma = sigma;
+    params.seed_term = static_cast<float>(static_cast<double>(seed) * 0.001);
+    params.row_is_source = row_is_source;
+    params.coeffs = NoiseCoeffs{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (sigma != 0.0 && perturb_mode == kIndexHash) {
+        TORCH_CHECK(index_hash_coeffs.defined() && index_hash_coeffs.numel() == 6, "index_hash_coeffs must have 6 elements");
+        TORCH_CHECK(index_hash_coeffs.scalar_type() == torch::kInt64, "index_hash_coeffs must be int64");
+        auto c = index_hash_coeffs.to(torch::kCPU).contiguous();
+        const int64_t* p = c.data_ptr<int64_t>();
+        params.coeffs = NoiseCoeffs{
+                static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]),
+                static_cast<float>(p[3]), static_cast<float>(p[4]), static_cast<float>(p[5])};
+    }
+    (void)query_global_index;
+    (void)database_global_index;
+    return params;
+}
+
+const int64_t* global_index_ptr(const torch::Tensor& tensor, double sigma) {
+    if (sigma == 0.0) {
+        return nullptr;
+    }
+    return tensor.data_ptr<int64_t>();
 }
 
 template <int K, int COST>
@@ -652,6 +821,9 @@ void launch_thread_per_col(
         const float* query,
         const float* db,
         const double* dual_db,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -661,7 +833,7 @@ void launch_thread_per_col(
     const size_t shmem = static_cast<size_t>(d) * sizeof(float);
     constexpr int threads = K == 32 ? kSmallThreadsK32 : kSmallThreads;
     fused_gcost_topk_thread_per_col_kernel<K, COST, threads><<<static_cast<unsigned int>(n_q), threads, shmem, stream>>>(
-            query, db, dual_db, n_q, n_db, d, out_val, out_idx);
+            query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, out_val, out_idx);
 }
 
 template <int K, int COST>
@@ -669,6 +841,9 @@ void launch_large_d(
         const float* query,
         const float* db,
         const double* dual_db,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -698,7 +873,7 @@ void launch_large_d(
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
     }
     fused_gcost_topk_large_d_kernel<K, COST><<<static_cast<unsigned int>(grid), kLargeThreads, shmem, stream>>>(
-            query, db, dual_db, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx);
+            query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx);
 }
 
 template <int K>
@@ -707,6 +882,9 @@ void dispatch_by_cost(
         const float* query,
         const float* db,
         const double* dual_db,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -718,21 +896,21 @@ void dispatch_by_cost(
     const bool small_d = d <= kThreadPerColMaxD;
     if (cost_type == kL1) {
         if (small_d) {
-            launch_thread_per_col<K, kL1>(query, db, dual_db, n_q, n_db, d, out_val, out_idx, stream);
+            launch_thread_per_col<K, kL1>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, out_val, out_idx, stream);
         } else {
-            launch_large_d<K, kL1>(query, db, dual_db, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
+            launch_large_d<K, kL1>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
         }
     } else if (cost_type == kLinf) {
         if (small_d) {
-            launch_thread_per_col<K, kLinf>(query, db, dual_db, n_q, n_db, d, out_val, out_idx, stream);
+            launch_thread_per_col<K, kLinf>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, out_val, out_idx, stream);
         } else {
-            launch_large_d<K, kLinf>(query, db, dual_db, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
+            launch_large_d<K, kLinf>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
         }
     } else {
         if (small_d) {
-            launch_thread_per_col<K, kL2>(query, db, dual_db, n_q, n_db, d, out_val, out_idx, stream);
+            launch_thread_per_col<K, kL2>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, out_val, out_idx, stream);
         } else {
-            launch_large_d<K, kL2>(query, db, dual_db, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
+            launch_large_d<K, kL2>(query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
         }
     }
 }
@@ -743,6 +921,9 @@ void dispatch_topk(
         const float* query,
         const float* db,
         const double* dual_db,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -751,7 +932,7 @@ void dispatch_topk(
         double* out_val,
         int64_t* out_idx,
         cudaStream_t stream) {
-    dispatch_by_cost<K>(cost_type, query, db, dual_db, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
+    dispatch_by_cost<K>(cost_type, query, db, dual_db, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, out_val, out_idx, stream);
 }
 
 void launch_certificate(
@@ -760,6 +941,9 @@ void launch_certificate(
         const float* db,
         const double* query_dual,
         const double* db_dual,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -804,13 +988,13 @@ void launch_certificate(
     }
     if (cost_type == kL1) {
         fused_gcost_certificate_kernel<kL1><<<static_cast<unsigned int>(grid), kLargeThreads, shmem, stream>>>(
-                query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
+                query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
     } else if (cost_type == kLinf) {
         fused_gcost_certificate_kernel<kLinf><<<static_cast<unsigned int>(grid), kLargeThreads, shmem, stream>>>(
-                query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
+                query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
     } else {
         fused_gcost_certificate_kernel<kL2><<<static_cast<unsigned int>(grid), kLargeThreads, shmem, stream>>>(
-                query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
+                query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, compute_denominator, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count);
     }
 }
 
@@ -820,6 +1004,9 @@ void launch_bidir_certificate(
         const float* db,
         const double* query_dual,
         const double* db_dual,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -856,7 +1043,7 @@ void launch_bidir_certificate(
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
     }
     fused_gcost_bidir_certificate_kernel<K, COST><<<static_cast<unsigned int>(n_blocks), kLargeThreads, shmem, stream>>>(
-            query, db, query_dual, db_dual,
+            query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise,
             n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices,
             partial_values, partial_indices, out_num, out_den, out_max_violation,
             out_cost_linf, out_positive_count);
@@ -869,6 +1056,9 @@ void dispatch_bidir_certificate(
         const float* db,
         const double* query_dual,
         const double* db_dual,
+        const int64_t* query_global_idx,
+        const int64_t* db_global_idx,
+        const NoiseParams& noise,
         int64_t n_q,
         int64_t n_db,
         int64_t d,
@@ -885,11 +1075,11 @@ void dispatch_bidir_certificate(
         int64_t* out_positive_count,
         cudaStream_t stream) {
     if (cost_type == kL1) {
-        launch_bidir_certificate<K, kL1>(query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
+        launch_bidir_certificate<K, kL1>(query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
     } else if (cost_type == kLinf) {
-        launch_bidir_certificate<K, kLinf>(query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
+        launch_bidir_certificate<K, kLinf>(query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
     } else {
-        launch_bidir_certificate<K, kL2>(query, db, query_dual, db_dual, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
+        launch_bidir_certificate<K, kL2>(query, db, query_dual, db_dual, query_global_idx, db_global_idx, noise, n_q, n_db, d, rows_per_block, db_tile, row_values, row_indices, partial_values, partial_indices, out_num, out_den, out_max_violation, out_cost_linf, out_positive_count, stream);
     }
 }
 
@@ -907,7 +1097,7 @@ void launch_reduce_gcost_col_partials(
 }
 
 // ============================================================================
-// CN: MIPS top-k 融合 kernel（用于 dual-assignment augment）。
+// CN: MIPS top-k 融合 kernel（dual-assignment augment 的 FAISS/Torch 回退替代）。
 //     score(i, j) = dot(query[i], db[j])，即 augmented 向量内积（query 最后一维为
 //     1、db 最后一维为 bias 时，等价于 feature 内积加 bias）。每行输出最大的 K 个
 //     score 及其列号，降序、同值按列号升序，语义与 torch.topk(largest=True) 一致
@@ -918,8 +1108,8 @@ void launch_reduce_gcost_col_partials(
 //       B. d > 32：block 对应 8 个 query 行（每 warp 一行），db 按列分块进 shared
 //          复用，每 lane 维护局部 int32 最小堆，warp shuffle 合并。
 //     k 仅支持 {1, 2, 4, 8, 16, 32}。
-// EN: Fused MIPS top-k kernel for the dual-assignment augment.
-//     score(i, j) = dot(query[i], db[j]) over the
+// EN: Fused MIPS top-k kernel replacing the FAISS/Torch fallback of the
+//     dual-assignment augment. score(i, j) = dot(query[i], db[j]) over the
 //     augmented vectors (query's last dim is 1 and db's last dim is the bias, so
 //     this equals feature dot plus bias). Outputs the K largest scores per row
 //     with column ids, descending, ties by ascending column id, matching
@@ -1359,8 +1549,15 @@ std::vector<torch::Tensor> fused_gcost_topk_cuda(
         torch::Tensor db,
         torch::Tensor dual_db,
         int64_t k,
-        int64_t cost_type) {
-    check_cuda_inputs(query, db, dual_db, k, cost_type);
+        int64_t cost_type,
+        torch::Tensor query_global_index,
+        torch::Tensor database_global_index,
+        double sigma,
+        int64_t seed,
+        int64_t perturb_mode,
+        bool row_is_source,
+        torch::Tensor index_hash_coeffs) {
+    check_cuda_inputs(query, db, dual_db, k, cost_type, query_global_index, database_global_index, sigma, perturb_mode);
     const c10::cuda::CUDAGuard guard(query.device());
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -1381,6 +1578,11 @@ std::vector<torch::Tensor> fused_gcost_topk_cuda(
     double* val_ptr = out_val.data_ptr<double>();
     int64_t* idx_ptr = out_idx.data_ptr<int64_t>();
 
+    const NoiseParams noise = make_noise_params(
+            query_global_index, database_global_index, sigma, seed, perturb_mode, row_is_source, index_hash_coeffs);
+    const int64_t* q_gidx = global_index_ptr(query_global_index, sigma);
+    const int64_t* d_gidx = global_index_ptr(database_global_index, sigma);
+
     // CN: 大 d 路径的 shared memory 预算：R 行 query + db_tile 列，动态适应设备上限。
     // EN: Shared-memory budget for large-d path: R query rows plus db tile, adapting to device limits.
     const auto large_d_tiles = plan_large_d_shared_tiles(d);
@@ -1388,17 +1590,17 @@ std::vector<torch::Tensor> fused_gcost_topk_cuda(
     const int64_t db_tile = large_d_tiles.second;
 
     if (k == 1) {
-        dispatch_topk<1>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<1>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     } else if (k == 2) {
-        dispatch_topk<2>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<2>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     } else if (k == 4) {
-        dispatch_topk<4>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<4>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     } else if (k == 8) {
-        dispatch_topk<8>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<8>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     } else if (k == 16) {
-        dispatch_topk<16>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<16>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     } else {
-        dispatch_topk<32>(cost_type, q_ptr, db_ptr, dual_ptr, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
+        dispatch_topk<32>(cost_type, q_ptr, db_ptr, dual_ptr, q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, val_ptr, idx_ptr, stream);
     }
     return {out_val, out_idx};
 }
@@ -1409,8 +1611,15 @@ std::vector<torch::Tensor> fused_gcost_certificate_cuda(
         torch::Tensor query_dual,
         torch::Tensor db_dual,
         int64_t cost_type,
+        torch::Tensor query_global_index,
+        torch::Tensor database_global_index,
+        double sigma,
+        int64_t seed,
+        int64_t perturb_mode,
+        bool row_is_source,
+        torch::Tensor index_hash_coeffs,
         int64_t compute_denominator) {
-    check_certificate_inputs(query, db, query_dual, db_dual, cost_type);
+    check_certificate_inputs(query, db, query_dual, db_dual, cost_type, query_global_index, database_global_index, sigma, perturb_mode);
     const c10::cuda::CUDAGuard guard(query.device());
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -1429,6 +1638,11 @@ std::vector<torch::Tensor> fused_gcost_certificate_cuda(
     auto out_cost_linf = torch::zeros({}, scalar_options);
     auto out_positive_count = torch::zeros({}, query_c.options().dtype(torch::kInt64));
 
+    const NoiseParams noise = make_noise_params(
+            query_global_index, database_global_index, sigma, seed, perturb_mode, row_is_source, index_hash_coeffs);
+    const int64_t* q_gidx = global_index_ptr(query_global_index, sigma);
+    const int64_t* d_gidx = global_index_ptr(database_global_index, sigma);
+
     const auto large_d_tiles = plan_large_d_shared_tiles(d);
     const int64_t rows_per_block = large_d_tiles.first;
     const int64_t db_tile = large_d_tiles.second;
@@ -1439,6 +1653,9 @@ std::vector<torch::Tensor> fused_gcost_certificate_cuda(
             db_c.data_ptr<float>(),
             query_dual_c.data_ptr<double>(),
             db_dual_c.data_ptr<double>(),
+            q_gidx,
+            d_gidx,
+            noise,
             n_q,
             n_db,
             d,
@@ -1460,8 +1677,15 @@ std::vector<torch::Tensor> fused_gcost_bidir_certificate_cuda(
         torch::Tensor query_dual,
         torch::Tensor db_dual,
         int64_t k,
-        int64_t cost_type) {
-    check_cuda_inputs(query, db, db_dual, k, cost_type);
+        int64_t cost_type,
+        torch::Tensor query_global_index,
+        torch::Tensor database_global_index,
+        double sigma,
+        int64_t seed,
+        int64_t perturb_mode,
+        bool row_is_source,
+        torch::Tensor index_hash_coeffs) {
+    check_cuda_inputs(query, db, db_dual, k, cost_type, query_global_index, database_global_index, sigma, perturb_mode);
     TORCH_CHECK(query_dual.is_cuda() && query_dual.scalar_type() == torch::kFloat64, "query_dual must be CUDA float64");
     TORCH_CHECK(query_dual.is_contiguous() && query_dual.numel() == query.size(0), "query_dual length mismatch");
     const c10::cuda::CUDAGuard guard(query.device());
@@ -1486,8 +1710,13 @@ std::vector<torch::Tensor> fused_gcost_bidir_certificate_cuda(
     auto out_max_violation = torch::zeros({}, scalar_options);
     auto out_cost_linf = torch::zeros({}, scalar_options);
     auto out_positive_count = torch::zeros({}, query.options().dtype(torch::kInt64));
+    const NoiseParams noise = make_noise_params(
+            query_global_index, database_global_index, sigma, seed, perturb_mode, row_is_source, index_hash_coeffs);
+    const int64_t* q_gidx = global_index_ptr(query_global_index, sigma);
+    const int64_t* d_gidx = global_index_ptr(database_global_index, sigma);
+
 #define DISPATCH_BIDIR(K) \
-    dispatch_bidir_certificate<K>(cost_type, query.data_ptr<float>(), db.data_ptr<float>(), query_dual.data_ptr<double>(), db_dual.data_ptr<double>(), n_q, n_db, d, rows_per_block, db_tile, row_values.data_ptr<double>(), row_indices.data_ptr<int64_t>(), partial_values.data_ptr<double>(), partial_indices.data_ptr<int64_t>(), out_num.data_ptr<double>(), out_den.data_ptr<double>(), out_max_violation.data_ptr<double>(), out_cost_linf.data_ptr<double>(), out_positive_count.data_ptr<int64_t>(), stream); \
+    dispatch_bidir_certificate<K>(cost_type, query.data_ptr<float>(), db.data_ptr<float>(), query_dual.data_ptr<double>(), db_dual.data_ptr<double>(), q_gidx, d_gidx, noise, n_q, n_db, d, rows_per_block, db_tile, row_values.data_ptr<double>(), row_indices.data_ptr<int64_t>(), partial_values.data_ptr<double>(), partial_indices.data_ptr<int64_t>(), out_num.data_ptr<double>(), out_den.data_ptr<double>(), out_max_violation.data_ptr<double>(), out_cost_linf.data_ptr<double>(), out_positive_count.data_ptr<int64_t>(), stream); \
     launch_reduce_gcost_col_partials<K>(partial_values.data_ptr<double>(), partial_indices.data_ptr<int64_t>(), n_blocks, n_db, col_values.data_ptr<double>(), col_indices.data_ptr<int64_t>(), stream)
     if (k == 1) {
         DISPATCH_BIDIR(1);

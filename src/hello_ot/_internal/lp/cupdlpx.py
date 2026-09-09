@@ -590,8 +590,11 @@ class CuPDLPxSolver(LPSolver):
             "print_summary": bool(verbose),
             "termination_evaluation_frequency": 200,
             "termination_norm": "l2",
+            "eps_optimal_absolute": tolerance.get("objective"),
             "eps_optimal_relative": tolerance.get("objective"),
+            "eps_feasible_absolute_primal": tolerance.get("primal"),
             "eps_feasible_relative_primal": tolerance.get("primal"),
+            "eps_feasible_absolute_dual": tolerance.get("dual"),
             "eps_feasible_relative_dual": tolerance.get("dual"),
             # CN: 这一组 step_size_method 默认值是 host/device 两条路径统一依赖的通用配置，
             # CN: 需要与 native cupdlpx 默认值和 pybind 暴露出的默认字典保持一致，避免未来再次出现路径分叉。

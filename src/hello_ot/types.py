@@ -158,6 +158,7 @@ class IterationStats:
     objective: float
     wall_time: float
     bookkeeping_time: float
+    full_scan_time: float
     solve_lp: SolveLPStats
     dual_violation: DualViolationStats
     budgeted_pruning: BudgetedPruningStats
@@ -305,6 +306,17 @@ class TraceResult:
 
 
 @dataclass(frozen=True)
+class CostStageResult:
+    """
+    CN: 按执行顺序记录一个成本阶段及其逐层求解统计。
+    EN: Record one cost stage and its per-level solve statistics in execution order.
+    """
+
+    name: str
+    solve: SolveStageResult
+
+
+@dataclass(frozen=True)
 class Result:
     objective: float
     solution: SparseOTSolution
@@ -313,6 +325,23 @@ class Result:
     peak_gpu_memory_mib: Optional[float] = None
     trace: Optional[TraceResult] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    cost_stages: tuple[CostStageResult, ...] = ()
+
+    @property
+    def original_cost_stage(self) -> SolveStageResult:
+        """
+        CN: 返回最终原成本求解阶段，供实验代码统一读取。
+        EN: Return the final original-cost stage for experiment adapters.
+        """
+        return self.solve_stage
+
+    @property
+    def perturbed_cost_stage(self) -> Optional[SolveStageResult]:
+        """
+        CN: 返回可选的扰动成本阶段。
+        EN: Return the optional perturbed-cost stage.
+        """
+        return next((stage.solve for stage in self.cost_stages if stage.name == "perturbed"), None)
 
 
 __all__ = [
@@ -324,6 +353,7 @@ __all__ = [
     "DualPreparation",
     "DualViolationStats",
     "Result",
+    "CostStageResult",
     "HelloSolveError",
     "InitializationStats",
     "InitializationResult",

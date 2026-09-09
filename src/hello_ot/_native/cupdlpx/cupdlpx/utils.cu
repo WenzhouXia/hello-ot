@@ -513,18 +513,34 @@ const char *termination_reason_to_string(termination_reason_t reason)
     }
 }
 
-bool optimality_criteria_met(const pdhg_solver_state_t *state, double rel_opt_tol, double rel_feas_tol)
+static double normalized_termination_residual(
+    double absolute_residual,
+    double absolute_tolerance,
+    double relative_tolerance,
+    double scale)
 {
-    return state->termination_relative_dual_residual < rel_feas_tol &&
-           state->termination_relative_primal_residual < rel_feas_tol &&
-           state->relative_objective_gap < rel_opt_tol;
+    if (relative_tolerance == 0.0)
+        return absolute_residual;
+    const double denominator = absolute_tolerance / relative_tolerance + scale;
+    return denominator > 0.0 ? absolute_residual / denominator : INFINITY;
 }
 
-bool optimality_criteria_met_separate(const pdhg_solver_state_t *state, double rel_opt_tol, double rel_feas_tol_primal, double rel_feas_tol_dual)
+bool optimality_criteria_met(
+    const pdhg_solver_state_t *state,
+    const termination_criteria_t *criteria)
 {
-    return state->termination_relative_dual_residual < rel_feas_tol_dual &&
-           state->termination_relative_primal_residual < rel_feas_tol_primal &&
-           state->relative_objective_gap < rel_opt_tol;
+    const double primal_threshold =
+        criteria->eps_feasible_absolute_primal +
+        criteria->eps_feasible_relative_primal * state->termination_constraint_bound_norm;
+    const double dual_threshold =
+        criteria->eps_feasible_absolute_dual +
+        criteria->eps_feasible_relative_dual * state->termination_objective_vector_norm;
+    const double gap_scale = fabs(state->primal_objective_value) + fabs(state->dual_objective_value);
+    const double gap_threshold =
+        criteria->eps_optimal_absolute + criteria->eps_optimal_relative * gap_scale;
+    return state->termination_absolute_dual_residual < dual_threshold &&
+           state->termination_absolute_primal_residual < primal_threshold &&
+           state->objective_gap < gap_threshold;
 }
 
 bool primal_infeasibility_criteria_met(const pdhg_solver_state_t *state, double eps)
@@ -549,8 +565,17 @@ void check_termination_criteria(
     pdhg_solver_state_t *solver_state,
     const termination_criteria_t *criteria)
 {
-    // if (optimality_criteria_met(solver_state, criteria->eps_optimal_relative, criteria->eps_feasible_relative))
-    if (optimality_criteria_met_separate(solver_state, criteria->eps_optimal_relative, criteria->eps_feasible_relative_primal, criteria->eps_feasible_relative_dual))
+    solver_state->termination_relative_primal_residual = normalized_termination_residual(
+        solver_state->termination_absolute_primal_residual,
+        criteria->eps_feasible_absolute_primal,
+        criteria->eps_feasible_relative_primal,
+        solver_state->termination_constraint_bound_norm);
+    solver_state->termination_relative_dual_residual = normalized_termination_residual(
+        solver_state->termination_absolute_dual_residual,
+        criteria->eps_feasible_absolute_dual,
+        criteria->eps_feasible_relative_dual,
+        solver_state->termination_objective_vector_norm);
+    if (optimality_criteria_met(solver_state, criteria))
     {
         // solver_state->termination_reason = TERMINATION_REASON_OPTIMAL;
         // return;
@@ -696,10 +721,10 @@ void print_initial_info(const pdhg_parameters_t *params, const lp_problem_t *pro
     printf("settings:\n");
     printf("  iter_limit         : %d\n", params->termination_criteria.iteration_limit);
     printf("  time_limit         : %.2f sec\n", params->termination_criteria.time_sec_limit);
-    printf("  eps_opt            : %.1e\n", params->termination_criteria.eps_optimal_relative);
+    printf("  eps_opt_abs/rel    : %.1e / %.1e\n", params->termination_criteria.eps_optimal_absolute, params->termination_criteria.eps_optimal_relative);
     // printf("  eps_feas           : %.1e\n", params->termination_criteria.eps_feasible_relative);
-    printf("  eps_feas_primal    : %.1e\n", params->termination_criteria.eps_feasible_relative_primal);
-    printf("  eps_feas_dual      : %.1e\n", params->termination_criteria.eps_feasible_relative_dual);
+    printf("  eps_primal_abs/rel : %.1e / %.1e\n", params->termination_criteria.eps_feasible_absolute_primal, params->termination_criteria.eps_feasible_relative_primal);
+    printf("  eps_dual_abs/rel   : %.1e / %.1e\n", params->termination_criteria.eps_feasible_absolute_dual, params->termination_criteria.eps_feasible_relative_dual);
     printf("  eps_infeas_detect  : %.1e\n", params->termination_criteria.eps_infeasible);
     printf("  termination_norm   : %s\n", params->termination_norm == TERMINATION_NORM_L_INF ? "linf" : "l2");
 
@@ -1021,7 +1046,8 @@ void compute_residual(pdhg_solver_state_t *state)
         state->termination_absolute_dual_residual = state->absolute_dual_residual;
         state->termination_relative_dual_residual = state->relative_dual_residual;
     }
-    state->relative_objective_gap = fabs(state->primal_objective_value - state->dual_objective_value) /
+    state->objective_gap = fabs(state->primal_objective_value - state->dual_objective_value);
+    state->relative_objective_gap = state->objective_gap /
                                     (1.0 + fabs(state->primal_objective_value) + fabs(state->dual_objective_value));
 }
 

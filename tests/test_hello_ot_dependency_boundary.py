@@ -35,7 +35,7 @@ def test_public_modules_import_without_loading_hierarchical_ot() -> None:
 
 
 def test_removed_compatibility_features_do_not_reappear_in_package_sources() -> None:
-    forbidden = ("metric_perturbation", "perturbed_cost_stage", "use_faiss", "hprlp")
+    forbidden = ("use_faiss", "hprlp")
     violations = []
     source_suffixes = {".py", ".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
     for path in PACKAGE_ROOT.rglob("*"):

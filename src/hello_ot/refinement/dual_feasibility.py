@@ -27,7 +27,7 @@ def normalize_dual_feasibility_norm(value: str) -> DualFeasibilityNorm:
     """
     normalized = str(value).strip().lower()
     if normalized not in {"l2", "linf"}:
-        raise ValueError("finest_dual_feasibility_norm must be one of: l2, linf")
+        raise ValueError("stopping_norm must be one of: l2, linf")
     return normalized  # type: ignore[return-value]
 
 

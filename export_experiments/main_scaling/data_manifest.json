@@ -1,0 +1,49 @@
+{
+  "format_version": 2,
+  "repository": "WenzhouXia/hello-ot-imagenet-pca",
+  "revision": "1557166e0e0f1dc1b66ddd4034fc9a51edf036dd",
+  "dtype": "float32",
+  "source_dataset": "visual-layer/imagenet-1k-vl-enriched",
+  "source_dataset_revision": "ac6afcdeb3be31c5ff6a7ff579874b3d372b7074",
+  "encoder": "LightningDiT VA-VAE f16d32",
+  "contents": "PCA-projected numeric features only; no images, labels, captions, filenames, or ImageNet identifiers",
+  "seed": 42,
+  "artifacts": {
+    "4": {
+      "filename": "imagenet_vavae_pca_n262144_d4_seed42.npy",
+      "shape": [
+        262144,
+        4
+      ],
+      "sha256": "1b54a29871c501c2cb9b30409d5aafda4a16d12d19596e901cc5855294ad37ef",
+      "size_bytes": 4194432
+    },
+    "32": {
+      "filename": "imagenet_vavae_pca_n262144_d32_seed42.npy",
+      "shape": [
+        262144,
+        32
+      ],
+      "sha256": "588e6c1118b24be2a08fadf39e49a950d7de4813ff173a17de041c46334422b9",
+      "size_bytes": 33554560
+    },
+    "256": {
+      "filename": "imagenet_vavae_pca_n262144_d256_seed42.npy",
+      "shape": [
+        262144,
+        256
+      ],
+      "sha256": "16acec53e7cd44ac816c2c12e20eab548fc590417f6fa46691e81e4e0d3b9c53",
+      "size_bytes": 268435584
+    },
+    "2048": {
+      "filename": "imagenet_vavae_pca_n262144_d2048_seed42.npy",
+      "shape": [
+        262144,
+        2048
+      ],
+      "sha256": "1f61a2340371fbc18b8af0d8fb0f319601fb81a6b9aad9c747858e298af30dc5",
+      "size_bytes": 2147483776
+    }
+  }
+}

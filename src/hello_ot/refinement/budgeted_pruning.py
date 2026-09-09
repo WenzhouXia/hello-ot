@@ -343,6 +343,7 @@ def apply_budgeted_pruning(
     trace_collector: Optional[Any] = None,
     trace_prefix: str = "solve_ot.solve.finalize_iteration.cleaning",
     current_inner_iter: Optional[int] = None,
+    removed_keys_out: Optional[list] = None,
 ) -> np.ndarray:
     cleaning_strategy = solver.cleaning_strategy
     if not isinstance(cleaning_strategy, DualGapCleaning):
@@ -375,6 +376,15 @@ def apply_budgeted_pruning(
         )
     if len(to_remove) <= 0:
         return np.empty(0, dtype=np.int32)
+
+    if removed_keys_out is not None:
+        from .reentry import edge_keys
+
+        support = solver.active_support
+        positions = to_remove
+        if torch.is_tensor(support.rows):
+            positions = torch.as_tensor(to_remove, dtype=torch.long, device=support.rows.device)
+        removed_keys_out.append(edge_keys(support.rows[positions], support.cols[positions], n_t))
 
     if logger.isEnabledFor(logging.INFO):
         size_after = curr_size - len(to_remove)

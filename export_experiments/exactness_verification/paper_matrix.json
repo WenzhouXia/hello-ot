@@ -1,0 +1,17 @@
+{
+  "n": [65536],
+  "d": [4, 128, 4096],
+  "seeds": [42],
+  "methods": [
+    "hello",
+    "ott_jax_sinkhorn_eps_1e-2",
+    "ott_jax_sinkhorn_eps_1e-3",
+    "hiref"
+  ],
+  "dataset": {
+    "name": "brenier_correlated_linear",
+    "rho": 0.999,
+    "latent_dim": 4,
+    "linear_scale": 2.0
+  }
+}

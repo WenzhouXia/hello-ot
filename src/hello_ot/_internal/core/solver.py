@@ -1255,6 +1255,21 @@ class HierarchicalOTSolver:
         )
 
     def _compute_pair_costs_arrays(
+        self, rows_add, cols_add, **kwargs
+    ):
+        """
+        CN: 为所有新增支撑边应用与扫描一致的成本扰动。
+        EN: Apply the same cost perturbation as the scans to every inserted support edge.
+        """
+        costs = self._compute_base_pair_costs_arrays(rows_add, cols_add, **kwargs)
+        perturbation = getattr(self, "_metric_cost_perturbation", None)
+        if perturbation is not None:
+            from hello_ot.kernels.norm_cost_scan import _apply_metric_pair_perturbation
+
+            costs = _apply_metric_pair_perturbation(costs, rows_add, cols_add, perturbation)
+        return costs
+
+    def _compute_base_pair_costs_arrays(
         self,
         rows_add: np.ndarray,
         cols_add: np.ndarray,

@@ -7,6 +7,9 @@ on:
 jobs:
   portable:
     runs-on: ubuntu-22.04
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      HELLO_OT_BUILD_NATIVE: "0"
     strategy:
       matrix:
         python-version: ["3.10", "3.11"]
@@ -17,7 +20,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install build and runtime dependencies
         run: |
-          python3 -m pip install --upgrade pip build
+          python3 -m pip install --upgrade pip build 'setuptools>=69' wheel
           python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           python3 -m pip install '.[test]'
       - name: Verify exported files
@@ -30,6 +33,11 @@ jobs:
             tests/test_hello_ot_dependency_boundary.py \
             tests/test_hello_ot_numerical_equivalence.py \
             tests/release_tooling_test.py \
+            tests/public_paper_experiments_test.py \
+            tests/public_pareto_test.py \
+            tests/hello_cost_perturbation_test.py \
+            tests/hello_algorithm_structure_test.py \
+            tests/hello_ot_variants_test.py \
             tests/torch_backend_end_to_end_test.py \
             tests/torch_packaging_test.py \
             tests/torch_prewarm_test.py \
@@ -38,5 +46,7 @@ jobs:
             tests/hello_inplace_feature_layout_test.py
       - name: Build portable wheel and source distribution
         run: python3 -m build
+      - name: Validate the source distribution independently
+        run: python3 scripts/check_sdist.py dist/*.tar.gz
       - name: Run quickstart from the installed package
         run: python3 examples/quickstart.py

@@ -1,6 +1,7 @@
 __pycache__/
 *.so
 *.egg-info/
+*.whl
 *.orig
 /build_solvers/build_cache_cupdlpx/
 /build/
@@ -15,8 +16,6 @@ __pycache__/
 /Applications/
 /applications/
 /Docs/
-/docs/*
-!/docs/algorithm.md
 /Papers/
 /papers/
 /.ignore
@@ -30,6 +29,7 @@ __pycache__/
 !/tests/test_hello_ot_public_api.py
 !/tests/test_hello_ot_dependency_boundary.py
 !/tests/test_hello_ot_numerical_equivalence.py
+!/tests/public_paper_experiments_test.py
 !/tests/_run_hello_equivalence_case.py
 !/paper_experiments/uot/test_*.py
 
@@ -37,6 +37,7 @@ __pycache__/
 # EN: Experiment result directories
 /experiments/data/
 /experiments/results/
+/results/
 /experiments/compare_recursive_vs_hierarchy_runs/
 /experiments/**/*_runs/
 /experiments/**/*_results/
@@ -65,6 +66,9 @@ __pycache__/
 /experiments/**/*.json
 !/experiments/main_scaling/paper_matrix.json
 !/experiments/accuracy_runtime_pareto/paper_matrix.json
+!/experiments/main_scaling/data_manifest.json
+!/experiments/exactness_verification/paper_matrix.json
+!/experiments/parameter_sensitivity/paper_matrix.json
 /experiments/**/*trace*.json
 /experiments/dual_assign/.dual_feas_raw_ext_build/
 /experiments/asymmetric_scan_fusion/results/

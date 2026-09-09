@@ -3,7 +3,6 @@ from __future__ import annotations
 # CN: 本模块包含 HELLO 私有双线性 cost runtime 的 fused-scan 与调度原语。
 # EN: This module contains fused-scan and dispatch primitives for HELLO's private bilinear cost runtime.
 
-from dataclasses import replace
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
@@ -15,17 +14,14 @@ from hello_ot.initialization.state import (
     _assign_state_from_known_dual_directional_scan,
     _complete_dual_from_candidate,
     _complete_dual_by_ctransform_top1,
-    _normalize_dual_assignment_state,
     _materialize_deferred_candidate_union,
     _state_from_gpu,
     _state_to_cpu_public,
     _unique_merge_rows_cols_vals,
 )
-from hello_ot.hierarchy.utilities import _normalize_subproblem_masses
 from hello_ot._internal.trace import _ChromeTraceCollector
-from hello_ot.refinement.loop import _refine_lowrank_from_warm_start
 from hello_ot.config import SolverRuntimeConfig
-from hello_ot.state import GPUWarmStartState as OTWarmStartGPUState, WarmStartState as OTWarmStartState
+from hello_ot.state import GPUWarmStartState as OTWarmStartGPUState
 
 
 def solve_leaf_lowrank(
@@ -196,79 +192,3 @@ def complete_dual_lowrank(
         trace_prefix=str(trace_prefix),
         dot_scale=float(dot_scale),
     )
-
-
-def refine_node_lowrank(
-    *,
-    source_F: np.ndarray,
-    target_G: np.ndarray,
-    source_cost_vec: np.ndarray,
-    target_cost_vec: np.ndarray,
-    source_mass: np.ndarray,
-    target_mass: np.ndarray,
-    scope: Literal["internal", "root"],
-    warm_start: OTWarmStartState | OTWarmStartGPUState,
-    config: SolverRuntimeConfig,
-    skip_initial_pricing: bool,
-    dual_feasibility_tol: float,
-    dual_feasibility_norm: Literal["l2", "linf"] = "l2",
-    lp_termination_norm: Literal["l2", "linf"] = "l2",
-    tracer: Optional[_ChromeTraceCollector],
-    trace_prefix: str,
-    pricing_index_pool: Optional[Any],
-    warm_start_cost_vec_chunk_size: int = 65536,
-    warm_start_cost_vec_feature_chunk_size: Optional[int] = None,
-    warm_start_profile_depth: int = 0,
-    dot_scale: float = 1.0,
-) -> Tuple[DualAssignmentState, Dict[str, Any]]:
-    sub_source_mass, sub_target_mass, _ = _normalize_subproblem_masses(source_mass, target_mass)
-    solve_cfg = replace(config)
-
-    solve_cfg.pricing_strategy = "nodewise_full"
-    solve_cfg.convergence_criterion = "dual_feasibility"
-    solve_cfg.require_dual_feasibility_convergence = False
-    solve_cfg.dual_feasibility_tol = float(dual_feasibility_tol)
-    solve_cfg.lp_termination_norm = str(lp_termination_norm)
-    solve_cfg.require_added_convergence = False
-    solve_cfg.validate()
-
-    solve_cfg.cost_type = "lowrank"
-    solve_cfg.dot_scale = float(dot_scale)
-    solve_cfg.validate()
-
-    result = _refine_lowrank_from_warm_start(
-        source_F=source_F,
-        target_G=target_G,
-        source_cost_vec=source_cost_vec,
-        target_cost_vec=target_cost_vec,
-        source_mass=sub_source_mass,
-        target_mass=sub_target_mass,
-        log=True,
-        return_coupling=True,
-        return_state=True,
-        config=solve_cfg,
-        warm_start=warm_start,
-        skip_initial_pricing=bool(skip_initial_pricing),
-        use_lp_warm_start_dual=True,
-        trace_collector=tracer,
-        trace_prefix=str(trace_prefix),
-        warm_start_profile_depth=int(warm_start_profile_depth),
-        pricing_index_pool=pricing_index_pool,
-        warm_start_cost_vec_chunk_size=int(warm_start_cost_vec_chunk_size),
-        warm_start_cost_vec_feature_chunk_size=warm_start_cost_vec_feature_chunk_size,
-        _consume_warm_start_gpu_state=True,
-        dual_feasibility_norm=dual_feasibility_norm,
-        dot_scale=float(dot_scale),
-    )
-    if not isinstance(result, dict):
-        raise RuntimeError("HELLO refinement expected a structured result dictionary.")
-    state = result.get("warm_start_state")
-    if not isinstance(state, OTWarmStartState):
-        raise RuntimeError("hello refine did not return warm_start_state.")
-    normalized_state = (
-        state
-        if str(getattr(config, "backend", "native")) == "torch"
-        else _normalize_dual_assignment_state(state, pipeline="gpu")
-    )
-    result["warm_start_state"] = normalized_state
-    return normalized_state, result

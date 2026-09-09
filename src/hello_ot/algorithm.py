@@ -15,10 +15,13 @@ from hello_ot.cost import (
     complete_dual,
     materialize_deferred_assignment_union,
     propagate_and_assign_dual,
-    refine_node_by_cost,
+    begin_refinement_by_cost,
+    finalize_refinement_by_cost,
     scan_deferred_assignment_candidates,
     solve_leaf_by_cost,
 )
+from hello_ot.refinement.iterations import check_optimality, solve_lp, update_support
+from hello_ot.perturbation import switch_level_to_perturbed_cost as _switch_level_to_perturbed_cost
 from hello_ot.hierarchy.construction import (
     HierarchyNodeRange as _HierarchyNodeRange,
     first_child_range as _first_child_range,
@@ -38,7 +41,12 @@ from hello_ot.initialization.state import (
 from hello_ot._internal.trace import _ChromeTraceCollector
 from hello_ot._internal.runtime_context import record_solve_event
 from hello_ot.restricted_ot.runtime import extract_level_zero_summary
-from hello_ot.config import SolverRuntimeConfig
+from hello_ot.config import (
+    SolverRuntimeConfig,
+    StoppingNormPolicy,
+    finest_stopping_norm,
+    level_stopping_norm,
+)
 from hello_ot.state import (
     GPUWarmStartState as OTWarmStartGPUState,
     WarmStartState as OTWarmStartState,
@@ -182,6 +190,56 @@ class _DualAssignmentResult:
 
 
 @dataclass
+class _HierarchyExecution:
+    """
+    CN: hierarchy 算法之外准备好的数据与运行设施，避免其污染论文级控制流。
+    EN: Data and runtime facilities prepared outside the hierarchy algorithm so they do not pollute its paper-level control flow.
+    """
+
+    cost_context: HelloCostContext
+    source_F: np.ndarray
+    target_G: np.ndarray
+    source_cost: np.ndarray
+    target_cost: np.ndarray
+    source_mass: np.ndarray
+    target_mass: np.ndarray
+    config: SolverRuntimeConfig
+    assignment_topk: int
+    split_count: int
+    dual_feasibility_tol: float
+    stopping_norm: StoppingNormPolicy
+    tracer: Optional[_ChromeTraceCollector]
+    pricing_index_pool: Optional[Any]
+    memory_recorder: Optional[Any]
+    log: bool
+    perturbation: Any = None
+
+    def context_for(self, node: _HierarchyNodeRange) -> HelloCostContext:
+        """
+        CN: 获取当前层成本上下文，保留扰动的全局边标识。
+        EN: Get this level's cost context while preserving global perturbation identities.
+        """
+        return self.cost_context.sliced(
+            slice(node.source_start, node.source_stop),
+            slice(node.target_start, node.target_stop),
+        )
+
+    def new_reentry_detector(self) -> Any:
+        """
+        CN: 为当前原成本层建立独立检测器。
+        EN: Create an independent detector for the current original-cost level.
+        """
+        return None if self.perturbation is None else self.perturbation.new_detector()
+
+    def stopping_norm_for(self, node: _HierarchyNodeRange) -> Literal["l2", "linf"]:
+        """
+        CN: 粗层固定使用 L2；finest_linf 只将最精细层切换到 L-infinity。
+        EN: Keep coarse levels on L2; finest_linf switches only the finest level to L-infinity.
+        """
+        return level_stopping_norm(self.stopping_norm, level_index=int(node.depth))
+
+
+@dataclass
 class _InitializedHierarchyLevel:
     node: _HierarchyNodeRange
     arrays: Dict[str, np.ndarray]
@@ -189,9 +247,12 @@ class _InitializedHierarchyLevel:
     split_axis: str
     trace_args: Dict[str, Any]
     started_at: float
+    initialization_elapsed: float
     support_before_solve: int
     stitch_profile: Dict[str, Any]
     assignment: _DualAssignmentResult
+    refinement: Any
+    refine_span: Any
 
 
 def _dual_assign_stitched_node(
@@ -380,25 +441,17 @@ def _initialize_hierarchy_level(
     *,
     node: _HierarchyNodeRange,
     child_state: OTWarmStartState | OTWarmStartGPUState,
-    cost_context: HelloCostContext,
-    source_F_full: np.ndarray,
-    target_G_full: np.ndarray,
-    source_cost_vec_full: np.ndarray,
-    target_cost_vec_full: np.ndarray,
-    source_mass_raw: np.ndarray,
-    target_mass_raw: np.ndarray,
-    config: SolverRuntimeConfig,
-    assignment_topk: int,
-    split_count: int,
-    tracer: Optional[_ChromeTraceCollector],
-    memory_recorder: Optional[Any],
-    log: bool,
+    execution: _HierarchyExecution,
 ) -> _InitializedHierarchyLevel:
     """
     CN: 执行论文的层间 initialization：继承 dual、c-transform completion、双向 dual assignment 与可行支撑构造。
     EN: Run paper-level initialization: dual inheritance, c-transform completion, bidirectional dual assignment, and feasible-support construction.
     """
     started_at = time.perf_counter()
+    cost_context = execution.context_for(node)
+    config = execution.config
+    tracer = execution.tracer
+    memory_recorder = execution.memory_recorder
     trace_args = {
         "path": str(node.path),
         "depth": int(node.depth),
@@ -412,7 +465,7 @@ def _initialize_hierarchy_level(
     _, chosen_partition = _first_child_range(
         node,
         split_axis=split_axis,
-        split_count=int(split_count),
+        split_count=int(execution.split_count),
     )
     if split_axis == "source":
         source_partitions = [np.asarray(chosen_partition, dtype=np.int64)]
@@ -445,12 +498,12 @@ def _initialize_hierarchy_level(
 
     arrays = _slice_node_arrays(
         node=node,
-        source_F_full=source_F_full,
-        target_G_full=target_G_full,
-        source_cost_vec_full=source_cost_vec_full,
-        target_cost_vec_full=target_cost_vec_full,
-        source_mass_raw=source_mass_raw,
-        target_mass_raw=target_mass_raw,
+        source_F_full=execution.source_F,
+        target_G_full=execution.target_G,
+        source_cost_vec_full=execution.source_cost,
+        target_cost_vec_full=execution.target_cost,
+        source_mass_raw=execution.source_mass,
+        target_mass_raw=execution.target_mass,
     )
     assignment = _dual_assign_stitched_node(
         node=node,
@@ -459,8 +512,8 @@ def _initialize_hierarchy_level(
         arrays=arrays,
         cost_context=cost_context,
         known_side=known_side,
-        assignment_topk=int(assignment_topk),
-        split_count=int(split_count),
+        assignment_topk=int(execution.assignment_topk),
+        split_count=int(execution.split_count),
         tracer=tracer,
         trace_args=trace_args,
         memory_recorder=memory_recorder,
@@ -478,54 +531,20 @@ def _initialize_hierarchy_level(
         primal=state.x_prev,
         dual=state.dual_uv,
     )
-    if log:
+    if execution.log:
         _print_augment_profile_before_refine(
             depth=int(node.depth),
-            assignment_topk=int(assignment_topk),
+            assignment_topk=int(execution.assignment_topk),
             support_after_forward=int(assignment.support_after_forward),
             support_after_reverse=assignment.support_after_reverse,
         )
-    return _InitializedHierarchyLevel(
-        node=node,
-        arrays=arrays,
-        state=state,
-        split_axis=split_axis,
-        trace_args=trace_args,
-        started_at=started_at,
-        support_before_solve=support_before_solve,
-        stitch_profile=dict(stitch_profile),
-        assignment=assignment,
-    )
-
-
-def _refine_hierarchy_level(
-    initialized: _InitializedHierarchyLevel,
-    *,
-    levels: List[Dict[str, Any]],
-    cost_context: HelloCostContext,
-    config: SolverRuntimeConfig,
-    split_count: int,
-    dual_feasibility_tol: float,
-    finest_dual_feasibility_norm: Literal["l2", "linf"],
-    finest_lp_stopping_norm: Literal["l2", "linf"],
-    tracer: Optional[_ChromeTraceCollector],
-    pricing_index_pool: Optional[Any],
-    memory_recorder: Optional[Any],
-) -> Tuple[OTWarmStartState | OTWarmStartGPUState, Dict[str, Any]]:
-    """
-    CN: 在一个非 coarsest 层执行 active-support refinement，并原地更新层级诊断。
-    EN: Run active-support refinement at one non-coarsest level and update level diagnostics in place.
-    """
-    node = initialized.node
-    arrays = initialized.arrays
-    parent_state = initialized.state
-    is_root = node.depth == 0
     refine_span = (
-        memory_recorder.begin_span(phase="refine", node=node, state=parent_state)
+        memory_recorder.begin_span(phase="refine", node=node, state=state)
         if memory_recorder is not None
         else None
     )
-    final_state, node_result = refine_node_by_cost(
+    level_stopping_norm = execution.stopping_norm_for(node)
+    refinement = begin_refinement_by_cost(
         cost_context=cost_context,
         source_F=arrays["source_F"],
         target_G=arrays["target_G"],
@@ -533,18 +552,47 @@ def _refine_hierarchy_level(
         target_cost_vec=arrays["target_cost_vec"],
         source_mass=arrays["source_mass"],
         target_mass=arrays["target_mass"],
-        scope="root" if is_root else "internal",
-        warm_start=parent_state,
+        warm_start=state,
         config=config,
         skip_initial_pricing=(cost_context.score_family == "inner_product"),
-        dual_feasibility_tol=float(dual_feasibility_tol),
-        dual_feasibility_norm=finest_dual_feasibility_norm if is_root else "l2",
-        lp_termination_norm=finest_lp_stopping_norm if is_root else "l2",
+        dual_feasibility_tol=float(execution.dual_feasibility_tol),
+        dual_feasibility_norm=level_stopping_norm,
+        lp_termination_norm=level_stopping_norm,
         tracer=tracer,
         trace_prefix="hello.refinement",
-        pricing_index_pool=pricing_index_pool,
+        pricing_index_pool=execution.pricing_index_pool,
         warm_start_profile_depth=int(node.depth),
     )
+    initialization_elapsed = float(time.perf_counter() - started_at)
+    return _InitializedHierarchyLevel(
+        node=node,
+        arrays=arrays,
+        state=state,
+        split_axis=split_axis,
+        trace_args=trace_args,
+        started_at=started_at,
+        initialization_elapsed=initialization_elapsed,
+        support_before_solve=support_before_solve,
+        stitch_profile=dict(stitch_profile),
+        assignment=assignment,
+        refinement=refinement,
+        refine_span=refine_span,
+    )
+
+
+def _finalize_hierarchy_level(
+    initialized: _InitializedHierarchyLevel,
+    *,
+    levels: List[Dict[str, Any]],
+    execution: _HierarchyExecution,
+) -> Tuple[OTWarmStartState | OTWarmStartGPUState, Dict[str, Any]]:
+    """
+    CN: 完成当前层并封装诊断；算法迭代不隐藏在此函数中。
+    EN: Finalize the current level and package diagnostics; no algorithm iteration is hidden here.
+    """
+    node = initialized.node
+    memory_recorder = execution.memory_recorder
+    final_state, node_result = finalize_refinement_by_cost(initialized.refinement)
     record_solve_event(
         "refine_level",
         path=str(node.path),
@@ -554,13 +602,19 @@ def _refine_hierarchy_level(
         dual=final_state.dual_uv,
     )
     if memory_recorder is not None:
-        memory_recorder.end_span(refine_span, state=final_state)
+        memory_recorder.end_span(initialized.refine_span, state=final_state)
 
     level_summary = extract_level_zero_summary(node_result)
     solve_summary = {
         "distance": float(node_result.get("distance", float("nan"))),
         "time": float(node_result.get("time", 0.0)),
         "lp_solve_time_total": float(node_result.get("lp_solve_time_total", 0.0)),
+        "full_scan_time": float(
+            sum(
+                float(record.get("full_scan_time", 0.0) or 0.0)
+                for record in node_result.get("warm_start_iteration_records", ())
+            )
+        ),
         "lp_backend_peak_mem_mib": node_result.get("lp_backend_peak_mem_mib"),
         "pricing_peak_mem_mib": node_result.get("pricing_peak_mem_mib"),
         "dual_feas_peak_mem_mib": node_result.get("dual_feas_peak_mem_mib"),
@@ -577,7 +631,7 @@ def _refine_hierarchy_level(
             "kind": "node",
             "split_axis": initialized.split_axis,
             "selected_child_index": 0,
-            "split_count": int(split_count),
+            "split_count": int(execution.split_count),
             "augment_direction": "bidirectional",
             "n_source": int(node.n_source),
             "n_target": int(node.n_target),
@@ -604,6 +658,7 @@ def _refine_hierarchy_level(
                 + assignment.augment_profile.get("total_time", 0.0)
                 + assignment.dual_completion_profile.get("total_time", 0.0)
             ),
+            "initialization_time": float(initialized.initialization_elapsed),
             "time": float(time.perf_counter() - initialized.started_at),
             "stitch_profile": initialized.stitch_profile,
             "augment_profile": assignment.augment_profile,
@@ -611,28 +666,36 @@ def _refine_hierarchy_level(
             "solve_summary": solve_summary,
         }
     )
+    from .progress import report_level_done
+
+    report_level_done(
+        execution,
+        node,
+        node_result,
+        active=support_after_solve,
+        initialization_elapsed=initialized.initialization_elapsed,
+        elapsed=time.perf_counter() - initialized.started_at,
+    )
     return final_state, node_result
 
 
 def _solve_coarsest_level(
     *,
     node: _HierarchyNodeRange,
-    cost_context: HelloCostContext,
-    source_F_full: np.ndarray,
-    target_G_full: np.ndarray,
-    source_cost_vec_full: np.ndarray,
-    target_cost_vec_full: np.ndarray,
-    source_mass_raw: np.ndarray,
-    target_mass_raw: np.ndarray,
-    config: SolverRuntimeConfig,
-    tracer: Optional[_ChromeTraceCollector],
-    memory_recorder: Optional[Any],
+    execution: _HierarchyExecution,
 ) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     CN: 直接求解 hierarchy 的 coarsest 层。
     EN: Solve the coarsest hierarchy level directly.
     """
+    from .progress import report_coarsest_done, report_level_start
+
+    report_level_start(execution, node, coarsest=True)
     t_node = time.perf_counter()
+    cost_context = execution.context_for(node)
+    config = execution.config
+    tracer = execution.tracer
+    memory_recorder = execution.memory_recorder
     trace_args = {
         "path": str(node.path),
         "depth": int(node.depth),
@@ -649,12 +712,12 @@ def _solve_coarsest_level(
             leaf_span = memory_recorder.begin_span(phase="leaf_solve", node=node) if memory_recorder is not None else None
             leaf_state, leaf_report = solve_leaf_by_cost(
                 cost_context=cost_context,
-                source_F_full=source_F_full,
-                target_G_full=target_G_full,
-                source_cost_vec_full=source_cost_vec_full,
-                target_cost_vec_full=target_cost_vec_full,
-                source_mass_raw=source_mass_raw,
-                target_mass_raw=target_mass_raw,
+                source_F_full=execution.source_F,
+                target_G_full=execution.target_G,
+                source_cost_vec_full=execution.source_cost,
+                target_cost_vec_full=execution.target_cost,
+                source_mass_raw=execution.source_mass,
+                target_mass_raw=execution.target_mass,
                 source_start=int(node.source_start),
                 source_stop=int(node.source_stop),
                 target_start=int(node.target_start),
@@ -734,30 +797,14 @@ def _solve_coarsest_level(
                 )
                 root_result["dual_source"] = np.asarray(state_cpu.dual_uv, dtype=np.float64)
                 root_result["warm_start_state"] = state_cpu
+            report_coarsest_done(execution, node, level)
             return normalized_leaf_state, [level], root_result
         raise ValueError("_solve_coarsest_level requires a coarsest hierarchy node")
 
 def _solve_hierarchy(
     *,
     root: _HierarchyNodeRange,
-    cost_context: HelloCostContext,
-    source_F_full: np.ndarray,
-    target_G_full: np.ndarray,
-    source_cost_vec_full: np.ndarray,
-    target_cost_vec_full: np.ndarray,
-    source_mass_raw: np.ndarray,
-    target_mass_raw: np.ndarray,
-    config: SolverRuntimeConfig,
-    assignment_topk: int,
-    split_count: int,
-    dual_feasibility_tol: float,
-    finest_dual_feasibility_norm: Literal["l2", "linf"],
-    finest_lp_stopping_norm: Literal["l2", "linf"],
-    node_seed: int,
-    tracer: Optional[_ChromeTraceCollector],
-    pricing_index_pool: Optional[Any],
-    memory_recorder: Optional[Any],
-    log: bool,
+    execution: _HierarchyExecution,
 ) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     CN: 按论文顺序执行 HELLO：构造 hierarchy，在 coarsest 层求解，再逐层 initialization 与 refinement。
@@ -770,53 +817,56 @@ def _solve_hierarchy(
         child, _ = _first_child_range(
             parent,
             split_axis=split_axis,
-            split_count=int(split_count),
+            split_count=int(execution.split_count),
         )
         hierarchy.append(child)
 
     state, levels, result = _solve_coarsest_level(
         node=hierarchy[-1],
-        cost_context=cost_context,
-        source_F_full=source_F_full,
-        target_G_full=target_G_full,
-        source_cost_vec_full=source_cost_vec_full,
-        target_cost_vec_full=target_cost_vec_full,
-        source_mass_raw=source_mass_raw,
-        target_mass_raw=target_mass_raw,
-        config=config,
-        tracer=tracer,
-        memory_recorder=memory_recorder,
+        execution=execution,
     )
+    from .progress import report_iteration, report_level_initialized, report_level_start
+
     for level in reversed(hierarchy[:-1]):
+        report_level_start(execution, level)
         initialized = _initialize_hierarchy_level(
             node=level,
             child_state=state,
-            cost_context=cost_context,
-            source_F_full=source_F_full,
-            target_G_full=target_G_full,
-            source_cost_vec_full=source_cost_vec_full,
-            target_cost_vec_full=target_cost_vec_full,
-            source_mass_raw=source_mass_raw,
-            target_mass_raw=target_mass_raw,
-            config=config,
-            assignment_topk=int(assignment_topk),
-            split_count=int(split_count),
-            tracer=tracer,
-            memory_recorder=memory_recorder,
-            log=bool(log),
+            execution=execution,
         )
-        state, result = _refine_hierarchy_level(
+        report_level_initialized(execution, initialized)
+        refinement = initialized.refinement
+        detector = execution.new_reentry_detector()
+        iteration_index = 0
+        certificate = None
+        while iteration_index < refinement.max_iterations:
+            iteration = solve_lp(refinement.runtime, iteration_index)
+            certificate = check_optimality(refinement.runtime, iteration)
+            if certificate.converged:
+                break
+            if detector is not None and detector.should_trigger():
+                initialized = _switch_level_to_perturbed_cost(
+                    initialized, iteration, certificate, execution, levels, detector
+                )
+                refinement = initialized.refinement
+                detector = None
+                iteration_index = 0
+                continue
+            update = update_support(
+                refinement.runtime, iteration, certificate, track_reentry=detector is not None
+            )
+            report_iteration(execution, refinement.runtime)
+            if detector is not None:
+                detector.observe(update)
+            iteration_index += 1
+
+        if certificate is not None and certificate.converged:
+            report_iteration(execution, refinement.runtime)
+
+        state, result = _finalize_hierarchy_level(
             initialized,
             levels=levels,
-            cost_context=cost_context,
-            config=config,
-            split_count=int(split_count),
-            dual_feasibility_tol=float(dual_feasibility_tol),
-            finest_dual_feasibility_norm=finest_dual_feasibility_norm,
-            finest_lp_stopping_norm=finest_lp_stopping_norm,
-            tracer=tracer,
-            pricing_index_pool=pricing_index_pool,
-            memory_recorder=memory_recorder,
+            execution=execution,
         )
     return state, levels, result
 
@@ -891,8 +941,7 @@ def _solve_hello_stage(
     assignment_topk: int,
     split_count: int,
     dual_feasibility_tol: float,
-    finest_dual_feasibility_norm: Literal["l2", "linf"] = "l2",
-    finest_lp_stopping_norm: Literal["l2", "linf"] = "l2",
+    stopping_norm: StoppingNormPolicy = "l2",
     node_seed: int,
     tracer: Optional[_ChromeTraceCollector] = None,
     pricing_index_pool: Optional[Any],
@@ -901,6 +950,8 @@ def _solve_hello_stage(
     return_state: bool,
     progress: Optional[bool] = None,
     consume_input_features: bool = False,
+    cost_perturbation: str = "off",
+    cost_perturbation_relative_scale: float = 0.01,
 ) -> Any:
     """
     CN: 执行固定语义的 HELLO，并返回内部层级求解结果。
@@ -916,10 +967,10 @@ def _solve_hello_stage(
     # CN: 先把外部配置规范化为 hierarchy 内部只接受的少数模式，避免层级遍历中出现隐式分支。
     # EN: Normalize external options to the small mode set accepted by the hierarchy traversal.
     cost_name = str(getattr(config, "cost_type", "lowrank")).strip().lower()
-    from hello_ot.refinement.dual_feasibility import normalize_dual_feasibility_norm
-
-    finest_stopping_norm = normalize_dual_feasibility_norm(finest_dual_feasibility_norm)
-    finest_lp_norm = normalize_dual_feasibility_norm(finest_lp_stopping_norm)
+    if stopping_norm not in {"l2", "finest_linf"}:
+        raise ValueError("stopping_norm must be one of: l2, finest_linf")
+    resolved_stopping_norm: StoppingNormPolicy = stopping_norm
+    resolved_finest_norm = finest_stopping_norm(resolved_stopping_norm)
     if cost_name == "lowrank":
         cost_context = HelloCostContext(
             score_family="inner_product",
@@ -930,20 +981,19 @@ def _solve_hello_stage(
         cost_context = HelloCostContext(score_family="norm_cost", cost_type=cost_name)
     else:
         raise ValueError("hello supports cost_type in {'lowrank', 'l1', 'linf', 'l2'}.")
-    if finest_stopping_norm == "linf" and cost_name != "lowrank":
-        raise ValueError("L-infinity finest-level stopping is currently supported only for lowrank/l2^2 costs.")
-    if finest_stopping_norm == "linf" and not bool(
+    if resolved_finest_norm == "linf" and cost_name != "lowrank":
+        raise ValueError("stopping_norm='finest_linf' is currently supported only for native l2^2 costs.")
+    if resolved_finest_norm == "linf" and str(getattr(config, "backend", "native")) != "native":
+        raise ValueError("stopping_norm='finest_linf' is currently supported only by the native backend.")
+    if resolved_finest_norm == "linf" and not bool(
         getattr(config, "use_fused_lowrank_feasibility_pricing", True)
     ):
-        raise ValueError("L-infinity finest-level stopping requires the fused lowrank feasibility/pricing scan.")
-    if finest_lp_norm == "linf" and cost_name != "lowrank":
-        raise ValueError("L-infinity restricted-LP termination is currently supported only for lowrank/l2^2 costs.")
+        raise ValueError("stopping_norm='finest_linf' requires the fused lowrank feasibility/pricing scan.")
     if bool(progress_enabled):
         print(
-            "[FinestStopping] "
-            f"outer_dual_norm={finest_stopping_norm} "
-            f"restricted_lp_termination_norm={finest_lp_norm} "
-            f"mismatch={str(finest_stopping_norm != finest_lp_norm).lower()}"
+            "[Stopping] "
+            f"policy={resolved_stopping_norm} "
+            f"intermediate_norm=l2 finest_norm={resolved_finest_norm}"
         )
     # CN: shuffle-once 在 hierarchy 构造前固定全局顺序；之后所有层都用连续区间表示，最后再映射回原始坐标。
     # EN: Shuffle-once fixes global order before hierarchy construction; levels then use contiguous ranges and are mapped back at output time.
@@ -1007,34 +1057,57 @@ def _solve_hello_stage(
         )
         # CN: 主算法显式构造 hierarchy，再从 coarsest 到 finest 逐层初始化和 refinement。
         # EN: The main algorithm explicitly builds the hierarchy, then initializes and refines from coarsest to finest.
-        t_hierarchy = time.perf_counter()
-        root_state, levels, root_result = _solve_hierarchy(
-            root=root,
+        hierarchy_execution = _HierarchyExecution(
             cost_context=cost_context,
-            source_F_full=source_F_reordered,
-            target_G_full=target_G_reordered,
-            source_cost_vec_full=source_cost_reordered,
-            target_cost_vec_full=target_cost_reordered,
-            source_mass_raw=source_mass_reordered,
-            target_mass_raw=target_mass_reordered,
+            source_F=source_F_reordered,
+            target_G=target_G_reordered,
+            source_cost=source_cost_reordered,
+            target_cost=target_cost_reordered,
+            source_mass=source_mass_reordered,
+            target_mass=target_mass_reordered,
             config=config,
             assignment_topk=int(assignment_topk),
             split_count=int(split_count),
             dual_feasibility_tol=float(dual_feasibility_tol),
-            finest_dual_feasibility_norm=finest_stopping_norm,
-            finest_lp_stopping_norm=finest_lp_norm,
-            node_seed=int(node_seed),
+            stopping_norm=resolved_stopping_norm,
             tracer=tracer,
             pricing_index_pool=pricing_index_pool,
             memory_recorder=memory_recorder,
             log=bool(progress_enabled),
         )
+        t_hierarchy = time.perf_counter()
+        from .perturbation import CostPerturbationRun, finish_original_problem
+
+        perturbation = CostPerturbationRun(
+            policy=cost_perturbation,
+            relative_scale=cost_perturbation_relative_scale,
+            random_seed=node_seed,
+            source_index=source_perm,
+            target_index=target_perm,
+        )
+        hierarchy_execution.perturbation = perturbation
+        if cost_perturbation == "on":
+            perturbation.activate(hierarchy_execution)
+        root_state, levels, root_result = _solve_hierarchy(
+            root=root,
+            execution=hierarchy_execution,
+        )
+        if perturbation.activated:
+            root_state, root_result = finish_original_problem(root, root_state, hierarchy_execution, levels)
+        if root_result is None:
+            raise RuntimeError("hello root node did not produce a solve result")
+        perturbation.record_stage(list(levels))
+        root_result["cost_stages"] = perturbation.stages
+        root_result["cost_perturbation"] = {
+            "policy": cost_perturbation, "activated": perturbation.activated, **perturbation.metadata,
+        }
         hierarchy_time = float(time.perf_counter() - t_hierarchy)
     if memory_recorder is not None:
         memory_recorder.record(phase="after_hierarchy_solve", node=root, state=root_state)
     if root_result is None:
         raise RuntimeError("hello root node did not produce a solve result.")
-    hierarchy_timing = _hierarchy_timing_summary(levels, hierarchy_time=hierarchy_time)
+    all_stage_levels = [level for stage in perturbation.stages for level in stage["levels"]]
+    hierarchy_timing = _hierarchy_timing_summary(all_stage_levels, hierarchy_time=hierarchy_time)
     root_result.update(
         {
             key: float(value)
@@ -1143,9 +1216,11 @@ def _solve_hello_stage(
         "augment_direction": "bidirectional",
         "cost_type": str(cost_context.cost_type),
         "score_family": str(cost_context.score_family),
-        "finest_dual_feasibility_norm": str(finest_stopping_norm),
-        "finest_lp_stopping_norm": str(finest_lp_norm),
-        "finest_stopping_norm_mismatch": bool(finest_stopping_norm != finest_lp_norm),
+        "stopping_norm": str(resolved_stopping_norm),
+        "intermediate_stopping_norm": "l2",
+        "finest_dual_feasibility_norm": str(resolved_finest_norm),
+        "finest_lp_stopping_norm": str(resolved_finest_norm),
+        "finest_stopping_norm_mismatch": False,
         "gpu_pipeline_enabled": True,
         "assignment_topk": int(assignment_topk),
         "hierarchy_depth": int(depth_remaining),

@@ -1,0 +1,8 @@
+{
+  "n": [16384, 32768, 65536, 131072, 262144],
+  "d": [4, 32, 256, 2048],
+  "seeds": [42],
+  "dataset": "imagenet_vavae_pca_gaussian_to_data",
+  "cost": "l2^2",
+  "backend": "native"
+}

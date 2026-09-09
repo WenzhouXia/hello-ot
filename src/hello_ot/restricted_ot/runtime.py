@@ -102,6 +102,22 @@ def _pricing_and_pruning(
     return strategy, pruning
 
 
+def _termination_solver_params(
+    solver_params: Optional[Dict[str, Any]], termination_norm: str
+) -> Dict[str, Any]:
+    """
+    CN: 将 HELLO 的 norm/eps 接口策略映射到 cuPDLPx termination 参数。
+    EN: Map HELLO's norm/eps interface policy to cuPDLPx termination parameters.
+    """
+    params = dict(solver_params or {})
+    params["termination_norm"] = str(termination_norm)
+    if termination_norm == "linf":
+        # CN: OT 的 Linf primal feasibility 使用纯相对判据，避免单位质量随问题规模缩小时被固定绝对项主导。
+        # EN: OT Linf primal feasibility is relative-only so a fixed absolute term cannot dominate shrinking unit masses.
+        params["eps_feasible_absolute_primal"] = 0.0
+    return params
+
+
 def _finish_restricted_solver(
     solver: HierarchicalOTSolver,
     config: SolverRuntimeConfig,
@@ -111,6 +127,7 @@ def _finish_restricted_solver(
     if config.backend == "native" and not torch.cuda.is_available():
         raise RuntimeError("HELLO native restricted OT requires CUDA.")
     solver._cost_type = str(cost_type)
+    solver._metric_cost_perturbation = config.metric_cost_perturbation
     solver._cost_dot_scale = float(config.dot_scale)
     # CN: HELLO 的正式计时使用 API/阶段直接 wall-time；禁止同步式 RuntimeProfiler 进入求解热路径。
     # EN: Formal HELLO timing uses direct API/stage wall time; the synchronizing RuntimeProfiler is excluded from the hot path.
@@ -130,8 +147,9 @@ def _finish_restricted_solver(
     solver._use_gpu_active_support = bool(torch.device(active_device).type == "cuda")
     solver._active_support_device = str(active_device)
     lp_kwargs = dict(getattr(solver, "_lp_solver_kwargs", {}) or {})
-    params = dict(lp_kwargs.get("solver_params", {}) or {})
-    params["termination_norm"] = str(config.lp_termination_norm)
+    params = _termination_solver_params(
+        lp_kwargs.get("solver_params"), str(config.lp_termination_norm)
+    )
     lp_kwargs["solver_params"] = params
     lp_kwargs.update(
         {
@@ -307,6 +325,7 @@ def extract_level_zero_summary(result: Dict[str, Any]) -> Dict[str, Any]:
             "level0_inner_iterations": -1,
             "level0_lp_time_total": float("nan"),
             "level0_pricing_time_total": float("nan"),
+            "level0_full_scan_time_total": float("nan"),
             "level0_total_time": float("nan"),
             "final_active_support_size": 0,
         }
@@ -314,6 +333,9 @@ def extract_level_zero_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         "level0_inner_iterations": int(level.get("iters", -1)),
         "level0_lp_time_total": float(level.get("lp_time", float("nan"))),
         "level0_pricing_time_total": float(level.get("pricing_time", float("nan"))),
+        "level0_full_scan_time_total": float(
+            level.get("full_scan_time", float("nan"))
+        ),
         "level0_total_time": float(level.get("time", float("nan"))),
         "level0_lp_backend_peak_mem_mib": level.get("lp_backend_peak_mem_mib"),
         "level0_pricing_peak_mem_mib": level.get("pricing_peak_mem_mib"),

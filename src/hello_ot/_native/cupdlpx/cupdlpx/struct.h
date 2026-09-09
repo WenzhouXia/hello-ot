@@ -180,12 +180,15 @@ typedef struct
 
 typedef struct
 {
+	double eps_optimal_absolute;
 	double eps_optimal_relative;
 	double eps_feasible_relative;
 	double eps_infeasible;
 	double time_sec_limit;
 	int iteration_limit;
+	double eps_feasible_absolute_primal;
 	double eps_feasible_relative_primal;
+	double eps_feasible_absolute_dual;
 	double eps_feasible_relative_dual;
 	int use_dual_nnz_gate;	 // 0=关闭(默认)，1=开启
 	double dual_nnz_factor;	 // 阈值系数，默认 2.0 (阈值 = factor * num_variables)

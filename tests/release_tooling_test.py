@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,8 +44,38 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
         "tests/torch_scan_test.py",
         "tests/hello_inplace_feature_layout_test.py",
         ".github/workflows/ci.yml",
+        "export_experiments/exactness_verification/run.py",
+        "export_experiments/parameter_sensitivity/run.py",
+        "export_experiments/main_scaling/data_manifest.json",
+        "third_party/README.md",
     }
     assert all((destination / relative).is_file() for relative in required)
+    assert not (destination / "experiments").exists()
+    # CN: 只使用导出目录的源码，验证公开入口不依赖内部工作区。
+    # EN: Use only exported sources to verify public entry points are independent of the internal workspace.
+    environment = dict(os.environ, PYTHONPATH=str(destination / "src"))
+    subprocess.run(
+        [sys.executable, "-c",
+         "import paper_experiments.baselines.linear_ot as b; "
+         "assert 'solve_public_hello' not in b.__all__; "
+         "assert 'solve_hello' in b.__all__; "
+         "assert 'solve_neufeld_cutplane' not in b.__all__; "
+         "assert 'solve_zanetti_ipm' not in b.__all__; "
+         "assert hasattr(b, 'solve_hello')"],
+        cwd=destination, env=environment, check=True,
+    )
+    for name in ("hello_cost_perturbation_test.py", "hello_algorithm_structure_test.py",
+                 "hello_ot_variants_test.py", "variants_numerical_equivalence_test.py"):
+        assert (destination / "tests" / name).is_file()
+    for family in ("main_scaling", "exactness_verification", "parameter_sensitivity", "accuracy_runtime_pareto"):
+        subprocess.run(
+            [sys.executable, "-m", f"export_experiments.{family}.run", "--help"],
+            cwd=destination,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     manifest = destination / "PUBLIC_MANIFEST.sha256"
     entries = manifest.read_text(encoding="utf-8").splitlines()
     assert entries

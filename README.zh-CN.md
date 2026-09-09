@@ -1,6 +1,6 @@
 # HELLO
 
-HELLO 是一个面向大规模平衡最优传输的点云求解器。默认 `native` backend 是论文实验使用的 CUDA 实现；用户显式选择 `torch` backend 后，可以只依赖普通 PyTorch 算子在 CPU 或 CUDA 上运行。安装或加载 native 失败时绝不会静默 fallback 到 Torch。
+HELLO 是一个面向大规模离散最优传输的点云求解器。默认 `native` backend 是论文实验使用的 CUDA 实现（目前在 A100 和 H100上进行过测试）；用户显式选择 `torch` backend 后，可以只依赖普通 PyTorch 算子在 CPU 或 CUDA 上运行。
 
 公开接口保持简洁：
 
@@ -60,4 +60,7 @@ scripts/build_native_wheel.sh dist
 
 源码构建需要 CUDA 11.8、兼容的 C++ compiler、Ninja 和 pybind11；安装预编译 wheel 不需要这些工具。
 
-算法与代码的对应关系见 `docs/algorithm.md`，公开实验入口见 `experiments/README.md`。
+算法与代码的对应关系见 `docs/algorithm.md`，公开实验入口见 `export_experiments/README.md`。
+
+完整实验复现请使用 GitHub 仓库；wheel 和 sdist 用于安装、构建 HELLO 包，不附带实验套件。
+后续 GPU 检查、wheel 验收及内部 adapter 迁移见 [发布清单](docs/release_checklist.md)。

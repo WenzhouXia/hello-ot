@@ -62,7 +62,7 @@ def test_paper_defaults_are_bitwise_equivalent_to_pre_migration_baseline(cost: s
         cost=cost,
         max_iterations=4,
         random_seed=42,
-        options=hello_ot.SolverOptions(coarsest_size_threshold=8),
+        options=hello_ot.SolverOptions(coarsest_size_threshold=8, cost_perturbation="off"),
     )
     solution = result.solution
     keys = np.asarray(solution.rows, dtype=np.int64) * int(solution.shape[1]) + np.asarray(

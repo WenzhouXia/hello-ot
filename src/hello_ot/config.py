@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Literal, Optional, Union
 
-DualFeasibilityNorm = Literal["l2", "linf"]
+StoppingNormPolicy = Literal["l2", "finest_linf"]
 BackendName = Literal["native", "torch"]
 TorchDeviceName = Literal["auto", "cpu", "cuda"]
+VerboseMode = Literal["off", "compact", "detailed"]
+
+
+def finest_stopping_norm(policy: StoppingNormPolicy) -> Literal["l2", "linf"]:
+    """
+    CN: 将公开 stopping policy 解析为最精细层实际使用的范数。
+    EN: Resolve the public stopping policy to the norm used at the finest level.
+    """
+    return "linf" if policy == "finest_linf" else "l2"
+
+
+def level_stopping_norm(
+    policy: StoppingNormPolicy, *, level_index: int
+) -> Literal["l2", "linf"]:
+    """
+    CN: 解析某个 hierarchy level 实际使用的 stopping norm，level 0 为最精细层。
+    EN: Resolve the stopping norm for a hierarchy level, where level 0 is the finest.
+    """
+    return finest_stopping_norm(policy) if int(level_index) == 0 else "l2"
 
 
 @dataclass(frozen=True)
@@ -21,14 +41,25 @@ class SolverOptions:
     pricing_topk: int = 2
     support_budget_factor: float = 10.0
     fused_scan_memory_floor_mib: float = 768.0
-    verbose: bool = False
+    stopping_norm: StoppingNormPolicy = "l2"
+    verbose: VerboseMode = "compact"
     record_trace: bool = False
     profile_memory: bool = False
     consume_input_features: bool = False
     backend: BackendName = "native"
     torch_device: TorchDeviceName = "auto"
+    cost_perturbation: Literal["on", "off", "auto"] = "auto"
+    cost_perturbation_relative_scale: float = 0.01
 
     def __post_init__(self) -> None:
+        if not isinstance(self.verbose, str) or self.verbose not in {"off", "compact", "detailed"}:
+            raise ValueError("verbose must be one of: off, compact, detailed; boolean values are not supported")
+        if self.stopping_norm not in {"l2", "finest_linf"}:
+            raise ValueError("stopping_norm must be one of: l2, finest_linf")
+        if self.cost_perturbation not in {"on", "off", "auto"}:
+            raise ValueError("cost_perturbation must be one of: on, off, auto")
+        if not math.isfinite(self.cost_perturbation_relative_scale) or self.cost_perturbation_relative_scale <= 0:
+            raise ValueError("cost_perturbation_relative_scale must be finite and > 0; use 'off' to disable")
         if self.split_count not in {2, 4, 8}:
             raise ValueError("split_count must be one of: 2, 4, 8")
         if self.coarsest_size_threshold < 1:
@@ -59,12 +90,15 @@ class SolverOptions:
             primal_tolerance=1e-10,
             max_iterations=max_iterations,
             fused_scan_memory_floor_mib=self.fused_scan_memory_floor_mib,
+            stopping_norm=self.stopping_norm,
             verbose=self.verbose,
             record_trace=self.record_trace,
             profile_memory=self.profile_memory,
             consume_input_features=self.consume_input_features,
             backend=self.backend,
             torch_device=self.torch_device,
+            cost_perturbation=self.cost_perturbation,
+            cost_perturbation_relative_scale=self.cost_perturbation_relative_scale,
         )
 
 
@@ -84,18 +118,18 @@ class _AlgorithmConfig:
     primal_tolerance: float
     max_iterations: int
     fused_scan_memory_floor_mib: float
-    verbose: bool
+    verbose: VerboseMode
     record_trace: bool
     profile_memory: bool
     consume_input_features: bool
     backend: BackendName
     torch_device: TorchDeviceName
+    cost_perturbation: str = "off"
+    cost_perturbation_relative_scale: float = 0.01
     dual_feasibility_tolerance: float = 1e-6
-    dual_feasibility_norm: DualFeasibilityNorm = "l2"
     lp_tolerance: float = 1e-6
-    lp_stopping_norm: DualFeasibilityNorm = "l2"
+    stopping_norm: StoppingNormPolicy = "l2"
     ensure_final_dual_feasible: bool = False
-    record_dual_linf_diagnostics: bool = False
     variable_bound_mode: str = "constant"
     matrix_value_mode: str = "implicit_aty"
     vector_sum_mode: str = "direct_reduce"
@@ -153,16 +187,19 @@ class SolverRuntimeConfig:
     added_violation_rel_threshold: float = 1e-6
     runtime_logging: Optional[Dict[str, Any]] = None
     debug: Optional[Dict[str, Any]] = None
+    metric_cost_perturbation: Optional[Any] = None
+    verbosity: VerboseMode = "off"
 
     @classmethod
     def from_options(cls, config: _AlgorithmConfig, *, cost_type: str) -> "SolverRuntimeConfig":
+        detailed = config.verbose == "detailed"
         printing = {
-            "enabled": bool(config.verbose),
-            "progress": bool(config.verbose),
-            "warm_start": bool(config.verbose),
-            "profile_iter": bool(config.verbose),
-            "profile_level": bool(config.verbose),
-            "profile_run": bool(config.verbose),
+            "enabled": detailed,
+            "progress": detailed,
+            "warm_start": detailed,
+            "profile_iter": detailed,
+            "profile_level": detailed,
+            "profile_run": detailed,
             "iter_interval": 10,
         }
         profiling = {
@@ -184,11 +221,11 @@ class SolverRuntimeConfig:
             tolerance=float(config.lp_tolerance),
             max_inner_iter=int(config.max_iterations),
             dual_feasibility_tol=float(config.dual_feasibility_tolerance),
-            lp_termination_norm=str(config.lp_stopping_norm),
+            lp_termination_norm=finest_stopping_norm(config.stopping_norm),
             pricing_topk=float(config.pricing_topk),
             cleaning_primal_tol=float(config.primal_tolerance),
             cleaning_threshold_factor=float(config.support_budget_factor),
-            lp_solver_verbose=bool(config.verbose),
+            lp_solver_verbose=detailed,
             enable_profiling=False,
             printing=printing,
             profiling=profiling,
@@ -199,10 +236,11 @@ class SolverRuntimeConfig:
             cupdlpx_python_pre_rescale=bool(config.cupdlpx_python_pre_rescale),
             backend=config.backend,
             torch_device=str(config.torch_device),
-            record_dual_linf_diagnostics=bool(config.record_dual_linf_diagnostics),
+            record_dual_linf_diagnostics=(config.backend == "native" and str(cost_type) == "lowrank"),
             runtime_logging=dict(printing),
             ensure_final_dual_feasible=bool(config.ensure_final_dual_feasible),
             fused_lowrank_scan_memory_floor_mib=float(config.fused_scan_memory_floor_mib),
+            verbosity=config.verbose,
         )
         runtime.validate()
         return runtime
@@ -218,6 +256,8 @@ class SolverRuntimeConfig:
         return dict(self.runtime_logging or self.printing)
 
     def validate(self) -> None:
+        if self.verbosity not in {"off", "compact", "detailed"}:
+            raise ValueError("verbosity must be one of: off, compact, detailed")
         if float(self.dot_scale) not in {1.0, 2.0}:
             raise ValueError("dot_scale must be exactly 1 or 2")
         if self.solver_engine not in {"cupdlpx", "torch_pdlp"}:
@@ -237,4 +277,8 @@ class SolverRuntimeConfig:
 __all__ = [
     "SolverOptions",
     "SolverRuntimeConfig",
+    "StoppingNormPolicy",
+    "VerboseMode",
+    "finest_stopping_norm",
+    "level_stopping_norm",
 ]

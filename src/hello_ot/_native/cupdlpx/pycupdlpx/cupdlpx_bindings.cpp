@@ -1095,9 +1095,31 @@ public:
     pull("time_sec_limit", params.termination_criteria.time_sec_limit);
     pull("iteration_limit", params.termination_criteria.iteration_limit);
     pull("eps_optimal_relative", params.termination_criteria.eps_optimal_relative);
+    if (user_params.contains("eps_optimal_absolute"))
+      pull("eps_optimal_absolute", params.termination_criteria.eps_optimal_absolute);
+    else if (user_params.contains("eps_optimal_relative"))
+      params.termination_criteria.eps_optimal_absolute = params.termination_criteria.eps_optimal_relative;
     pull("eps_feasible_relative", params.termination_criteria.eps_feasible_relative);
     pull("eps_feasible_relative_primal", params.termination_criteria.eps_feasible_relative_primal);
+    if (user_params.contains("eps_feasible_absolute_primal"))
+      pull("eps_feasible_absolute_primal", params.termination_criteria.eps_feasible_absolute_primal);
+    else if (user_params.contains("eps_feasible_relative_primal"))
+      params.termination_criteria.eps_feasible_absolute_primal = params.termination_criteria.eps_feasible_relative_primal;
     pull("eps_feasible_relative_dual", params.termination_criteria.eps_feasible_relative_dual);
+    if (user_params.contains("eps_feasible_absolute_dual"))
+      pull("eps_feasible_absolute_dual", params.termination_criteria.eps_feasible_absolute_dual);
+    else if (user_params.contains("eps_feasible_relative_dual"))
+      params.termination_criteria.eps_feasible_absolute_dual = params.termination_criteria.eps_feasible_relative_dual;
+    auto validate_tolerance_pair = [](const char *name, double absolute_tolerance, double relative_tolerance)
+    {
+      if (!std::isfinite(absolute_tolerance) || !std::isfinite(relative_tolerance) ||
+          absolute_tolerance < 0.0 || relative_tolerance < 0.0 ||
+          (absolute_tolerance == 0.0 && relative_tolerance == 0.0))
+        throw std::invalid_argument(std::string(name) + " tolerances must be finite, nonnegative, and not both zero.");
+    };
+    validate_tolerance_pair("objective gap", params.termination_criteria.eps_optimal_absolute, params.termination_criteria.eps_optimal_relative);
+    validate_tolerance_pair("primal feasibility", params.termination_criteria.eps_feasible_absolute_primal, params.termination_criteria.eps_feasible_relative_primal);
+    validate_tolerance_pair("dual feasibility", params.termination_criteria.eps_feasible_absolute_dual, params.termination_criteria.eps_feasible_relative_dual);
     pull("eps_infeasible", params.termination_criteria.eps_infeasible);
     pull("l_inf_ruiz_iterations", params.l_inf_ruiz_iterations);
     pull("bound_objective_rescaling", params.bound_objective_rescaling);
@@ -1653,8 +1675,13 @@ static py::dict make_default_params()
   d["reflection_coefficient"] = p.reflection_coefficient;
   d["time_sec_limit"] = p.termination_criteria.time_sec_limit;
   d["iteration_limit"] = p.termination_criteria.iteration_limit;
+  d["eps_optimal_absolute"] = p.termination_criteria.eps_optimal_absolute;
   d["eps_optimal_relative"] = p.termination_criteria.eps_optimal_relative;
   d["eps_feasible_relative"] = p.termination_criteria.eps_feasible_relative;
+  d["eps_feasible_absolute_primal"] = p.termination_criteria.eps_feasible_absolute_primal;
+  d["eps_feasible_relative_primal"] = p.termination_criteria.eps_feasible_relative_primal;
+  d["eps_feasible_absolute_dual"] = p.termination_criteria.eps_feasible_absolute_dual;
+  d["eps_feasible_relative_dual"] = p.termination_criteria.eps_feasible_relative_dual;
   d["eps_infeasible"] = p.termination_criteria.eps_infeasible;
   d["use_dual_nnz_gate"] = p.termination_criteria.use_dual_nnz_gate; // 0
   d["dual_nnz_factor"] = p.termination_criteria.dual_nnz_factor;     // 2.0

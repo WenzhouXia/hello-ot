@@ -38,6 +38,10 @@ The paper uses the dual score $\sigma_{ij}=f_i+g_j-c_{ij}$. Code may compute the
 
 Checks dual feasibility over the complete edge set after a restricted LP solve. The public tolerance is fixed to the paper value rather than exposed as a user option.
 
+`SolverOptions.stopping_norm` selects a hierarchy-wide stopping policy. `l2` uses L2 for restricted-LP stopping and the full optimality check at every refinement level. `finest_linf` uses L2 at coarser levels and L-infinity for both checks at the finest level, so the returned solution has an L-infinity certificate. The default is `l2`. `finest_linf` currently requires the native squared-L2 path. The native squared-L2 scan records both L2 and L-infinity diagnostics from the same scan regardless of which norm controls stopping.
+
+`full_scan_time` is the wall time of all complete-edge traversals in one refinement iteration. A fused feasibility, dual-violation, and candidate-selection pass is counted once. When feasibility and violation detection require separate complete-edge passes, their times are added. Candidate deduplication, active-support insertion, and budgeted pruning are excluded.
+
 ## Dual-violation insertion
 
 Adds full-edge dual violators to the active support. This is the first part of the paper's support update.
@@ -53,3 +57,13 @@ The sparse set of edges on which the restricted OT problem is solved. Prefer `ac
 ## Costs
 
 The public cost names are `l2^2`, `l1`, `l2`, and `linf`. `l2^2` is lowered internally to a bilinear representation without materializing the dense cost matrix. Internal representation names are not public cost types.
+
+## Cost perturbation
+
+An auxiliary cost problem used to obtain dual potentials before final refinement with the original cost. `SolverOptions.cost_perturbation` selects `on`, `off`, or `auto`; this activation policy is distinct from the noise representation (rank-2 or index hash). The public balanced-OT default is `auto`. A solve uses one globally consistent perturbation definition and scale, and can activate it at most once.
+
+For norm costs, index hash uses a shared FP32 approximate-remainder rule in NumPy, Torch, and native CUDA, with fixed operation order and FP64 amplitude multiplication. It is not an exact integer-modulo hash; boundary values may slightly exceed one and are not clipped.
+
+## Active-support re-entry
+
+An edge added by dual-violation insertion that was removed by budgeted pruning in the immediately preceding round. In `auto`, any such re-entry starts one LP observation period. If the next full optimality check still fails, cost perturbation is activated at the current level and retained at finer levels before final original-cost refinement. This is a heuristic trigger, not a proof of cycling. History is reset between levels and never accumulated across rounds.

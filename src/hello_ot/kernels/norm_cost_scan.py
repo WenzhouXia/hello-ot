@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import time
+from functools import lru_cache
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Dict, Literal, Optional, Tuple
@@ -42,7 +43,6 @@ from hello_ot.kernels.scan_contract import (
     plan_stream_chunk_rows,
     reusable_cuda_memory_bytes,
 )
-from hello_ot.refinement.loop import _run_single_level_active_support_refinement_loop
 from hello_ot.initialization.initial_support import (
     _WARM_START_INITIAL_CREATION_ITER,
     _augment_active_support_with_northwest_corner,
@@ -50,9 +50,6 @@ from hello_ot.initialization.initial_support import (
 )
 from hello_ot.restricted_ot.runtime import (
     build_metric_restricted_solver,
-    finalize_solve_output,
-    state_from_active_support,
-    sum_level_summary_metric,
 )
 from hello_ot.restricted_ot.active_support import ActiveSupport
 from hello_ot.config import SolverRuntimeConfig
@@ -86,6 +83,7 @@ def pair_costs_metric(
     cols: Any,
     cost_type: MetricCostType,
     batch_size: int = 65536,
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Any:
     cost_name = str(cost_type)
     if cost_name == "l1":
@@ -102,7 +100,8 @@ def pair_costs_metric(
         costs = _cost_pairs_linf_batched(level_cache, rows, cols, batch_size=int(batch_size))
     else:
         costs = _cost_pairs_euclidean_batched(level_cache, rows, cols, batch_size=int(batch_size))
-    return costs.to(dtype=torch.float64) if torch.is_tensor(costs) else np.asarray(costs, dtype=np.float64)
+    costs = costs.to(dtype=torch.float64) if torch.is_tensor(costs) else np.asarray(costs, dtype=np.float64)
+    return _apply_metric_pair_perturbation(costs, rows, cols, perturbation)
 
 
 def solve_leaf_metric(
@@ -118,11 +117,15 @@ def solve_leaf_metric(
     cost_type: MetricCostType,
     node_trace_args: Dict[str, Any],
     tracer: Optional[_ChromeTraceCollector],
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DualAssignmentState, Dict[str, Any]]:
     source = np.asarray(source_points_full[int(source_start) : int(source_stop)], dtype=np.float32, order="C")
     target = np.asarray(target_points_full[int(target_start) : int(target_stop)], dtype=np.float32, order="C")
     t_cost = time.perf_counter()
     cost = _metric_cost_matrix(source, target, cost_type)
+    if perturbation is not None:
+        rows, cols = np.indices(cost.shape)
+        cost = _apply_metric_pair_perturbation(cost.reshape(-1), rows.reshape(-1), cols.reshape(-1), perturbation).reshape(cost.shape)
     cost_build_time = float(time.perf_counter() - t_cost)
     source_mass, target_mass, _ = _normalize_subproblem_masses(
         np.asarray(source_mass_raw[int(source_start) : int(source_stop)], dtype=np.float64, order="C"),
@@ -157,11 +160,16 @@ def _require_norm_cost_scan_ext() -> Any:
         fail hard without a KeOps fallback.
     """
     try:
-        return importlib.import_module(_NORM_COST_SCAN_EXT_MODULE)
+        module = importlib.import_module(_NORM_COST_SCAN_EXT_MODULE)
+        if not getattr(module, "supports_cost_perturbation", False):
+            raise RuntimeError("installed norm-cost extension predates cost perturbation; rebuild the native extensions")
+        if getattr(module, "index_hash_arithmetic", None) != "fp32_remainder_v1":
+            raise RuntimeError("installed norm-cost extension uses a different index hash; rebuild the native extensions")
+        return module
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
             "norm-cost hello requires the custom scan CUDA extension "
-            f"({_NORM_COST_SCAN_EXT_MODULE}); rebuild with `pip install -e .` on a "
+            f"({_NORM_COST_SCAN_EXT_MODULE}); rebuild with `HELLO_OT_BUILD_NATIVE=1 pip install -e .` on a "
             "CUDA-capable machine. There is no KeOps fallback in the metric chain."
         ) from exc
 
@@ -179,11 +187,15 @@ def _fused_metric_kmin(
     known_dual: np.ndarray | torch.Tensor,
     cost_type: MetricCostType,
     k: int,
+    query_is_source: bool = True,
+    query_global_index: Optional[np.ndarray] = None,
+    database_global_index: Optional[np.ndarray] = None,
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    CN: 用 fused kernel 计算每行 (cost-dual) 的 K 个最小值。
+    CN: 用 fused kernel 计算每行 (cost+perturb-dual) 的 K 个最小值。
         1..32 的任意 K 向上映射到 CUDA bucket，然后裁剪为请求的 K；不做静默回退。
-    EN: Use the fused kernel for the K smallest (cost-dual) values per
+    EN: Use the fused kernel for the K smallest (cost+perturb-dual) values per
         row. Any K in 1..32 is rounded up to a CUDA bucket and sliced back to the
         requested K; no silent fallback is allowed.
     """
@@ -228,13 +240,28 @@ def _fused_metric_kmin(
         query_t: torch.Tensor,
         database_t: torch.Tensor,
         dual_t: torch.Tensor,
+        query_index: Optional[np.ndarray],
+        database_index: Optional[np.ndarray],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sigma, seed, mode, q_idx_t, d_idx_t, coeffs = _fused_perturb_arguments(
+            perturbation=perturbation,
+            query_global_index=query_index,
+            database_global_index=database_index,
+            device=device,
+        )
         return ext.fused_gcost_topk(
             query_t,
             database_t,
             dual_t,
             int(kernel_k),
             int(_fused_cost_type_id(cost_type)),
+            q_idx_t,
+            d_idx_t,
+            float(sigma),
+            int(seed),
+            mode,
+            bool(query_is_source),
+            coeffs,
         )
 
     if memory_plan.resident_side == "target":
@@ -245,10 +272,13 @@ def _fused_metric_kmin(
         for q_start in range(0, int(query_np.shape[0]), chunk_rows):
             q_stop = min(int(query_np.shape[0]), q_start + chunk_rows)
             query_t = torch.as_tensor(query_np[q_start:q_stop], dtype=torch.float32, device=device).contiguous()
+            q_index = None if query_global_index is None else np.asarray(query_global_index)[q_start:q_stop]
             values_t, indices_t = run_chunk(
                 query_t,
                 database_t,
                 dual_t,
+                q_index,
+                database_global_index,
             )
             values_parts.append(values_t[:, :k_int].contiguous())
             indices_parts.append(indices_t[:, :k_int].to(torch.int64).contiguous())
@@ -261,7 +291,8 @@ def _fused_metric_kmin(
         d_stop = min(int(database_np.shape[0]), d_start + chunk_rows)
         database_t = torch.as_tensor(database_np[d_start:d_stop], dtype=torch.float32, device=device).contiguous()
         dual_t = torch.as_tensor(known_dual_np[d_start:d_stop], dtype=torch.float64, device=device).contiguous()
-        values_t, indices_t = run_chunk(query_t, database_t, dual_t)
+        d_index = None if database_global_index is None else np.asarray(database_global_index)[d_start:d_stop]
+        values_t, indices_t = run_chunk(query_t, database_t, dual_t, query_global_index, d_index)
         candidate_values = torch.cat([best_values, values_t[:, :k_int]], dim=1)
         candidate_indices = torch.cat(
             [best_indices, indices_t[:, :k_int].to(torch.int64) + int(d_start)], dim=1
@@ -320,6 +351,7 @@ def augment_topk_metric(
     assignment_topk: int,
     tracer: Optional[_ChromeTraceCollector],
     trace_args: Dict[str, Any],
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DualAssignmentState, Dict[str, Any], Dict[str, Any], DualCompletionCandidate]:
     if str(known_side) not in {"source", "target"}:
         raise ValueError("known_side must be either 'source' or 'target'.")
@@ -349,6 +381,10 @@ def augment_topk_metric(
             known_dual=np.asarray(known_dual, dtype=np.float64),
             cost_type=cost_type,
             k=int(k),
+            query_is_source=query_is_source,
+            query_global_index=None if perturbation is None else perturbation["source_global_index" if query_is_source else "target_global_index"],
+            database_global_index=None if perturbation is None else perturbation["target_global_index" if query_is_source else "source_global_index"][part_idx],
+            perturbation=perturbation,
         )
         topk_time += float(time.perf_counter() - t_topk)
         part_t = torch.as_tensor(part_idx, dtype=torch.int64, device=local_idx_t.device)
@@ -423,6 +459,7 @@ def complete_dual_metric(
     tracer: Optional[_ChromeTraceCollector],
     trace_args: Dict[str, Any],
     trace_prefix: str,
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DualAssignmentState, Dict[str, Any]]:
     del tracer, trace_args, trace_prefix
     t_total = time.perf_counter()
@@ -445,6 +482,10 @@ def complete_dual_metric(
             known = dual[n_source:]
             values_t, _idx_t = _fused_metric_kmin(
                 query_points=source_points,
+                query_is_source=True,
+                perturbation=perturbation,
+                query_global_index=None if perturbation is None else perturbation["source_global_index"],
+                database_global_index=None if perturbation is None else perturbation["target_global_index"],
                 database_points=target_points,
                 known_dual=known,
                 cost_type=cost_type,
@@ -455,6 +496,10 @@ def complete_dual_metric(
             known = dual[:n_source]
             values_t, _idx_t = _fused_metric_kmin(
                 query_points=target_points,
+                query_is_source=False,
+                perturbation=perturbation,
+                query_global_index=None if perturbation is None else perturbation["target_global_index"],
+                database_global_index=None if perturbation is None else perturbation["source_global_index"],
                 database_points=source_points,
                 known_dual=known,
                 cost_type=cost_type,
@@ -595,6 +640,7 @@ def _init_metric_warm_start_refinement(
     dual_feasibility_tol: float,
     tracer: Optional[_ChromeTraceCollector],
     trace_prefix: str,
+    perturbation: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
     CN: 构建范数 cost 的单层 GPU runtime，并在首个 restricted LP 前完成 support 初始化。
@@ -604,7 +650,7 @@ def _init_metric_warm_start_refinement(
     from hello_ot.types import InitializationResult
 
     sub_source_mass, sub_target_mass, _ = _normalize_subproblem_masses(source_mass, target_mass)
-    solve_cfg = replace(config)
+    solve_cfg = replace(config, metric_cost_perturbation=perturbation)
     solve_cfg.cost_type = str(cost_type)
     solve_cfg.pricing_strategy = "nodewise_full"
     solve_cfg.convergence_criterion = "dual_feasibility"
@@ -644,79 +690,6 @@ def _init_metric_warm_start_refinement(
     )
 
 
-def refine_node_metric(
-    *,
-    source_points: np.ndarray,
-    target_points: np.ndarray,
-    source_mass: np.ndarray,
-    target_mass: np.ndarray,
-    cost_type: MetricCostType,
-    scope: Literal["internal", "root"],
-    warm_start: OTWarmStartState | OTWarmStartGPUState,
-    config: SolverRuntimeConfig,
-    dual_feasibility_tol: float,
-    tracer: Optional[_ChromeTraceCollector],
-    trace_prefix: str,
-    pricing_index_pool: Optional[Any],
-    warm_start_profile_depth: int = 0,
-) -> Tuple[DualAssignmentState, Dict[str, Any]]:
-    del pricing_index_pool
-    initialized = _init_metric_warm_start_refinement(
-        source_points=source_points,
-        target_points=target_points,
-        source_mass=source_mass,
-        target_mass=target_mass,
-        cost_type=cost_type,
-        warm_start=warm_start,
-        config=config,
-        dual_feasibility_tol=dual_feasibility_tol,
-        tracer=tracer,
-        trace_prefix=trace_prefix,
-    )
-    solver = initialized.solver
-    cfg = initialized.cfg
-    initial_support_info = initialized.statistics
-    dual_uv = initialized.dual_warm_start
-    with (tracer.span(f"{trace_prefix}.total", "solve_ot") if tracer is not None else nullcontext()):
-        warm_result = _run_single_level_active_support_refinement_loop(
-            solver,
-            cfg,
-            dual_uv,
-            trace_collector=tracer,
-            trace_prefix=trace_prefix,
-            warm_start_profile_depth=warm_start_profile_depth,
-        )
-    state = state_from_active_support(
-        solver,
-        n_source=int(source_points.shape[0]),
-        n_target=int(target_points.shape[0]),
-        dual=warm_result["dual"],
-    )
-    out = finalize_solve_output(
-        distance=warm_result["distance"],
-        coupling=warm_result["coupling"],
-        state=state,
-        dual_source=warm_result["dual"],
-        level_summaries=warm_result["level_summaries"],
-        lp_solve_time_total=sum_level_summary_metric(warm_result["level_summaries"], "lp_time"),
-        elapsed=solver.build_time + warm_result["solve_time"],
-        log=True,
-        return_coupling=True,
-        return_state=True,
-    )
-    if not isinstance(out, dict):
-        raise RuntimeError("metric warm-start refinement expected log output.")
-    out["warm_start_iteration_records"] = list(warm_result.get("iteration_records") or [])
-    out["warm_start_init"] = dict(initial_support_info)
-    normalized_state = (
-        state
-        if str(getattr(config, "backend", "native")) == "torch"
-        else _normalize_dual_assignment_state(state, pipeline="gpu")
-    )
-    out["warm_start_state"] = normalized_state
-    return normalized_state, out
-
-
 def detect_metric_violations_and_check_feasibility(
     *,
     source_points: np.ndarray,
@@ -725,6 +698,9 @@ def detect_metric_violations_and_check_feasibility(
     target_dual: np.ndarray | torch.Tensor,
     cost_type: MetricCostType,
     topk: int,
+    perturbation: Optional[Dict[str, Any]] = None,
+    source_global_index: Optional[np.ndarray] = None,
+    target_global_index: Optional[np.ndarray] = None,
 ) -> DualViolationScanResult:
     """
     CN: 以 resident-streamed custom traversal 完成双向违例检测与完整 certificate。
@@ -761,15 +737,19 @@ def detect_metric_violations_and_check_feasibility(
     if not hasattr(ext, "fused_gcost_bidir_certificate"):
         raise RuntimeError(
             "Installed norm-cost scan extension is outdated and lacks fused_gcost_bidir_certificate; "
-            "reinstall hello-ot."
+            "reinstall hierarchical_ot."
         )
 
     if memory_plan.resident_side == "target":
         resident_points_np, resident_dual_np = target_np, target_dual_np
         stream_points_np, stream_dual_np = source_np, source_dual_np
+        resident_index, stream_index = target_global_index, source_global_index
+        row_is_source = True
     else:
         resident_points_np, resident_dual_np = source_np, source_dual_np
         stream_points_np, stream_dual_np = target_np, target_dual_np
+        resident_index, stream_index = source_global_index, target_global_index
+        row_is_source = False
     resident_points_t = torch.as_tensor(resident_points_np, dtype=torch.float32, device=device).contiguous()
     resident_dual_t = torch.as_tensor(resident_dual_np, dtype=torch.float64, device=device).contiguous()
     n_resident = int(resident_points_np.shape[0])
@@ -811,6 +791,13 @@ def detect_metric_violations_and_check_feasibility(
         stop = min(n_stream, start + stream_chunk)
         query_t = torch.as_tensor(stream_points_np[start:stop], dtype=torch.float32, device=device).contiguous()
         query_dual_t = torch.as_tensor(stream_dual_np[start:stop], dtype=torch.float64, device=device).contiguous()
+        query_index = None if stream_index is None else np.asarray(stream_index)[start:stop]
+        sigma, seed, mode, q_idx_t, d_idx_t, coeffs = _fused_perturb_arguments(
+            perturbation=perturbation,
+            query_global_index=query_index,
+            database_global_index=resident_index,
+            device=device,
+        )
         if use_decomposed_large_k:
             q_cost_values, q_indices = ext.fused_gcost_topk(
                 query_t,
@@ -818,6 +805,13 @@ def detect_metric_violations_and_check_feasibility(
                 resident_dual_t,
                 int(kernel_k),
                 int(_fused_cost_type_id(cost_type)),
+                q_idx_t,
+                d_idx_t,
+                float(sigma),
+                int(seed),
+                mode,
+                bool(row_is_source),
+                coeffs,
             )
             r_cost_values, r_indices = ext.fused_gcost_topk(
                 resident_points_t,
@@ -825,6 +819,13 @@ def detect_metric_violations_and_check_feasibility(
                 query_dual_t,
                 int(kernel_k),
                 int(_fused_cost_type_id(cost_type)),
+                d_idx_t,
+                q_idx_t,
+                float(sigma),
+                int(seed),
+                mode,
+                not bool(row_is_source),
+                coeffs,
             )
             num_t, den_t, max_t, cost_linf_t, count_t = ext.fused_gcost_certificate(
                 query_t,
@@ -832,6 +833,13 @@ def detect_metric_violations_and_check_feasibility(
                 query_dual_t,
                 resident_dual_t,
                 int(_fused_cost_type_id(cost_type)),
+                q_idx_t,
+                d_idx_t,
+                float(sigma),
+                int(seed),
+                mode,
+                bool(row_is_source),
+                coeffs,
                 1,
             )
             q_values = query_dual_t[:, None] - q_cost_values
@@ -845,6 +853,13 @@ def detect_metric_violations_and_check_feasibility(
                     resident_dual_t,
                     int(kernel_k),
                     int(_fused_cost_type_id(cost_type)),
+                    q_idx_t,
+                    d_idx_t,
+                    float(sigma),
+                    int(seed),
+                    mode,
+                    bool(row_is_source),
+                    coeffs,
                 )
             )
         stream_values_parts.append(q_values[:, :requested_k].contiguous())
@@ -905,6 +920,9 @@ def check_metric_dual_feasibility(
     source_dual: np.ndarray | torch.Tensor,
     target_dual: np.ndarray | torch.Tensor,
     cost_type: MetricCostType,
+    perturbation: Optional[Dict[str, Any]] = None,
+    source_global_index: Optional[np.ndarray] = None,
+    target_global_index: Optional[np.ndarray] = None,
     compute_denominator: bool = True,
 ) -> Tuple[DualFeasibilityCertificate, Dict[str, Any]]:
     """
@@ -949,11 +967,17 @@ def check_metric_dual_feasibility(
         resident_dual = torch.as_tensor(target_dual_np, dtype=torch.float64, device=device).contiguous()
         stream_points = source_np
         stream_dual = source_dual_np
+        stream_index = source_global_index
+        resident_index = target_global_index
+        row_is_source = True
     else:
         resident_points = torch.as_tensor(source_np, dtype=torch.float32, device=device).contiguous()
         resident_dual = torch.as_tensor(source_dual_np, dtype=torch.float64, device=device).contiguous()
         stream_points = target_np
         stream_dual = target_dual_np
+        stream_index = target_global_index
+        resident_index = source_global_index
+        row_is_source = False
 
     chunk_rows = plan_stream_chunk_rows(
         memory_plan,
@@ -966,12 +990,26 @@ def check_metric_dual_feasibility(
         stop = min(int(stream_points.shape[0]), start + chunk_rows)
         query_t = torch.as_tensor(stream_points[start:stop], dtype=torch.float32, device=device).contiguous()
         query_dual_t = torch.as_tensor(stream_dual[start:stop], dtype=torch.float64, device=device).contiguous()
+        query_index = None if stream_index is None else np.asarray(stream_index)[start:stop]
+        sigma, seed, mode, q_idx_t, d_idx_t, coeffs = _fused_perturb_arguments(
+            perturbation=perturbation,
+            query_global_index=query_index,
+            database_global_index=resident_index,
+            device=device,
+        )
         num_t, den_t, max_t, cost_linf_t, count_t = ext.fused_gcost_certificate(
             query_t,
             resident_points,
             query_dual_t,
             resident_dual,
             cid,
+            q_idx_t,
+            d_idx_t,
+            float(sigma),
+            int(seed),
+            mode,
+            bool(row_is_source),
+            coeffs,
             int(bool(compute_denominator)),
         )
         total_num.add_(num_t)
@@ -1014,6 +1052,8 @@ def run_metric_dual_feasibility_scan(
     cost_type = str(getattr(config, "cost_type", "l1")).lower()
     if cost_type not in {"l1", "linf", "l2"}:
         raise ValueError("metric dual feasibility scan supports cost_type in {'l1', 'linf', 'l2'}.")
+    perturbation = config.metric_cost_perturbation
+    perturb_args = {} if perturbation is None else {"perturbation": perturbation, "source_global_index": perturbation["source_global_index"], "target_global_index": perturbation["target_global_index"]}
     topk = max(1, int(round(float(getattr(config, "pricing_topk", 1.0)))))
     scan_start = time.perf_counter()
     diagnostics: Dict[str, Any] = {
@@ -1041,6 +1081,7 @@ def run_metric_dual_feasibility_scan(
             topk=int(topk),
             theta=0.0,
             device=str(getattr(config, "torch_device", "auto")),
+            perturbation=perturbation,
         )
         diagnostics.update(scan.diagnostics)
         diagnostics.setdefault("edge_selection_mode", "nodewise")
@@ -1067,6 +1108,7 @@ def run_metric_dual_feasibility_scan(
         topk_int = int(topk)
         custom_topk_bucket(topk_int, score_family="norm_cost")
         scan_result = detect_metric_violations_and_check_feasibility(
+            **perturb_args,
             source_points=source_np,
             target_points=target_np,
             source_dual=u_t,
@@ -1130,3 +1172,143 @@ def run_metric_dual_feasibility_scan(
         cols=cols_np,
         peak_mem_mib=None,
     )
+
+
+_INDEX_HASH_PRIMES = (2003, 2011)
+_PERTURB_MODE_IDS = {"rank2": 0, "index_hash": 1}
+MetricPerturbMode = Literal["rank2", "index_hash"]
+
+def _full_metric_perturbation_enabled(perturbation: Optional[Dict[str, Any]]) -> bool:
+    return (
+        isinstance(perturbation, dict)
+        and str(perturbation.get("mode", "")).strip().lower() == "full_cost_perturb"
+        and float(perturbation.get("sigma", 0.0)) != 0.0
+    )
+
+@lru_cache(maxsize=32)
+def _index_hash_parameters(seed: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """
+    CN: 从种子生成两个模素数哈希的系数；取值范围保证 float32 的 KeOps 中间整数可精确表示。
+    EN: Generate coefficients for two prime-modulus hashes while keeping KeOps float32 integer intermediates exact.
+    """
+    rng = np.random.default_rng(int(seed) & ((1 << 63) - 1))
+    return tuple(
+        (
+            int(rng.integers(1, prime)),
+            int(rng.integers(1, prime)),
+            int(rng.integers(0, prime)),
+        )
+        for prime in _INDEX_HASH_PRIMES
+    )
+
+def _metric_index_hash_noise_numpy(source_index: Any, target_index: Any, *, seed: int) -> np.ndarray:
+    """
+    CN: 使用与 Torch/CUDA 相同的 FP32 近似取模与运算顺序；不截断边界值。
+    EN: Use the same FP32 approximate remainder and operation order as Torch/CUDA without clipping.
+    """
+    src = np.asarray(source_index, dtype=np.int64)
+    tgt = np.asarray(target_index, dtype=np.int64)
+    hashes = []
+    for prime, (src_coeff, tgt_coeff, offset) in zip(_INDEX_HASH_PRIMES, _index_hash_parameters(seed)):
+        src_residue = np.remainder(src, prime).astype(np.float32)
+        tgt_residue = np.remainder(tgt, prime).astype(np.float32)
+        value = ((np.float32(src_coeff) * src_residue + np.float32(tgt_coeff) * tgt_residue)
+                 + src_residue * tgt_residue) + np.float32(offset)
+        hashes.append(value - np.float32(prime) * np.floor(value * np.float32(1.0 / prime)))
+    combined = hashes[0] + np.float32(_INDEX_HASH_PRIMES[0]) * hashes[1]
+    modulus = _INDEX_HASH_PRIMES[0] * _INDEX_HASH_PRIMES[1]
+    return (combined + np.float32(0.5)) * np.float32(1.0 / modulus)
+
+def _metric_noise_numpy(source_index: Any, target_index: Any, *, seed: int) -> np.ndarray:
+    src = np.asarray(source_index, dtype=np.float32)
+    tgt = np.asarray(target_index, dtype=np.float32)
+    z = src * np.float32(12.9898) + tgt * np.float32(78.233) + np.float32(int(seed) * 0.001)
+    return (np.sin(z).astype(np.float32, copy=False) * np.float32(0.5) + np.float32(0.5)).astype(np.float32, copy=False)
+
+def _metric_perturb_mode(perturbation: Dict[str, Any]) -> MetricPerturbMode:
+    mode = str(perturbation.get("noise", "rank2")).strip().lower()
+    if mode not in {"rank2", "index_hash"}:
+        raise ValueError("metric perturbation noise must be one of: rank2, index_hash")
+    return mode
+
+def _apply_metric_pair_perturbation(
+    costs: Any,
+    rows: Any,
+    cols: Any,
+    perturbation: Optional[Dict[str, Any]],
+) -> Any:
+    if not _full_metric_perturbation_enabled(perturbation):
+        return costs
+    sigma = float(perturbation.get("sigma", 0.0))
+    seed = int(perturbation.get("seed", 0))
+    perturb_mode = _metric_perturb_mode(perturbation)
+    source_index = perturbation.get("source_global_index")
+    target_index = perturbation.get("target_global_index")
+    if source_index is None or target_index is None:
+        raise ValueError("full metric perturbation requires source_global_index and target_global_index.")
+    if torch.is_tensor(costs):
+        device = costs.device
+        rows_t = rows.to(device=device, dtype=torch.long) if torch.is_tensor(rows) else torch.as_tensor(rows, dtype=torch.long, device=device)
+        cols_t = cols.to(device=device, dtype=torch.long) if torch.is_tensor(cols) else torch.as_tensor(cols, dtype=torch.long, device=device)
+        src_idx = torch.as_tensor(np.asarray(source_index, dtype=np.int64), dtype=torch.long, device=device).index_select(0, rows_t)
+        tgt_idx = torch.as_tensor(np.asarray(target_index, dtype=np.int64), dtype=torch.long, device=device).index_select(0, cols_t)
+        if perturb_mode == "rank2":
+            noise = torch.sin(src_idx.float() * 12.9898 + tgt_idx.float() * 78.233 + float(seed) * 0.001) * 0.5 + 0.5
+        else:
+            hashes = []
+            for prime, (src_coeff, tgt_coeff, offset) in zip(_INDEX_HASH_PRIMES, _index_hash_parameters(seed)):
+                src_residue = torch.remainder(src_idx, prime).float()
+                tgt_residue = torch.remainder(tgt_idx, prime).float()
+                value = ((float(src_coeff) * src_residue + float(tgt_coeff) * tgt_residue)
+                         + src_residue * tgt_residue) + float(offset)
+                hashes.append(value - float(prime) * torch.floor(value * float(np.float32(1.0 / prime))))
+            modulus = _INDEX_HASH_PRIMES[0] * _INDEX_HASH_PRIMES[1]
+            noise = (hashes[0] + float(_INDEX_HASH_PRIMES[0]) * hashes[1]).add(0.5).mul(float(np.float32(1.0 / modulus)))
+        return costs + noise.to(dtype=costs.dtype) * float(sigma)
+    rows_np = np.asarray(rows, dtype=np.int64).reshape(-1)
+    cols_np = np.asarray(cols, dtype=np.int64).reshape(-1)
+    src_idx = np.asarray(source_index, dtype=np.int64)[rows_np]
+    tgt_idx = np.asarray(target_index, dtype=np.int64)[cols_np]
+    noise = (
+        _metric_noise_numpy(src_idx, tgt_idx, seed=int(seed))
+        if perturb_mode == "rank2"
+        else _metric_index_hash_noise_numpy(src_idx, tgt_idx, seed=int(seed))
+    )
+    return np.asarray(costs, dtype=np.float64) + noise.astype(np.float64, copy=False) * float(sigma)
+
+def _fused_perturb_arguments(
+    *,
+    perturbation: Optional[Dict[str, Any]],
+    query_global_index: Optional[np.ndarray],
+    database_global_index: Optional[np.ndarray],
+    device: torch.device,
+) -> Tuple[float, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    CN: 把 metric 链的 perturbation dict 转成 fused kernel 的入参
+        (sigma, seed, mode_id, query_global_index, database_global_index, coeffs)；
+        无扰动时传 sigma=0 与空索引。
+    EN: Convert a metric-chain perturbation dict into fused kernel arguments
+        (sigma, seed, mode_id, query_global_index, database_global_index, coeffs);
+        pass sigma=0 and empty indices when perturbation is disabled.
+    """
+    empty_idx = torch.empty(0, dtype=torch.int64, device=device)
+    if not _full_metric_perturbation_enabled(perturbation):
+        return 0.0, 0, 0, empty_idx, empty_idx, torch.zeros(6, dtype=torch.int64, device=device)
+    sigma = float(perturbation.get("sigma", 0.0))
+    seed = int(perturbation.get("seed", 0))
+    mode = int(_PERTURB_MODE_IDS[_metric_perturb_mode(perturbation)])
+    q_idx = None if query_global_index is None else np.asarray(query_global_index, dtype=np.int64)
+    d_idx = None if database_global_index is None else np.asarray(database_global_index, dtype=np.int64)
+    if q_idx is None or d_idx is None:
+        raise ValueError("full metric perturbation requires row and column global indices for the fused kernel.")
+    q_t = torch.as_tensor(q_idx, dtype=torch.int64, device=device).contiguous()
+    d_t = torch.as_tensor(d_idx, dtype=torch.int64, device=device).contiguous()
+    if mode == 1:
+        coeffs = torch.as_tensor(
+            np.asarray(sum(_index_hash_parameters(seed), ()), dtype=np.int64),
+            dtype=torch.int64,
+            device=device,
+        ).contiguous()
+    else:
+        coeffs = torch.zeros(6, dtype=torch.int64, device=device)
+    return sigma, seed, mode, q_t, d_t, coeffs

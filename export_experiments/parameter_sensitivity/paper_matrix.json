@@ -1,0 +1,16 @@
+{
+  "n": [262144],
+  "d": [4, 32, 256, 2048],
+  "seeds": [42],
+  "configurations": {
+    "default": {"split_count": 4, "assignment_topk": 16, "pricing_topk": 2, "support_budget_factor": 10.0},
+    "split_count_2": {"split_count": 2, "assignment_topk": 16, "pricing_topk": 2, "support_budget_factor": 10.0},
+    "split_count_8": {"split_count": 8, "assignment_topk": 16, "pricing_topk": 2, "support_budget_factor": 10.0},
+    "assignment_topk_8": {"split_count": 4, "assignment_topk": 8, "pricing_topk": 2, "support_budget_factor": 10.0},
+    "assignment_topk_32": {"split_count": 4, "assignment_topk": 32, "pricing_topk": 2, "support_budget_factor": 10.0},
+    "pricing_topk_1": {"split_count": 4, "assignment_topk": 16, "pricing_topk": 1, "support_budget_factor": 10.0},
+    "pricing_topk_4": {"split_count": 4, "assignment_topk": 16, "pricing_topk": 4, "support_budget_factor": 10.0},
+    "support_budget_factor_5": {"split_count": 4, "assignment_topk": 16, "pricing_topk": 2, "support_budget_factor": 5.0},
+    "support_budget_factor_20": {"split_count": 4, "assignment_topk": 16, "pricing_topk": 2, "support_budget_factor": 20.0}
+  }
+}

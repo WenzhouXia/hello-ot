@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
@@ -16,11 +17,11 @@ from hello_ot.config import SolverRuntimeConfig
 from hello_ot.state import GPUWarmStartState as OTWarmStartGPUState, WarmStartState as OTWarmStartState
 
 from .kernels.norm_cost_scan import (
+    _init_metric_warm_start_refinement,
     augment_topk_metric,
     check_metric_dual_feasibility,
     complete_dual_metric,
     pair_costs_metric,
-    refine_node_metric,
     solve_leaf_metric,
 )
 from .kernels.scan_contract import DualFeasibilityCertificate
@@ -28,9 +29,24 @@ from .kernels.bilinear_scan import (
     augment_topk_lowrank,
     complete_dual_lowrank,
     materialize_lowrank_candidate_union,
-    refine_node_lowrank,
     scan_topk_lowrank_candidates,
     solve_leaf_lowrank,
+)
+from hello_ot._internal.instrumentation.reporting import _print_warm_start_init_profile
+from hello_ot.hierarchy.utilities import _normalize_subproblem_masses
+from hello_ot.initialization.state import _normalize_dual_assignment_state
+from hello_ot.refinement.iterations import (
+    RefinementRuntime,
+    begin_refinement,
+    finalize_refinement,
+)
+from hello_ot.refinement.dual_feasibility import normalize_dual_feasibility_norm
+from hello_ot.restricted_ot.runtime import (
+    InitializedLevel,
+    _init_lowrank_warm_start_refinement,
+    finalize_solve_output,
+    state_from_active_support,
+    sum_level_summary_metric,
 )
 
 
@@ -189,6 +205,20 @@ class HelloCostContext:
     score_family: Literal["inner_product", "norm_cost"]
     cost_type: Literal["lowrank", "l1", "linf", "l2"]
     dot_scale: float = 1.0
+    perturbation: Optional[Dict[str, Any]] = None
+
+    def sliced(self, source_slice: slice, target_slice: slice) -> "HelloCostContext":
+        """
+        CN: 保留全局边标识，将同一扰动限制到当前层。
+        EN: Restrict the same perturbation to this level while preserving global edge identities.
+        """
+        if self.perturbation is None:
+            return self
+        return replace(self, perturbation={
+            **self.perturbation,
+            "source_global_index": self.perturbation["source_global_index"][source_slice],
+            "target_global_index": self.perturbation["target_global_index"][target_slice],
+        })
 
     def __post_init__(self) -> None:
         if self.score_family == "inner_product" and self.cost_type != "lowrank":
@@ -252,6 +282,7 @@ def solve_leaf_by_cost(
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
             node_trace_args=node_trace_args,
             tracer=tracer,
+            perturbation=cost_context.perturbation,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -286,6 +317,7 @@ def _directional_assignment_by_cost(
             known_side=known_side,
             topk=int(assignment_topk),
             device=str(torch_device),
+            perturbation=cost_context.perturbation,
         )
     if cost_context.score_family == "inner_product":
         return augment_topk_lowrank(
@@ -310,6 +342,7 @@ def _directional_assignment_by_cost(
             assignment_topk=int(assignment_topk),
             tracer=tracer,
             trace_args=trace_args,
+            perturbation=cost_context.perturbation,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -445,6 +478,7 @@ def complete_dual(
             tracer=tracer,
             trace_args=trace_args,
             trace_prefix=str(trace_prefix),
+            perturbation=cost_context.perturbation,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -502,11 +536,33 @@ def check_dual_feasibility(
             source_dual=dual[:n_source],
             target_dual=dual[n_source:],
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
+            perturbation=cost_context.perturbation,
+            source_global_index=None if cost_context.perturbation is None else cost_context.perturbation["source_global_index"],
+            target_global_index=None if cost_context.perturbation is None else cost_context.perturbation["target_global_index"],
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
 
-def refine_node_by_cost(
+@dataclass(frozen=True)
+class PreparedCostRefinement:
+    """
+    CN: cost dispatch 完成后的单层 refinement；主算法只读取 runtime 与迭代上限。
+    EN: A cost-dispatched level refinement; the main algorithm only reads its runtime and iteration limit.
+    """
+
+    runtime: RefinementRuntime
+    initialized: InitializedLevel
+    n_source: int
+    n_target: int
+    backend: str
+    trace_context: Any
+
+    @property
+    def max_iterations(self) -> int:
+        return int(self.runtime.config.max_inner_iter)
+
+
+def begin_refinement_by_cost(
     *,
     cost_context: HelloCostContext,
     source_F: np.ndarray,
@@ -515,7 +571,6 @@ def refine_node_by_cost(
     target_cost_vec: np.ndarray,
     source_mass: np.ndarray,
     target_mass: np.ndarray,
-    scope: Literal["internal", "root"],
     warm_start: OTWarmStartState | OTWarmStartGPUState,
     config: SolverRuntimeConfig,
     skip_initial_pricing: bool,
@@ -526,27 +581,84 @@ def refine_node_by_cost(
     trace_prefix: str,
     pricing_index_pool: Optional[Any],
     warm_start_profile_depth: int,
-) -> Tuple[DualAssignmentState, Dict[str, Any]]:
+) -> PreparedCostRefinement:
+    """
+    CN: 按 cost family 构造 restricted-OT runtime，但不执行 refinement 迭代。
+    EN: Build the restricted-OT runtime for a cost family without running refinement iterations.
+    """
+    n_source = int(source_F.shape[0])
+    n_target = int(target_G.shape[0])
+    trace_context = (
+        tracer.span(f"{trace_prefix}.total", "solve_ot")
+        if tracer is not None
+        else nullcontext()
+    )
     if cost_context.score_family == "inner_product":
-        return refine_node_lowrank(
+        normalized_source_mass, normalized_target_mass, _ = _normalize_subproblem_masses(
+            source_mass,
+            target_mass,
+        )
+        solve_config = replace(config)
+        solve_config.pricing_strategy = "nodewise_full"
+        solve_config.convergence_criterion = "dual_feasibility"
+        solve_config.require_dual_feasibility_convergence = False
+        solve_config.dual_feasibility_tol = float(dual_feasibility_tol)
+        solve_config.lp_termination_norm = str(lp_termination_norm)
+        solve_config.require_added_convergence = False
+        solve_config.cost_type = "lowrank"
+        solve_config.dot_scale = float(cost_context.dot_scale)
+        solve_config.validate()
+        initialized = _init_lowrank_warm_start_refinement(
             source_F=source_F,
             target_G=target_G,
             source_cost_vec=source_cost_vec,
             target_cost_vec=target_cost_vec,
-            source_mass=source_mass,
-            target_mass=target_mass,
-            scope=scope,
+            source_mass=np.asarray(normalized_source_mass, dtype=np.float64),
+            target_mass=np.asarray(normalized_target_mass, dtype=np.float64),
+            config=solve_config,
             warm_start=warm_start,
-            config=config,
             skip_initial_pricing=bool(skip_initial_pricing),
-            dual_feasibility_tol=float(dual_feasibility_tol),
-            dual_feasibility_norm=dual_feasibility_norm,
-            lp_termination_norm=lp_termination_norm,
-            tracer=tracer,
-            trace_prefix=str(trace_prefix),
+            trace_collector=tracer,
+            trace_prefix=trace_prefix,
             pricing_index_pool=pricing_index_pool,
-            warm_start_profile_depth=int(warm_start_profile_depth),
+            warm_start_cost_vec_chunk_size=65536,
+            warm_start_cost_vec_feature_chunk_size=None,
+            _consume_warm_start_gpu_state=True,
             dot_scale=float(cost_context.dot_scale),
+        )
+        initial_support_info = dict(initialized.initialization.statistics)
+        _print_warm_start_init_profile(
+            initialized.solver,
+            components=dict(initial_support_info.get("components", {})),
+            primal_nnz=int(initial_support_info.get("primal_nnz", 0)),
+            active_size=int(
+                initial_support_info.get(
+                    "post_pricing_support_size",
+                    initialized.solver.active_support.size,
+                )
+            ),
+            bfs_added=int(initial_support_info.get("northwest_added", 0)),
+            profile_depth=int(warm_start_profile_depth),
+        )
+        trace_context.__enter__()
+        runtime = begin_refinement(
+            initialized.solver,
+            initialized.cfg,
+            initialized.initialization.dual_warm_start,
+            trace_collector=tracer,
+            trace_prefix=trace_prefix,
+            warm_start_profile_depth=warm_start_profile_depth,
+            dual_feasibility_norm=normalize_dual_feasibility_norm(
+                dual_feasibility_norm
+            ),
+        )
+        return PreparedCostRefinement(
+            runtime=runtime,
+            initialized=initialized,
+            n_source=n_source,
+            n_target=n_target,
+            backend=str(getattr(config, "backend", "native")),
+            trace_context=trace_context,
         )
     if cost_context.score_family == "norm_cost":
         if str(lp_termination_norm) != "l2":
@@ -555,22 +667,92 @@ def refine_node_by_cost(
             raise ValueError("L-infinity finest-level stopping is currently supported only for lowrank/l2^2 costs.")
         if bool(skip_initial_pricing):
             raise ValueError("skip_initial_pricing is only supported by lowrank asymmetric-chain refinement.")
-        return refine_node_metric(
+        del pricing_index_pool
+        initialized = _init_metric_warm_start_refinement(
             source_points=source_F,
             target_points=target_G,
             source_mass=source_mass,
             target_mass=target_mass,
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
-            scope=scope,
             warm_start=warm_start,
             config=config,
             dual_feasibility_tol=float(dual_feasibility_tol),
             tracer=tracer,
             trace_prefix=str(trace_prefix),
-            pricing_index_pool=pricing_index_pool,
-            warm_start_profile_depth=int(warm_start_profile_depth),
+            perturbation=cost_context.perturbation,
+        )
+        trace_context.__enter__()
+        runtime = begin_refinement(
+            initialized.solver,
+            initialized.cfg,
+            initialized.initialization.dual_warm_start,
+            trace_collector=tracer,
+            trace_prefix=trace_prefix,
+            warm_start_profile_depth=warm_start_profile_depth,
+        )
+        return PreparedCostRefinement(
+            runtime=runtime,
+            initialized=initialized,
+            n_source=n_source,
+            n_target=n_target,
+            backend=str(getattr(config, "backend", "native")),
+            trace_context=trace_context,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
+
+
+def finalize_refinement_by_cost(
+    prepared: PreparedCostRefinement,
+) -> Tuple[DualAssignmentState, Dict[str, Any]]:
+    """
+    CN: 将已完成迭代的 runtime 整理为 hierarchy 可继续传播的 state 与层级结果。
+    EN: Finalize an iterated runtime into the state and level result consumed by the hierarchy.
+    """
+    warm_result = finalize_refinement(prepared.runtime)
+    prepared.trace_context.__exit__(None, None, None)
+    solver = prepared.initialized.solver
+    state = state_from_active_support(
+        solver,
+        n_source=prepared.n_source,
+        n_target=prepared.n_target,
+        dual=warm_result["dual"],
+    )
+    result = finalize_solve_output(
+        distance=warm_result["distance"],
+        coupling=warm_result["coupling"],
+        state=state,
+        dual_source=warm_result["dual"],
+        level_summaries=warm_result["level_summaries"],
+        lp_solve_time_total=sum_level_summary_metric(
+            warm_result["level_summaries"], "lp_time"
+        ),
+        elapsed=solver.build_time + warm_result["solve_time"],
+        log=True,
+        return_coupling=True,
+        return_state=True,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("HELLO refinement expected a structured result dictionary.")
+    result["lp_backend_peak_mem_mib"] = warm_result.get("lp_backend_peak_mem_mib")
+    result["lp_backend_delta_peak_mem_mib"] = warm_result.get(
+        "lp_backend_delta_peak_mem_mib"
+    )
+    result["lp_backend_abs_peak_mem_mib"] = warm_result.get(
+        "lp_backend_abs_peak_mem_mib"
+    )
+    result["pricing_peak_mem_mib"] = warm_result.get("pricing_peak_mem_mib")
+    result["dual_feas_peak_mem_mib"] = warm_result.get("dual_feas_peak_mem_mib")
+    result["warm_start_iteration_records"] = list(
+        warm_result.get("iteration_records") or []
+    )
+    result["warm_start_init"] = dict(prepared.initialized.initialization.statistics)
+    normalized_state = (
+        state
+        if prepared.backend == "torch"
+        else _normalize_dual_assignment_state(state, pipeline="gpu")
+    )
+    result["warm_start_state"] = normalized_state
+    return normalized_state, result
 
 
 def pair_costs_by_cost(
@@ -590,6 +772,7 @@ def pair_costs_by_cost(
             rows=rows,
             cols=cols,
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
+            perturbation=cost_context.perturbation,
         )
     if cost_context.score_family == "inner_product":
         source = np.asarray(source_F, dtype=np.float32, order="C")
@@ -615,6 +798,7 @@ __all__ = [
     "pair_costs_by_cost",
     "prepare_cost",
     "propagate_and_assign_dual",
-    "refine_node_by_cost",
+    "begin_refinement_by_cost",
+    "finalize_refinement_by_cost",
     "solve_leaf_by_cost",
 ]

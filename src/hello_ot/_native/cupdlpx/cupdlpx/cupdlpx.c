@@ -171,9 +171,12 @@ void set_default_parameters(pdhg_parameters_t *params)
     params->termination_norm = TERMINATION_NORM_L2;
     params->reflection_coefficient = 1.0;
 
+    params->termination_criteria.eps_optimal_absolute = 1e-4;
     params->termination_criteria.eps_optimal_relative = 1e-4;
     params->termination_criteria.eps_feasible_relative = 1e-4;
+    params->termination_criteria.eps_feasible_absolute_primal = 1e-4;
     params->termination_criteria.eps_feasible_relative_primal = 1e-4;
+    params->termination_criteria.eps_feasible_absolute_dual = 1e-4;
     params->termination_criteria.eps_feasible_relative_dual = 1e-4;
     params->termination_criteria.eps_infeasible = 1e-10;
     params->termination_criteria.time_sec_limit = 3600.0;
@@ -261,8 +264,8 @@ void print_usage(const char *prog_name)
     fprintf(stderr, "  -v, --verbose                       Enable verbose logging (default: false).\n");
     fprintf(stderr, "      --time_limit <seconds>          Time limit in seconds (default: 3600.0).\n");
     fprintf(stderr, "      --iter_limit <iterations>       Iteration limit (default: %d).\n", INT32_MAX);
-    fprintf(stderr, "      --eps_opt <tolerance>           Relative optimality tolerance (default: 1e-4).\n");
-    fprintf(stderr, "      --eps_feas <tolerance>          Relative feasibility tolerance (default: 1e-4).\n");
+    fprintf(stderr, "      --eps_opt <tolerance>           Shared absolute/relative optimality tolerance (default: 1e-4).\n");
+    fprintf(stderr, "      --eps_feas <tolerance>          Shared absolute/relative feasibility tolerance (default: 1e-4).\n");
     fprintf(stderr, "      --eps_infeas_detect <tolerance> Infeasibility detection tolerance (default: 1e-10).\n");
 }
 
@@ -299,10 +302,15 @@ int main(int argc, char *argv[])
             params.termination_criteria.iteration_limit = atoi(optarg);
             break;
         case 1003: // --eps_optimal
-            params.termination_criteria.eps_optimal_relative = atof(optarg);
+            params.termination_criteria.eps_optimal_absolute = atof(optarg);
+            params.termination_criteria.eps_optimal_relative = params.termination_criteria.eps_optimal_absolute;
             break;
         case 1004: // --eps_feas
             params.termination_criteria.eps_feasible_relative = atof(optarg);
+            params.termination_criteria.eps_feasible_absolute_primal = params.termination_criteria.eps_feasible_relative;
+            params.termination_criteria.eps_feasible_relative_primal = params.termination_criteria.eps_feasible_relative;
+            params.termination_criteria.eps_feasible_absolute_dual = params.termination_criteria.eps_feasible_relative;
+            params.termination_criteria.eps_feasible_relative_dual = params.termination_criteria.eps_feasible_relative;
             break;
         case 1005: // --eps_infeas_detect
             params.termination_criteria.eps_infeasible = atof(optarg);

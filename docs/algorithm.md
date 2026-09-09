@@ -9,4 +9,22 @@ The production path in `src/hello_ot/algorithm.py` follows the paper operators d
 
 The top-level orchestration intentionally stays in one file. CUDA scan details, sparse support storage, CuPDLPx bindings, memory planning, and diagnostics live in deeper modules so that they do not obscure the paper-level control flow.
 
+The production loop in `_solve_hierarchy` therefore exposes the refinement order directly:
+
+```python
+for level in reversed(hierarchy[:-1]):
+    initialized = _initialize_hierarchy_level(...)
+
+    for iteration_index in range(initialized.refinement.max_iterations):
+        iteration = solve_lp(...)
+        certificate = check_optimality(...)
+        if certificate.converged:
+            break
+        update_support(...)
+
+    state, result = _finalize_hierarchy_level(...)
+```
+
+`check_optimality` retains any candidates produced by the fused feasibility/pricing scan, and `update_support` consumes those candidates without scanning the full edge set again.
+
 The implementation uses paper terminology in names and documentation. `TERMINOLOGY.md` is the authoritative paper-to-code glossary.

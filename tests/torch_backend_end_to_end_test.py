@@ -14,7 +14,22 @@ def test_default_native_failure_never_falls_back_to_torch(monkeypatch, capsys) -
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA"):
         hello_ot.solve(np.zeros((2, 1)), np.ones((2, 1)))
-    assert "backend=torch" not in capsys.readouterr().err
+    error_output = capsys.readouterr().err
+    assert "backend=torch" not in error_output
+    assert "HELLO failed | error=" in error_output
+
+
+def test_torch_off_is_silent(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    source = np.arange(8, dtype=np.float32).reshape(4, 2)
+    hello_ot.solve(
+        source,
+        source.copy(),
+        options=hello_ot.SolverOptions(
+            backend="torch", torch_device="cpu", cost_perturbation="off", verbose="off"
+        ),
+    )
+    assert capsys.readouterr().err == ""
 
 
 def test_torch_cpu_runs_non_leaf_hello_without_native(monkeypatch, capsys) -> None:
@@ -48,8 +63,13 @@ def test_torch_cpu_runs_non_leaf_hello_without_native(monkeypatch, capsys) -> No
         ),
     )
     captured = capsys.readouterr()
-    assert "backend=torch device=cpu" in captured.err
-    assert "backend=torch finished" in captured.err
+    assert "HELLO | backend=torch device=cpu" in captured.err
+    assert "[original] level=" in captured.err
+    assert "init done |" in captured.err
+    assert "iter=1 obj=" in captured.err
+    assert " lp=" in captured.err
+    assert " full_scan=" in captured.err
+    assert "HELLO converged | obj=" in captured.err
     assert result.metadata["backend"] == "torch"
     assert result.metadata["device"] == "cpu"
     assert len(result.solve_stage.levels) >= 2
@@ -58,6 +78,12 @@ def test_torch_cpu_runs_non_leaf_hello_without_native(monkeypatch, capsys) -> No
         level.solve.summary.converged
         for level in result.solve_stage.levels
         if level.kind == "refined"
+    )
+    assert all(
+        iteration.full_scan_time > 0.0
+        for level in result.solve_stage.levels
+        if level.kind == "refined"
+        for iteration in level.solve.iterations
     )
 
     solution = result.solution

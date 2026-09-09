@@ -9,6 +9,14 @@ from typing import Any
 
 from .config import SolverOptions
 from .types import PointCloudCostType, PrewarmStats, Problem, Result
+from .variants import (
+    GromovResult,
+    SemiDiscreteResult,
+    UnbalancedResult,
+    solve_gromov,
+    solve_semidiscrete,
+    solve_unbalanced,
+)
 
 
 def prewarm(*args: Any, **kwargs: Any) -> PrewarmStats:
@@ -74,4 +82,17 @@ def solve(
     )
 
 
-__all__ = ["Problem", "Result", "SolverOptions", "PrewarmStats", "prewarm", "solve"]
+__all__ = [
+    "GromovResult",
+    "PrewarmStats",
+    "Problem",
+    "Result",
+    "SemiDiscreteResult",
+    "SolverOptions",
+    "UnbalancedResult",
+    "prewarm",
+    "solve",
+    "solve_gromov",
+    "solve_semidiscrete",
+    "solve_unbalanced",
+]
