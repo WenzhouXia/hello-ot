@@ -7,6 +7,9 @@ include docs/release_checklist.md
 include examples/quickstart.py
 include examples/verify_native.py
 include scripts/build_native_wheel.sh
+include scripts/create_hello_ot_env.sh
+include scripts/install_native.sh
+include scripts/install_jax_gpu.sh
 include scripts/validate_release.py
 recursive-include src/hello_ot/_native *.c *.cpp *.cu *.h *.md LICENSE
 prune src/hierarchical_ot

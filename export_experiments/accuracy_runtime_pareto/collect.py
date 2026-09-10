@@ -25,7 +25,7 @@ def collect(output_dir):
     text = f"# Public Pareto\n\n{len(rows) - len(failures)}/{len(rows)} configurations succeeded. Seed=42.\n"
     if failures:
         text += "\nFailed configurations:\n\n" + "\n".join(
-            f"- N={r['n']} D={r['d']} {r['method']} ({r['parameter']}): {r['error']}" for r in failures
+            f"- n={r['n']} d={r['d']} {r['method']} ({r['parameter']}): {r['error']}" for r in failures
         ) + "\n"
     (Path(output_dir) / "summary.md").write_text(text)
     return rows

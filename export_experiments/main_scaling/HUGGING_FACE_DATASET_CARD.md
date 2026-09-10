@@ -39,7 +39,7 @@ The generated `data_manifest.json` records each file's shape, byte size and
 SHA-256. The HELLO repository verifies each downloaded file against that manifest.
 The release commit is pinned in the consuming HELLO repository after upload.
 Gaussian source points are generated locally using NumPy FP32 standard_normal
-with seed=42 for each requested `(N, d)`; they are not stored in this dataset.
+with seed=42 for each requested `(n, d)`; they are not stored in this dataset.
 
 ## Upstream terms
 

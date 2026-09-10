@@ -3,8 +3,9 @@ from __future__ import annotations
 import torch
 
 
-NATIVE_TORCH_VERSION = "2.5.1"
+NATIVE_TORCH_VERSION = "2.7.1"
 NATIVE_CUDA_RUNTIME = "11.8"
+NATIVE_CXX11_ABI = True
 
 
 def native_runtime_compatibility() -> tuple[bool, str]:
@@ -14,13 +15,16 @@ def native_runtime_compatibility() -> tuple[bool, str]:
     """
     torch_version = str(torch.__version__).split("+", 1)[0]
     cuda_runtime = torch.version.cuda
-    compatible_torch = torch_version == NATIVE_TORCH_VERSION or torch_version.startswith(
-        f"{NATIVE_TORCH_VERSION}.post"
+    cxx11_abi = bool(torch._C._GLIBCXX_USE_CXX11_ABI)
+    compatible = (
+        torch_version == NATIVE_TORCH_VERSION
+        and cuda_runtime == NATIVE_CUDA_RUNTIME
+        and cxx11_abi == NATIVE_CXX11_ABI
     )
-    compatible = compatible_torch and cuda_runtime == NATIVE_CUDA_RUNTIME
     detail = (
-        f"expected torch={NATIVE_TORCH_VERSION} with CUDA {NATIVE_CUDA_RUNTIME}; "
-        f"found torch={torch.__version__} with CUDA {cuda_runtime}"
+        f"expected torch={NATIVE_TORCH_VERSION} with CUDA {NATIVE_CUDA_RUNTIME} "
+        f"and cxx11_abi={NATIVE_CXX11_ABI}; found torch={torch.__version__} "
+        f"with CUDA {cuda_runtime} and cxx11_abi={cxx11_abi}"
     )
     return compatible, detail
 

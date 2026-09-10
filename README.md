@@ -1,132 +1,134 @@
 # HELLO
 
-HELLO is a solver for large-scale balanced optimal transport on point clouds. It localizes a sparse active support through a dual-guided hierarchy, solves restricted transport problems, and certifies convergence on the full edge set. The default `native` backend is the CUDA implementation used for paper experiments; an explicitly selected portable `torch` backend runs from ordinary PyTorch operators on CPU or CUDA.
+HELLO is a high-performance solver for large-scale, unregularized discrete optimal transport (OT) between point clouds. By combining a dual-guided hierarchy with efficient GPU parallelization, it computes exact sparse transport plans with low memory, fast runtime, and high accuracy. On a single A100 or H100 GPU, HELLO solves instances with millions of points across thousands of feature dimensions.
 
-The implementation supports squared Euclidean, L1, L2, and L-infinity costs. Its Python entry point is deliberately small:
+### Why Choose HELLO?
+- **High-Accuracy Sparse Solutions**: Solves unregularized discrete OT to a prescribed full-space relative KKT tolerance (alongside corresponding dual potentials);
+- **Million-Scale on a Single GPU**: Memory complexity scales as $\mathcal{O}(m+n)$—"store points, solve transport." A single GPU solves $m=n=1.28\times10^6, d=8192$ using only $41.6\text{ GiB}$ peak GPU memory;
+- **Efficiency Across Dimensions**: Maintains high convergence efficiency across feature dimensions from single digits to thousands;
+- **General Pairwise Costs**: Supports not only $\ell_2^2$ (squared Euclidean), but also $\ell_1$, $\ell_2$, $\ell_\infty$, and general pairwise cost functions;
+- **Backend Design**: Provides a pure PyTorch backend (out-of-the-box, cross-platform) alongside a native CUDA backend (extreme performance);
+- **Beyond Standard OT**: Out-of-the-box support for semi-discrete OT, Gromov–Wasserstein (GW), and unbalanced OT (UOT).
+
+<table style="width: 100%;">
+  <tr>
+    <td width="60%" align="center">
+      <img src="docs/figures/hello_framework.png" alt="Algorithmic Framework Overview" />
+    </td>
+    <td width="40%" align="center">
+      <img src="docs/figures/accuracy_runtime_pareto_2x2.png" alt="Accuracy vs Runtime Pareto" />
+    </td>
+  </tr>
+</table>
+
+## Quickstart
+
+`examples/quickstart.py` can be executed directly on a synthetic Brenier mapping problem ($n=m=2048, d=32$):
 
 ```python
 import numpy as np
 import hello_ot
 
-rng = np.random.default_rng(0)
-source = rng.normal(size=(2048, 32))
-target = rng.normal(size=(2048, 32))
+# 1. Construct test problem with known analytical ground truth
+rng = np.random.default_rng(42)
+source = rng.normal(size=(2048, 32)).astype(np.float32)
+target = source + 2.0 * np.tanh(source)
+target = target[rng.permutation(len(target))]
 
+# 2. Solve OT problem (defaults to uniform marginals and squared Euclidean distance)
 result = hello_ot.solve(
     source,
     target,
     options=hello_ot.SolverOptions(backend="torch", torch_device="auto"),
 )
-print(result.objective)
-print(result.solution.shape, result.solution.values.size)
+
+# 3. Inspect results
+print(f"Optimal objective: {result.objective:.6f}")
+print(f"Nonzero transport entries: {result.solution.values.size}")
+
+# Sparse transport matrix (scipy.sparse.coo_matrix) and dual potentials (f, g)
+x = result.solution.to_sparse_matrix()
+f, g = result.solution.source_dual, result.solution.target_dual
 ```
 
-Array inputs use uniform masses and squared Euclidean cost by default. To specify masses or another supported cost:
+Array inputs use uniform marginals and squared Euclidean cost by default. Non-uniform masses can be specified via `source_mass` and `target_mass`, and alternative ground costs selected via `cost="l1"`, `"l2"`, or `"linf"`.
 
-```python
-result = hello_ot.solve(
-    source,
-    target,
-    source_mass=source_mass,
-    target_mass=target_mass,
-    cost="l1",
-)
-```
+Advanced options are configured through `hello_ot.SolverOptions` (e.g., `backend="native"`, `backend="torch"`).
 
-Most users do not need a configuration object. Advanced experiments can change the few supported algorithmic options through `hello_ot.SolverOptions`; the LP tolerance and full dual-feasibility tolerance are fixed to the paper setting.
+> **Tip**: A complete verification script is bundled in the repository:
+> ```bash
+> python3 examples/quickstart.py
+> ```
+> The script solves the problem end-to-end and verifies primal feasibility, dual feasibility, and objective error against the analytical Brenier ground truth.
 
-Solver progress defaults to `verbose="compact"`: HELLO reports each hierarchy level and inner iteration to standard error, followed by the final objective and KKT summary. Use `verbose="off"` for timed experiments and `verbose="detailed"` for LP, pricing, and profiling diagnostics. Boolean values are not accepted.
+## Installation Guide
 
-Cost perturbation defaults to `auto` for balanced OT:
+### 1. PyTorch: Out of the Box (`backend="torch"`)
 
-```python
-options = hello_ot.SolverOptions(cost_perturbation="on")
-result = hello_ot.solve(source, target, options=options)
-```
-
-- `off` uses the original cost throughout.
-- `on` solves the perturbed hierarchy, then rebuilds support from its dual potentials and refines the full original problem.
-- `auto` starts with the original cost. At each refinement level, re-entry of an edge pruned in the immediately preceding round starts a one-LP observation period. If that next LP still fails the full optimality check, the current and subsequent levels use perturbed costs. The full original problem is refined at the end. Each solve can activate perturbation only once.
-
-Paper experiments should explicitly select `on` or `off`. The relative amplitude is controlled by `cost_perturbation_relative_scale` (default `0.01`); a fixed sample of 65,536 edge pairs estimates the full problem's mean cost. The existing `random_seed` determines the perturbation. A nonpositive or nonfinite sampled mean raises an error when perturbation is initialized. Each stage and level receives its own `max_iterations` budget. An auxiliary stage reaching that limit can still supply dual potentials to the next stage; only the final original-problem check certifies the returned result.
-
-`result.solve_stage` describes the final original-cost stage. `result.cost_stages` contains all stages in execution order, and `result.total_wall_time` includes the complete solve. `result.metadata["cost_perturbation"]` records activation, trigger level/iteration, re-entry count, scale, and seed; total refinement iterations and LP time are also recorded in metadata. GW, UOT, and SDOT inner solves explicitly use `off` in this release.
-
-## Installation
-
-The default installation is pure Python and requires no compiler. It installs the portable PyTorch backend; selecting that backend is always explicit, so a broken native installation can never silently change performance.
+If PyTorch is already installed, install HELLO-OT directly:
 
 ```bash
 python3 -m pip install .
-python3 examples/quickstart.py
 ```
 
-The quickstart uses `backend="torch"` on a `2048 x 2048`, 32-dimensional Brenier problem generated by the strictly convex map `T(x) = x + 2 tanh(x)`. It reports solver KKT diagnostics and the objective error against the known map. Its timings are not representative of the native paper backend.
-
-`SolverOptions()` deliberately keeps `backend="native"`. On a machine prepared for paper experiments, build the bundled C++/CUDA extensions explicitly:
+If PyTorch is not installed, or if you plan to test the native backend or run
+the paper reproduction, create the recommended `hello_ot` environment:
 
 ```bash
+bash scripts/create_hello_ot_env.sh hello_ot
+```
+
+The script installs Python 3.12, PyTorch 2.7.1 with the CUDA 11.8 runtime,
+NumPy 1.26.4, SciPy 1.15.3, and the portable HELLO-OT package. It prefers
+Conda and falls back to Micromamba. Replace the final argument with another
+name, such as `hello_ot_test`, to create a separate environment.
+
+---
+
+### 2. CUDA: Extreme Performance (`backend="native"`)
+
+Includes resident-streamed CUDA scan kernels and a CUDA-native LP solver:
+- **Supported Architectures**: NVIDIA GPUs with compute capabilities `sm_80`, `sm_86`, `sm_89`, `sm_90` (A100, RTX 3080 Ti/3090, RTX 4060 Ti/4090, H100, etc.);
+- **Target Environment**: Linux x86-64 (glibc ≥ 2.29), Python 3.12, PyTorch 2.7.1+cu118.
+
+#### Option A: Install Prebuilt Wheel (Recommended, No Local Compilation)
+
+After creating the environment above, install and verify the native wheel:
+
+```bash
+bash scripts/install_native.sh hello_ot
+```
+
+This replaces the portable distribution with the matching native wheel while
+retaining both `backend="torch"` and `backend="native"`.
+
+#### Option B: Build from Source
+
+For development, use Python 3.12, PyTorch 2.7.1+cu118, CUDA 11.8 NVCC and
+CCCL headers, a compatible C++ compiler, Ninja, and pybind11:
+
+```bash
+conda install -c nvidia cuda-nvcc=11.8 cuda-cccl=11.8.89
 python3 -m pip install '.[native-build]'
 scripts/build_native_wheel.sh dist
+python3 -m pip install dist/*.whl
 ```
 
-The `v0.1.0` native wheels target Linux x86-64 with glibc 2.29 or newer, Python 3.10/3.11, PyTorch 2.5.1+cu118, and CUDA compute capabilities 8.0, 8.6, 8.9, and 9.0, with PTX at 9.0 for forward compatibility. This covers A100, RTX 3080 Ti/3090, RTX 4060 Ti/4090, and H100. These wheels use the platform-specific `linux_x86_64` tag rather than a manylinux tag. Building from source needs CUDA 11.8, a compatible C++ compiler, Ninja, and pybind11; installing a prebuilt wheel does not.
+### 3. GPU JAX and Paper Reproduction
 
-Install PyTorch first, then run the line matching the Python version. The release is a rolling development build, so `--no-cache-dir --force-reinstall` always fetches its current wheel:
+Public reproduction scripts for the core paper experiments (large-scale scaling, Pareto curves, exactness verification, and parameter sensitivity) are organized under [`export_experiments/`](export_experiments/).
+
+Add GPU JAX, OTT-JAX, and the remaining reproduction dependencies to the same
+environment:
 
 ```bash
-python3 -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu118
-# Python 3.10
-python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp310-cp310-linux_x86_64.whl
-# Python 3.11
-python3 -m pip install --no-cache-dir --no-deps --force-reinstall https://github.com/WenzhouXia/hello-ot/releases/download/v0.1.0/hello_ot-0.1.0-cp311-cp311-linux_x86_64.whl
-python3 -m hello_ot.diagnose --require-native
-python3 examples/verify_native.py
+bash scripts/install_jax_gpu.sh hello_ot
+conda activate hello_ot
 ```
 
-WSL2 uses the Linux wheel and the NVIDIA driver supplied by the Windows host. Do not install a Linux NVIDIA display driver inside WSL2. Native Windows Python is not supported by this release.
+The installer keeps PyTorch on cuDNN 9 and places the CUDA 11 JAX requirement
+on cuDNN 8 in an isolated sidecar. The environment activation hook selects the
+correct CUDA 11.8 tools and libraries automatically. Micromamba environments
+use `micromamba activate hello_ot` instead.
 
-The portable `torch` backend may run with newer PyTorch versions allowed by the package metadata. The prebuilt native wheel is ABI-bound to the release matrix above and fails before loading its extensions when the PyTorch/CUDA runtime does not match.
-
-For a shareable release-validation report:
-
-```bash
-python3 scripts/validate_release.py --backend both --output hello_ot_validation.json
-```
-
-Run the release test suite with:
-
-```bash
-python3 -m pytest -q tests/test_hello_ot_public_api.py \
-  tests/test_hello_ot_dependency_boundary.py \
-  tests/test_hello_ot_numerical_equivalence.py \
-  tests/release_tooling_test.py \
-  tests/torch_backend_end_to_end_test.py \
-  tests/torch_packaging_test.py \
-  tests/torch_prewarm_test.py \
-  tests/torch_restricted_ot_pdlp_test.py \
-  tests/torch_scan_test.py \
-  tests/hello_inplace_feature_layout_test.py
-```
-
-The source layout is:
-
-```text
-src/hello_ot/
-  algorithm.py       paper-level hierarchy and refinement orchestration
-  initialization/    dual propagation, dual assignment, feasible support
-  refinement/        optimality checks and active-support updates
-  restricted_ot/     restricted LP construction and solve
-  kernels/           Python interfaces to resident-streamed CUDA scans
-  _native/           CuPDLPx and custom C++/CUDA extension sources
-```
-
-See `docs/algorithm.md` for the paper-to-code map and `export_experiments/README.md` for the reproducibility entry points.
-
-## License
-
-HELLO is released under the Apache License 2.0. Bundled third-party components and their licenses are listed in `THIRD_PARTY_NOTICES.md`.
-
-Full experiment reproduction requires the GitHub checkout; the wheel and sdist
-contain the installable/buildable HELLO package, not the experiment suite.
-See [release checklist](docs/release_checklist.md) for pending GPU and wheel validation.
+For detailed execution instructions, please refer to [export_experiments/README.md](export_experiments/README.md).

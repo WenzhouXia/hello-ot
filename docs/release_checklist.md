@@ -15,7 +15,7 @@ The library API retains its default auto policy.
 ## CPU checks
 
 GitHub Actions runs portable API, perturbation, explicit algorithm structure,
-variant interface, public experiment and export tests on Python 3.10/3.11.
+variant interface, public experiment and export tests on Python 3.12 with PyTorch 2.7.1.
 GPU-only tests are skipped there. Build a portable wheel from the sdist to check
 that the source archive has all required package/build files.
 
@@ -38,6 +38,15 @@ Neufeld–Xiang cutting-plane baseline are outside the public export scope.
 ## GPU commands to run later
 
 From a public repository checkout with the intended native wheel already installed:
+
+```bash
+bash scripts/create_hello_ot_env.sh hello_ot
+bash scripts/install_native.sh hello_ot
+bash scripts/install_jax_gpu.sh hello_ot
+```
+
+The three cumulative installers provide the portable PyTorch package, the native
+wheel, and GPU JAX/reproduction dependencies in one environment. Then run:
 
 ```bash
 python3 scripts/validate_gpu_release.py

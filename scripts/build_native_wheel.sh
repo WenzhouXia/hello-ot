@@ -20,18 +20,56 @@ if [[ "${nvcc_version}" != *"release 11.8"* ]]; then
     printf '%s\n' "${nvcc_version}" >&2
     exit 1
 fi
-
 python3 - <<'PY'
-import torch
+import sys
+from pathlib import Path
 
-torch_version = torch.__version__.split("+", 1)[0]
-compatible_torch = torch_version == "2.5.1" or torch_version.startswith("2.5.1.post")
-if not compatible_torch or torch.version.cuda != "11.8":
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
+
+if sys.version_info[:2] != (3, 12):
     raise SystemExit(
-        "native release wheels must be built with torch==2.5.1+cu118; "
+        "native release wheels must be built with Python 3.12; "
+        f"found Python {sys.version_info.major}.{sys.version_info.minor}"
+    )
+torch_version = torch.__version__.split("+", 1)[0]
+if torch_version != "2.7.1" or torch.version.cuda != "11.8":
+    raise SystemExit(
+        "native release wheels must be built with torch==2.7.1+cu118; "
         f"found torch={torch.__version__} cuda={torch.version.cuda}"
     )
-print(f"building with torch={torch.__version__} cuda={torch.version.cuda}")
+if not torch._C._GLIBCXX_USE_CXX11_ABI:
+    raise SystemExit(
+        "native release wheels must use the C++ ABI of the documented official "
+        "PyTorch 2.7.1 cu118 wheel (_GLIBCXX_USE_CXX11_ABI=True); "
+        "the selected build environment uses False"
+    )
+site_packages = Path(torch.__file__).resolve().parent.parent
+required_headers = (
+    site_packages / "nvidia/cuda_runtime/include/cuda_runtime.h",
+    site_packages / "nvidia/cublas/include/cublas_v2.h",
+    site_packages / "nvidia/cusparse/include/cusparse.h",
+    site_packages / "nvidia/cusolver/include/cusolverDn.h",
+)
+missing_headers = [str(path) for path in required_headers if not path.is_file()]
+if missing_headers:
+    raise SystemExit(
+        "native release wheel builds require CUDA development headers from the "
+        "official PyTorch cu118 installation; missing: " + ", ".join(missing_headers)
+    )
+cuda_root = Path(CUDA_HOME or "")
+if not (
+    (cuda_root / "include/thrust/complex.h").is_file()
+    or (cuda_root / "targets/x86_64-linux/include/thrust/complex.h").is_file()
+):
+    raise SystemExit(
+        "native release wheel builds require CUDA 11.8 CCCL headers; "
+        "install cuda-cccl=11.8.89"
+    )
+print(
+    f"building with torch={torch.__version__} cuda={torch.version.cuda} "
+    f"cxx11_abi={torch._C._GLIBCXX_USE_CXX11_ABI}"
+)
 PY
 
 echo "building with $(command -v nvcc)"

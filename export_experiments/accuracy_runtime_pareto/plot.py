@@ -8,7 +8,7 @@ from .protocol import METHODS
 
 
 def plot(output_dir):
-    """CN: 每个 N/D 输出一张图，零误差使用 symlog 显示。EN: Plot each N/D separately, displaying zero error with symlog."""
+    """CN: 每个 n/d 输出一张图，零误差使用 symlog 显示。EN: Plot each n/d separately, displaying zero error with symlog."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -29,7 +29,7 @@ def plot(output_dir):
         ax.set_xscale("symlog", linthresh=1e-8)
         ax.set_yscale("log")
         ax.set(xlabel="Relative objective error", ylabel="Solver time (s)",
-               title=f"Gaussian-to-ImageNet, N={n}, D={d}, seed=42")
+               title=f"Gaussian-to-ImageNet, n={n}, d={d}, seed=42")
         if count:
             ax.legend()
         else:

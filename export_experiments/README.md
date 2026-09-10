@@ -36,12 +36,16 @@ python3 -m export_experiments.exactness_verification.run \
   --n 16384 --d 4 --seed 42 --method hello
 ```
 
-POT is a required HELLO dependency. HiRef is an optional third-party checkout
-documented in `third_party/README.md`. JAX and OTT-JAX are optional and can be installed with:
+## Environment & Dependencies
+
+To run all reproduction experiments (including baseline solvers and Pareto plotting):
 
 ```bash
-python3 -m pip install -e '.[ott]'
+bash scripts/install_jax_gpu.sh hello_ot
+conda activate hello_ot
 ```
+
+HELLO-only experiments (`main_scaling`, `exactness_verification`, `parameter_sensitivity`) require only the core package. `install_jax_gpu.sh` adds GPU OTT-JAX, PyKeOps, and plotting tools to the same environment without replacing PyTorch's cuDNN. HiRef is an optional third-party checkout documented in `third_party/README.md`.
 
 Formal HELLO timings always use `SolverOptions(backend="native")`. The portable
 PyTorch backend is intentionally not used for paper timing.

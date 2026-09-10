@@ -21,8 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 experiments = ["pyyaml>=6", "pandas>=2", "matplotlib>=3.8"]
 dataset-build = ["safetensors", "tqdm"]
-ott = ["jax", "ott-jax"]
-pareto = ["numpy>=1.26,<2", "pykeops==2.3", "jax==0.4.25", "jaxlib==0.4.25", "ott-jax==0.4.6", "matplotlib>=3.8"]
+ott = ["jax==0.4.25", "ott-jax==0.4.6"]
+reproduce = ["numpy>=1.26,<2", "pykeops==2.3", "matplotlib>=3.8", "pytest>=8"]
 test = ["pytest>=8"]
 native-build = ["ninja>=1.11", "pybind11==2.12.*"]
 

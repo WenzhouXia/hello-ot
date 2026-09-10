@@ -39,6 +39,9 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
     required = {
         "examples/quickstart.py",
         "examples/verify_native.py",
+        "scripts/create_hello_ot_env.sh",
+        "scripts/install_native.sh",
+        "scripts/install_jax_gpu.sh",
         "scripts/build_native_wheel.sh",
         "scripts/validate_release.py",
         "tests/torch_scan_test.py",
@@ -89,5 +92,23 @@ def test_native_build_script_has_explicit_release_architectures() -> None:
     # EN: The build script must not implicitly narrow release architectures to GPUs visible on the builder.
     text = (ROOT / "scripts/build_native_wheel.sh").read_text(encoding="utf-8")
     assert "8.0 8.6 8.9 9.0+PTX" in text
-    assert "torch==2.5.1+cu118" in text
+    assert "torch==2.7.1+cu118" in text
     assert "release 11.8" in text
+    assert "cuda_runtime.h" in text
+    assert "_GLIBCXX_USE_CXX11_ABI" in text
+
+
+def test_layered_environment_installers_pin_compatible_stacks() -> None:
+    # CN: 三层安装必须共享 Python/PyTorch 数值栈，并隔离 JAX 的 cuDNN 8。
+    # EN: The three installers must share one Python/PyTorch stack and isolate JAX cuDNN 8.
+    create = (ROOT / "scripts/create_hello_ot_env.sh").read_text(encoding="utf-8")
+    native = (ROOT / "scripts/install_native.sh").read_text(encoding="utf-8")
+    jax = (ROOT / "scripts/install_jax_gpu.sh").read_text(encoding="utf-8")
+    assert "numpy==1.26.4 scipy==1.15.3" in create
+    assert "hello_ot-0.1.0-cp312-cp312-linux_x86_64.whl" in native
+    assert "--no-cache-dir --no-deps --force-reinstall" in native
+    assert "jaxlib==0.4.25+cuda11.cudnn86" in jax
+    assert "nvidia-cudnn-cu11==8.9.6.50" in jax
+    assert 'ACTIVATE_DIR="$ENV_PREFIX/etc/conda/activate.d"' in jax
+    assert 'LD_LIBRARY_PATH="$JAX_CUDNN_LIB' in jax
+    assert "PYTORCH_CUDA_LIBS" in jax

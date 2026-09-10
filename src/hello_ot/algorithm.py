@@ -1203,7 +1203,7 @@ def _solve_hello_stage(
             n_source=n_source,
             n_target=n_target,
         )
-    
+
     total_time = float(time.perf_counter() - t_total)
     # CN: diagnostics 汇总算法设置、层级记录和最终 root refinement 指标；实际数值结果仍由 root_result 承载。
     # EN: Diagnostics summarize settings, hierarchy records, and final root-refinement metrics; numeric outputs remain in root_result.

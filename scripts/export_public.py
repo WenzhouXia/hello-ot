@@ -21,6 +21,7 @@ FILES = (
 )
 DIRECTORIES = (
     "src/hello_ot",
+    "docs/figures",
     "export_experiments/main_scaling",
     "export_experiments/accuracy_runtime_pareto",
     "export_experiments/exactness_verification",
@@ -63,6 +64,9 @@ EXTRA_FILES = (
     "paper_experiments/common/feasible_rounding.py",
     "tests/public_pareto_test.py",
     "scripts/build_native_wheel.sh",
+    "scripts/create_hello_ot_env.sh",
+    "scripts/install_native.sh",
+    "scripts/install_jax_gpu.sh",
     "scripts/export_public.py",
     "scripts/validate_release.py",
     "tests/hello_inplace_feature_layout_test.py",

@@ -12,6 +12,38 @@ from pathlib import Path
 from .protocol import METHODS, fingerprint, load_config, load_problem, write_json
 
 
+def _inject_nvidia_library_paths(environment: dict[str, str]) -> None:
+    """
+    CN: 自动探测 pip 安装的 nvidia-* 动态链接库目录并注入 LD_LIBRARY_PATH。
+    EN: Automatically detect pip-installed nvidia-* library directories and inject into LD_LIBRARY_PATH.
+    """
+    candidates: list[str] = []
+    for module_name in (
+        "cudnn",
+        "cublas",
+        "cuda_runtime",
+        "cuda_nvrtc",
+        "cuda_cupti",
+        "cusolver",
+        "cusparse",
+        "cufft",
+    ):
+        try:
+            mod = __import__(f"nvidia.{module_name}", fromlist=[module_name])
+            for path_str in getattr(mod, "__path__", []):
+                lib_dir = Path(path_str) / "lib"
+                if lib_dir.is_dir():
+                    candidates.append(str(lib_dir))
+        except (ImportError, AttributeError):
+            continue
+
+    if candidates:
+        current_ld = environment.get("LD_LIBRARY_PATH", "")
+        existing = current_ld.split(":") if current_ld else []
+        merged = [c for c in candidates if c not in existing] + existing
+        environment["LD_LIBRARY_PATH"] = ":".join(merged)
+
+
 def run_worker(request, root, timeout):
     """CN: 独立进程运行；超时或进程被杀也保留失败记录。EN: Run in isolation and retain failures on timeout or process termination."""
     output = Path(request["output"])
@@ -20,6 +52,7 @@ def run_worker(request, root, timeout):
     write_json(request_path, request)
     output.unlink(missing_ok=True)
     environment = dict(os.environ)
+    _inject_nvidia_library_paths(environment)
     environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     environment["JAX_ENABLE_X64"] = "true"
     environment["JAX_PLATFORMS"] = "cuda"
@@ -101,7 +134,7 @@ def main():
                     common, method=method, parameter=parameter, reference_objective=reference_value,
                     output=str(case_dir / f"{method}_{name}.json"),
                 ), root, args.timeout)
-                print(f"N={args.n} D={dimension} {method} {name}: {result['status']} {result.get('error', '')}", flush=True)
+                print(f"n={args.n} d={dimension} {method} {name}: {result['status']} {result.get('error', '')}", flush=True)
     from .collect import collect
     collect(output_dir)
 
