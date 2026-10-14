@@ -44,11 +44,9 @@ def _trace_scalar(value: Any) -> Any:
 
 
 class CuPDLPxSolver(LPSolver):
-    """统一的 cuPDLPx wrapper。
-
-    支持两种 LP 形式：
-    - `primal`: 标准形式，变量是 primal flow
-    - `dual`: 结构化 OT 的 dual 形式，变量是势能 (u, v)
+    """
+    CN: 统一的 CuPDLPx wrapper，支持以 primal flow 或 dual potentials (u, v) 表示的 LP。
+    EN: Unified CuPDLPx wrapper supporting LPs represented by primal flow or dual potentials (u, v).
     """
 
     supports_tree_lp_form = True
@@ -144,7 +142,7 @@ class CuPDLPxSolver(LPSolver):
         return np.asarray(value, dtype=np.float64)
 
     @classmethod
-    def _normalize_continuation_state(cls, payload: Any) -> Optional[Dict[str, Any]]:
+    def _normalize_continuation_state(cls, payload: Any, *, on_gpu: bool = False) -> Optional[Dict[str, Any]]:
         if not isinstance(payload, dict):
             return None
         out: Dict[str, Any] = {}
@@ -172,7 +170,7 @@ class CuPDLPxSolver(LPSolver):
             "current_dual_unscaled",
         ):
             if key in payload and payload.get(key) is not None:
-                out[key] = cls._to_numpy_float64(payload.get(key))
+                out[key] = payload[key].detach() if on_gpu and cls._is_torch_tensor(payload[key]) else cls._to_numpy_float64(payload[key])
         return out if out else None
 
     @classmethod
@@ -584,8 +582,8 @@ class CuPDLPxSolver(LPSolver):
         """
         params = {
             "verbose": verbose,
-            # Disable native timing summary unless explicitly verbose to avoid
-            # uncontrollable C++ stdout noise and timing jitter.
+            # CN: 除非显式启用 verbose，否则关闭 native 计时摘要，避免 C++ stdout 噪声和计时抖动。
+            # EN: Disable native timing summaries unless verbose to avoid C++ stdout noise and timing jitter.
             "verbose_time": 1 if int(verbose) else 0,
             "print_summary": bool(verbose),
             "termination_evaluation_frequency": 200,
@@ -683,6 +681,9 @@ class CuPDLPxSolver(LPSolver):
             raise ValueError(f"Unknown lp_form: {lp_form!r}, expected 'primal' or 'dual'")
         device_problem_data = kwargs.pop("device_problem_data", None)
         solver_params_local = dict(solver_params or {})
+        gpu_output = solver_params_local.get("return_device", "cpu") == "cuda"
+        if gpu_output and device_problem_data is None:
+            raise ValueError("CUDA output requires device_problem_data")
         memory_accounting_component = solver_params_local.pop("memory_accounting_component", None)
         memory_accounting_metadata = solver_params_local.pop("memory_accounting_metadata", None)
         vector_sum_mode_arg = kwargs.pop("vector_sum_mode", None)
@@ -730,6 +731,8 @@ class CuPDLPxSolver(LPSolver):
         def _as_float64_or_none(arr):
             if arr is None:
                 return None
+            if gpu_output and torch.is_tensor(arr):
+                return arr.detach().to(dtype=torch.float64)
             return np.asarray(arr, dtype=np.float64)
 
         def _to_host_numpy(arr, *, dtype=None):
@@ -957,13 +960,18 @@ class CuPDLPxSolver(LPSolver):
                     "warm_start_dual_present": warm_start_dual is not None,
                 },
             ):
-                self._maybe_set_init_sol_primal_layout(
-                    solver,
-                    warm_start_primal=warm_start_primal,
-                    warm_start_dual=warm_start_dual,
-                    n_primal=n_primal,
-                    n_dual=n_eqs,
-                )
+                if gpu_output:
+                    def gpu_initial(value):
+                        return None if value is None else torch.as_tensor(value, dtype=torch.float64, device=normalized["device"]).detach().contiguous()
+                    solver.setInitSol(gpu_initial(warm_start_primal), gpu_initial(warm_start_dual))
+                else:
+                    self._maybe_set_init_sol_primal_layout(
+                        solver,
+                        warm_start_primal=warm_start_primal,
+                        warm_start_dual=warm_start_dual,
+                        n_primal=n_primal,
+                        n_dual=n_eqs,
+                    )
             solver_diag["warm_start_time"] = float(time.perf_counter() - t0)
         else:
             payload = dual_form_data or {}
@@ -1362,7 +1370,8 @@ class CuPDLPxSolver(LPSolver):
             solver_diag["algorithm_rel_dual_res_l2"] = result_dict.get("rel_dual_res")
             solver_diag["relative_primal_dual_gap"] = result_dict.get("rel_obj_gap")
         continuation_state = self._normalize_continuation_state(
-            result_dict.get("continuation_state") if isinstance(result_dict, dict) else None
+            result_dict.get("continuation_state") if isinstance(result_dict, dict) else None,
+            on_gpu=gpu_output,
         )
         if continuation_state is not None:
             solver_diag["continuation_state"] = continuation_state

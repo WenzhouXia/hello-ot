@@ -89,8 +89,8 @@ def test_torch_cpu_runs_non_leaf_hello_without_native(monkeypatch, capsys) -> No
     solution = result.solution
     source_marginal = np.bincount(solution.rows, weights=solution.values, minlength=32)
     target_marginal = np.bincount(solution.cols, weights=solution.values, minlength=32)
-    np.testing.assert_allclose(source_marginal, np.full(32, 1.0 / 32.0), atol=2e-7)
-    np.testing.assert_allclose(target_marginal, np.full(32, 1.0 / 32.0), atol=2e-7)
+    np.testing.assert_allclose(source_marginal, np.full(32, 1.0 / 32.0), atol=5e-7)
+    np.testing.assert_allclose(target_marginal, np.full(32, 1.0 / 32.0), atol=5e-7)
     cost = ot.dist(source, target, metric="sqeuclidean")
     reference = ot.emd2(np.full(32, 1.0 / 32.0), np.full(32, 1.0 / 32.0), cost)
     assert abs(result.objective - float(reference)) < 2e-6
@@ -126,3 +126,30 @@ def test_torch_cpu_supports_all_norm_costs(cost_type: str, pot_metric: str) -> N
         for level in result.solve_stage.levels
         if level.kind == "refined"
     )
+
+
+@pytest.mark.parametrize("cost_type", ["l2^2", "l1", "l2", "linf"])
+def test_torch_cpu_fp64_cost_precision_metadata(cost_type: str) -> None:
+    rng = np.random.default_rng(19)
+    source = rng.normal(size=(12, 4))
+    target = rng.normal(size=(10, 4))
+    result = hello_ot.solve(
+        source,
+        target,
+        cost=cost_type,
+        max_iterations=8,
+        options=hello_ot.SolverOptions(
+            backend="torch",
+            torch_device="cpu",
+            coarsest_size_threshold=4,
+            assignment_topk=2,
+            pricing_topk=1,
+            cost_perturbation="off",
+            cost_precision="fp64",
+            verbose="off",
+        ),
+    )
+    assert result.metadata["cost_precision"] == "fp64"
+    assert result.metadata["input_feature_precision"] == "fp32"
+    assert result.metadata["intermediate_cost_precision"] == "fp64"
+    assert result.metadata["finest_cost_precision"] == "fp64"

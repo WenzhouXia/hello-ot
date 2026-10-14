@@ -7,7 +7,67 @@ from typing import Any, Dict, Union
 
 import numpy as np
 
-from .types import Result, SolveStageResult
+from .types import IterationStats, Result, SolveStageResult
+
+
+def iteration_stats_record(stats: IterationStats) -> Dict[str, Any]:
+    """
+    CN: 在兼容日志边界将强类型迭代统计序列化为旧字段布局。
+    EN: Serialize typed iteration statistics to the legacy field layout at compatibility log boundaries.
+    """
+    pruning = stats.budgeted_pruning
+    convergence = stats.convergence
+    solve_lp = stats.solve_lp
+    return {
+        "iter": stats.index,
+        "objective": stats.objective,
+        "lp_time": solve_lp.wall_time,
+        "full_scan_time": stats.full_scan_time,
+        "lp_iters": solve_lp.backend_iterations,
+        "lp_diag": {
+            "solver_algorithm_rel_primal_res_l2": solve_lp.primal_feasibility,
+            "solver_relative_primal_dual_gap": solve_lp.primal_dual_gap,
+            "solver_termination_norm": solve_lp.termination_norm,
+            "solver_termination_reason": solve_lp.termination_reason,
+            "solver_termination_rel_primal_res": solve_lp.termination_primal_feasibility,
+            "solver_termination_rel_dual_res": solve_lp.termination_dual_feasibility,
+            "solver_algorithm_rel_dual_res_l2": solve_lp.algorithm_dual_feasibility,
+        },
+        "active_support_before_lp": stats.support.before_lp,
+        "active_support_after_pricing": stats.support.after_dual_violation,
+        "active_support_after_cleaning": stats.support.after_budgeted_pruning,
+        "pricing_info": {
+            "time": stats.dual_violation.wall_time,
+            "found": stats.dual_violation.violations_found,
+            "found_count": stats.dual_violation.violations_found,
+            "added": stats.dual_violation.edges_added,
+            "added_count": stats.dual_violation.edges_added,
+        },
+        "cleaning_info": {
+            "before": pruning.support_before,
+            "after": pruning.support_after,
+            "removed": max(0, pruning.support_before - pruning.support_after),
+            "budget": pruning.budget,
+            "budget_overflow": max(0, pruning.support_after - pruning.budget),
+        },
+        "convergence_info": {
+            "is_converged": convergence.passed,
+            "dual_feasibility": convergence.relative_full_dual_feasibility,
+            "relative_linf_dual_feasibility": convergence.relative_linf_dual_feasibility,
+            "dual_feasibility_max_violation": convergence.max_dual_violation,
+            "finest_dual_feasibility_norm": convergence.norm,
+            "stopping_dual_feasibility": convergence.dual_feasibility,
+            "stopping_dual_feasibility_tol": convergence.tolerance,
+            "stopping_dual_feasibility_passed": convergence.passed,
+        },
+        "finalize_components": {
+            "pricing": stats.dual_violation.wall_time,
+            "cleaning": pruning.wall_time,
+            "state_update": stats.bookkeeping_time,
+            "convergence_check": 0.0,
+        },
+        "wall_time": stats.wall_time,
+    }
 
 
 def relative_kkt_fields(
@@ -79,4 +139,9 @@ def save_solution_npz(result: Result, path: Union[str, Path]) -> None:
     )
 
 
-__all__ = ["relative_kkt_fields", "save_solution_npz", "summary_dict"]
+__all__ = [
+    "iteration_stats_record",
+    "relative_kkt_fields",
+    "save_solution_npz",
+    "summary_dict",
+]

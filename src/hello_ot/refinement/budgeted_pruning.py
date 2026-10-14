@@ -15,55 +15,86 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from hello_ot.refinement.dual_violation import fmt_size_ratio
+from hello_ot.refinement.support_budget import (
+    POSITIVE_SUPPORT_TOLERANCE,
+    active_support_budget,
+)
 from hello_ot.utilities import trace_span
 
 logger = logging.getLogger(__name__)
 
 
-class CleaningStrategy(ABC):
-    """Abstract base class for active set cleaning strategies."""
+def _select_zero_flow_removals(
+    *,
+    removable_pool: Any,
+    reduced_costs: Any,
+    num_to_remove: int,
+) -> np.ndarray:
+    """
+    CN: 用同一规则按 reduced cost 为 NumPy 或 Torch active support 选择旧零流边。
+    EN: Select old zero-flow edges by reduced cost with one rule for NumPy and Torch active supports.
+    """
+    torch_backend = bool(TORCH_AVAILABLE and torch.is_tensor(removable_pool))
+    if torch_backend:
+        indices = torch.nonzero(removable_pool, as_tuple=False).view(-1)
+        if int(indices.numel()) < int(num_to_remove):
+            raise RuntimeError("insufficient removable old zero-flow edges")
+        order = torch.argsort(
+            reduced_costs.index_select(0, indices),
+            descending=True,
+            stable=True,
+        )
+        selected = indices.index_select(0, order)[:int(num_to_remove)]
+        return selected.detach().cpu().numpy().astype(np.int32, copy=False)
 
-    # Add a small tolerance for floating point comparisons
-    _TOL = 1e-10
+    indices = np.flatnonzero(removable_pool)
+    if int(indices.size) < int(num_to_remove):
+        raise RuntimeError("insufficient removable old zero-flow edges")
+    order = np.argsort(
+        -np.asarray(reduced_costs)[indices],
+        kind="stable",
+    )
+    return np.asarray(indices[order[:int(num_to_remove)]], dtype=np.int32)
+
+
+class CleaningStrategy(ABC):
+    """
+    CN: active support 剪枝策略的抽象基类。
+    EN: Abstract base class for active-support pruning strategies.
+    """
 
     def __init__(self, threshold_factor: float = 0.0):
         """
-        Args:
-            threshold_factor: 清理阈值系数 (如 5.0 表示 active set > 5 * (N+M) 时触发清理)
+        CN: 初始化 active support 剪枝策略。threshold_factor 表示触发剪枝的支撑规模系数。
+        EN: Initialize an active-support pruning strategy. threshold_factor controls the support-size trigger.
         """
         self.threshold = max(0.0, threshold_factor)
 
     @abstractmethod
     def select_indices_to_remove(self, current_inc: Dict[str, Any], num_to_remove: int, **kwargs) -> np.ndarray:
         """
-        Selects indices of variables to remove from the active set.
-
-        Args:
-            current_inc: The current active set dictionary containing at least:
-                'rows', 'cols', 'c_vec', 'x_prev', 'pos_map'.
-                May also contain 'creation_iteration' if needed by the strategy.
-            num_to_remove: The target number of variables to remove.
-            **kwargs: Additional context potentially needed by specific strategies
-                      (e.g., 'duals', 'n_source').
-
-        Returns:
-            A NumPy array of absolute indices within the current_inc arrays
-            corresponding to the variables selected for removal. The strategy
-            might return fewer indices than num_to_remove if insufficient
-            candidates are found.
+        CN: 选择要从 active support 中删除的变量下标。
+        EN: Select variable indices to remove from the active support.
         """
         pass
 
     def needs_creation_iteration(self) -> bool:
-        """Indicates if this strategy requires tracking variable creation time."""
+        """
+        CN: 返回该策略是否需要跟踪变量的创建轮次。
+        EN: Return whether this strategy needs variable-creation iteration tracking.
+        """
         return False
 
 
 class NoCleaning(CleaningStrategy):
-    """A strategy that performs no cleaning."""
+    """
+    CN: 不执行 budgeted pruning 的策略。
+    EN: Strategy that performs no budgeted pruning.
+    """
 
     def __init__(self):
-        # NoCleaning 的阈值通常设为 0 或无穷大，这里设为 0 且 select 返回空即可
+        # CN: NoCleaning 使用零阈值，并通过返回空下标集禁用剪枝。
+        # EN: NoCleaning uses a zero threshold and disables pruning by returning no indices.
         super().__init__(threshold_factor=0.0)
 
     def select_indices_to_remove(self, current_inc: Dict[str, Any], num_to_remove: int, **kwargs) -> np.ndarray:
@@ -72,30 +103,18 @@ class NoCleaning(CleaningStrategy):
 
 class DualGapCleaning(CleaningStrategy):
     """
-    CN: 删除 dual gap 最大且 primal 流量足够小的变量。
-    EN: Remove variables with the largest dual gap whose primal flow is small enough.
+    CN: 删除 reduced cost 最大且 primal 流量足够小的变量。
+    EN: Remove variables with the largest reduced costs whose primal flow is small enough.
     """
 
     def __init__(
         self,
         threshold_factor: float = 10.0,
-        primal_tol: float = CleaningStrategy._TOL,
     ):
         super().__init__(threshold_factor=threshold_factor)
-        self.primal_tol = max(0.0, float(primal_tol))
 
     def needs_creation_iteration(self) -> bool:
         return True
-
-    @staticmethod
-    def _is_torch_tensor(value: Any) -> bool:
-        return bool(TORCH_AVAILABLE and torch.is_tensor(value))
-
-    @staticmethod
-    def _to_numpy_1d(value: Any, dtype: Any) -> np.ndarray:
-        if TORCH_AVAILABLE and torch.is_tensor(value):
-            return value.detach().cpu().numpy().astype(dtype, copy=False).reshape(-1)
-        return np.asarray(value, dtype=dtype).reshape(-1)
 
     def _select_protect_new_indices(
         self,
@@ -120,192 +139,40 @@ class DualGapCleaning(CleaningStrategy):
             )
             return np.empty(0, dtype=np.int32)
 
-        if getattr(current_active_support, "is_torch_backend", False):
-            # CN: CUDA active support 路径保持张量在原 device 上，避免 cleaning 时来回拷贝。
-            # EN: Keep tensors on the active-support device in the CUDA path to avoid cleaning-time transfers.
-            costs = current_active_support.c_vec
-            x_prev = current_active_support.x_prev
-            creation_iters = current_active_support.creation_iteration
-            duals_t = duals if self._is_torch_tensor(duals) else torch.as_tensor(
-                duals,
-                dtype=costs.dtype,
-                device=costs.device,
-            )
-            if duals_t.device != costs.device:
-                duals_t = duals_t.to(device=costs.device)
-            if duals_t.dtype != costs.dtype:
-                duals_t = duals_t.to(dtype=costs.dtype)
-
-            # CN: dual 向量前 n_source 项是 source 势 u，后半部分是 target 势 v。
-            # EN: The first n_source dual entries are source potentials u; the remainder are target potentials v.
-            n_source_int = int(n_source)
-            u = duals_t[:n_source_int]
-            v = duals_t[n_source_int:]
-            # CN: 当前轮新加入的边不进入删除池；creation_iteration == -1 的结构性边也不删。
-            # EN: Current-iteration edges are protected; structural edges marked -1 are also excluded.
-            abs_x = torch.abs(x_prev)
-            is_new = creation_iters == int(current_inner_iter)
-            old_pool = (creation_iters != -1) & (~is_new)
-            old_zero_indices = torch.nonzero(old_pool & (abs_x < self.primal_tol), as_tuple=False).view(-1)
-            need = int(num_to_remove)
-            selected_parts = []
-
-            def _dual_gaps_for(indices: Any) -> Any:
-                # CN: 对候选边计算 reduced cost / dual gap: c_ij - u_i - v_j。
-                # EN: Compute reduced cost / dual gap for candidates: c_ij - u_i - v_j.
-                row_idx = current_active_support.rows.index_select(0, indices).to(dtype=torch.long)
-                col_idx = current_active_support.cols.index_select(0, indices).to(dtype=torch.long)
-                if bool(torch.any(row_idx >= n_source_int)) or bool(torch.any(col_idx >= int(v.numel()))):
-                    logger.info(
-                        "[%s Error] Row or column index out of bounds for dual variables.",
-                        log_prefix,
-                    )
-                    return None
-                gap = costs.index_select(0, indices) - (u.index_select(0, row_idx) + v.index_select(0, col_idx))
-                return torch.where(
-                    torch.isfinite(gap),
-                    gap,
-                    torch.full_like(gap, -torch.inf),
-                )
-
-            # CN: 第一阶段优先删除旧的零流边，并在其中优先删 dual gap 最大的边。
-            # EN: First remove old zero-flow edges, prioritizing the largest dual gaps.
-            if int(old_zero_indices.numel()) > 0 and need > 0:
-                take = min(need, int(old_zero_indices.numel()))
-                old_zero_gaps = _dual_gaps_for(old_zero_indices)
-                if old_zero_gaps is None:
-                    return np.empty(0, dtype=np.int32)
-                if take < int(old_zero_indices.numel()):
-                    top_pos = torch.topk(
-                        old_zero_gaps,
-                        k=int(take),
-                        largest=True,
-                        sorted=True,
-                    ).indices
-                else:
-                    top_pos = torch.argsort(
-                        old_zero_gaps,
-                        descending=True,
-                        stable=True,
-                    )
-                selected_parts.append(old_zero_indices.index_select(0, top_pos[:take]))
-                need -= take
-
-            # CN: 如果零流旧边不够，再扩展到旧的非零流边，按流量小优先、gap 大打破并列。
-            # EN: If old zero-flow edges are insufficient, expand to old nonzero edges by small flow, then larger gap.
-            if need > 0:
-                selected_mask = torch.zeros(int(costs.numel()), dtype=torch.bool, device=costs.device)
-                if selected_parts:
-                    selected_mask[torch.cat(selected_parts)] = True
-                old_indices = torch.nonzero(old_pool & (~selected_mask), as_tuple=False).view(-1)
-                if int(old_indices.numel()) > 0:
-                    take = min(need, int(old_indices.numel()))
-                    old_gaps = _dual_gaps_for(old_indices)
-                    if old_gaps is None:
-                        return np.empty(0, dtype=np.int32)
-                    old_abs = abs_x.index_select(0, old_indices)
-                    # CN: 先按 gap 降序稳定排序，再按 primal 升序稳定排序，等价于 numpy lexsort((-gap, abs_x))。
-                    # EN: Stable sort by gap descending, then primal ascending, matching numpy lexsort((-gap, abs_x)).
-                    gap_order = torch.argsort(-old_gaps, stable=True)
-                    old_by_gap = old_indices.index_select(0, gap_order)
-                    primal_order = torch.argsort(old_abs.index_select(0, gap_order), stable=True)
-                    selected_parts.append(old_by_gap.index_select(0, primal_order[:take]))
-                    need -= take
-
-            if not selected_parts:
-                logger.info("[%s] No old variables found to remove.", log_prefix)
-                return np.empty(0, dtype=np.int32)
-
-            # CN: 返回的是 prune 前 active support 内的绝对位置，而不是 row/col key。
-            # EN: Return absolute positions in the pre-prune active support, not row/col keys.
-            selected_t = torch.cat(selected_parts).to(dtype=torch.int32)
-            if need > 0:
-                logger.info(
-                    "[%s] Selected %d old variables; old pool is short by %d, so current new variables are preserved.",
-                    log_prefix,
-                    int(selected_t.numel()),
-                    int(need),
-                )
-            else:
-                logger.info(
-                    "[%s] Selected %d old variables with protect_new cleaning.",
-                    log_prefix,
-                    int(selected_t.numel()),
-                )
-            return selected_t.detach().cpu().numpy().astype(np.int32, copy=False)
-
-        # CN: NumPy 路径使用同一套选择规则，只是先把 active support 视图规整为 1D 数组。
-        # EN: The NumPy path applies the same selection rule after normalizing active-support views to 1D arrays.
-        rows = self._to_numpy_1d(current_active_support.rows, np.int64)
-        cols = self._to_numpy_1d(current_active_support.cols, np.int64)
-        costs = self._to_numpy_1d(current_active_support.c_vec, np.float64)
-        x_prev = self._to_numpy_1d(current_active_support.x_prev, np.float64)
-        creation_iters = self._to_numpy_1d(current_active_support.creation_iteration, np.int64)
-        duals_np = self._to_numpy_1d(duals, np.float64)
-        n_source_int = int(n_source)
-        u = duals_np[:n_source_int]
-        v = duals_np[n_source_int:]
-
-        if np.any(rows >= n_source_int) or np.any(cols >= len(v)):
-            logger.info(
-                "[%s Error] Row or column index out of bounds for dual variables.",
-                log_prefix,
-            )
+        values = current_active_support.pruning_values(duals, n_source)
+        if values is None:
+            logger.info("[%s Error] Row or column index out of bounds for dual variables.", log_prefix)
             return np.empty(0, dtype=np.int32)
-
-        # CN: 对全部候选预先计算 dual gap，非有限值降为 -inf，避免被优先删除。
-        # EN: Precompute dual gaps for all candidates and demote non-finite values to -inf.
-        dual_gaps = costs - (u[rows] + v[cols])
-        dual_gaps = np.where(np.isfinite(dual_gaps), dual_gaps, -np.inf)
-        abs_x = np.abs(x_prev)
+        abs_x, creation_iters, reduced_costs = values
         is_new = creation_iters == int(current_inner_iter)
-        old_pool = (creation_iters != -1) & (~is_new)
-        old_zero_indices = np.flatnonzero(old_pool & (abs_x < self.primal_tol))
-        need = int(num_to_remove)
-        selected_parts = []
+        is_structural = creation_iters == -1
+        old_pool = (~is_structural) & (~is_new)
+        is_positive = abs_x > POSITIVE_SUPPORT_TOLERANCE
+        removable_pool = old_pool & (~is_positive)
 
-        # CN: 第一阶段：旧零流边按 dual gap 降序删除。
-        # EN: Stage 1: remove old zero-flow edges in descending dual-gap order.
-        if old_zero_indices.size > 0 and need > 0:
-            zero_order = np.argsort(-dual_gaps[old_zero_indices], kind="stable")
-            take = min(need, int(old_zero_indices.size))
-            selected_parts.append(old_zero_indices[zero_order[:take]])
-            need -= take
-
-        # CN: 第二阶段：如果还需删除，则在旧边中按 primal 小优先、gap 大打破并列。
-        # EN: Stage 2: if more removals are needed, prefer smaller primal values and break ties by larger gaps.
-        if need > 0:
-            selected_mask = np.zeros(rows.size, dtype=bool)
-            if selected_parts:
-                selected_mask[np.concatenate(selected_parts)] = True
-            old_indices = np.flatnonzero(old_pool & (~selected_mask))
-            if old_indices.size > 0:
-                # CN: 旧零流候选不够时，按 primal 流量从小到大扩展旧边；同流量时删 dual gap 更大的边。
-                # EN: If old zero-flow candidates are insufficient, expand old edges by increasing primal flow; ties prefer larger dual gaps.
-                old_order = np.lexsort((-dual_gaps[old_indices], abs_x[old_indices]))
-                take = min(need, int(old_indices.size))
-                selected_parts.append(old_indices[old_order[:take]])
-                need -= take
-
-        if not selected_parts:
-            logger.info("[%s] No old variables found to remove.", log_prefix)
-            return np.empty(0, dtype=np.int32)
-
-        selected = np.concatenate(selected_parts).astype(np.int32, copy=False)
-        if need > 0:
-            logger.info(
-                "[%s] Selected %d old variables; old pool is short by %d, so current new variables are preserved.",
-                log_prefix,
-                int(selected.size),
-                int(need),
-            )
+        if TORCH_AVAILABLE and torch.is_tensor(removable_pool):
+            count = lambda mask: int(torch.count_nonzero(mask).item())
+            support_size = int(removable_pool.numel())
         else:
-            logger.info(
-                "[%s] Selected %d old variables with protect_new cleaning.",
-                log_prefix,
-                int(selected.size),
+            count = lambda mask: int(np.count_nonzero(mask))
+            support_size = int(np.asarray(removable_pool).size)
+        removable_count = count(removable_pool)
+        if removable_count < int(num_to_remove):
+            raise RuntimeError(
+                "HELLO budgeted pruning invariant violated: "
+                f"required_removals={int(num_to_remove)}, "
+                f"removable_old_zero={removable_count}, "
+                f"protected_positive={count(is_positive)}, "
+                f"protected_structural={count(is_structural)}, "
+                f"protected_new={count(is_new)}, "
+                f"support_size={support_size}, "
+                f"budget={support_size - int(num_to_remove)}"
             )
-        return selected
+        return _select_zero_flow_removals(
+            removable_pool=removable_pool,
+            reduced_costs=reduced_costs,
+            num_to_remove=num_to_remove,
+        )
 
     def select_indices_to_remove(self, current_active_support: Dict[str, Any], num_to_remove: int, **kwargs) -> np.ndarray:
         """
@@ -353,8 +220,7 @@ def apply_budgeted_pruning(
     if threshold <= 0:
         return np.empty(0, dtype=np.int32)
 
-    min_supp = n_s + n_t
-    max_size = int(threshold * min_supp)
+    max_size = active_support_budget(threshold, n_s, n_t)
     curr_size = solver.active_support.size
     if curr_size <= max_size:
         return np.empty(0, dtype=np.int32)
@@ -378,13 +244,7 @@ def apply_budgeted_pruning(
         return np.empty(0, dtype=np.int32)
 
     if removed_keys_out is not None:
-        from .reentry import edge_keys
-
-        support = solver.active_support
-        positions = to_remove
-        if torch.is_tensor(support.rows):
-            positions = torch.as_tensor(to_remove, dtype=torch.long, device=support.rows.device)
-        removed_keys_out.append(edge_keys(support.rows[positions], support.cols[positions], n_t))
+        removed_keys_out.append(solver.active_support.keys_at_positions(to_remove))
 
     if logger.isEnabledFor(logging.INFO):
         size_after = curr_size - len(to_remove)
@@ -394,35 +254,13 @@ def apply_budgeted_pruning(
             fmt_size_ratio(curr_size, n_s, n_t),
             fmt_size_ratio(size_after, n_s, n_t),
         )
-    if getattr(solver.active_support, "is_torch_backend", False):
-        mask_backend = torch.ones(
-            int(curr_size),
-            dtype=torch.bool,
-            device=solver.active_support.device,
-        )
-        remove_t = torch.as_tensor(
-            np.asarray(to_remove, dtype=np.int64),
-            dtype=torch.long,
-            device=solver.active_support.device,
-        )
-        mask_backend[remove_t] = False
-        with trace_span(
-            trace_collector,
-            trace_prefix,
-            "prune",
-            args={"removed": int(len(to_remove))},
-        ):
-            solver.active_support.prune(mask_backend)
-    else:
-        mask = np.ones(curr_size, dtype=bool)
-        mask[to_remove] = False
-        with trace_span(
-            trace_collector,
-            trace_prefix,
-            "prune",
-            args={"removed": int(len(to_remove))},
-        ):
-            solver.active_support.prune(mask)
+    with trace_span(
+        trace_collector,
+        trace_prefix,
+        "prune",
+        args={"removed": int(len(to_remove))},
+    ):
+        solver.active_support.remove_positions(to_remove)
     record_solve_event(
         "budgeted_pruning",
         iteration=None if current_inner_iter is None else int(current_inner_iter),

@@ -9,6 +9,9 @@ ResidentSide = Literal["source", "target"]
 
 _CUSTOM_TOPK_BUCKETS = (1, 2, 4, 8, 16, 32)
 _MIN_MEMORY_RESERVE_BYTES = 512 * 1024 * 1024
+_TOPK_VALUE_BYTES = 8
+_TOPK_INDEX_BYTES = 8
+_TOPK_SLOT_BYTES = _TOPK_VALUE_BYTES + _TOPK_INDEX_BYTES
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,9 @@ def estimate_resident_bytes(*, point_count: int, feature_dim: int, topk_bucket: 
     if bucket not in _CUSTOM_TOPK_BUCKETS:
         raise ValueError(f"topk_bucket must be one of {_CUSTOM_TOPK_BUCKETS}")
     feature_and_vectors = count * (dim * 4 + 3 * 8)
-    topk_state = count * bucket * (8 + 4)
+    # CN: 生产 scan 的常驻 top-k 状态使用 FP64 value 和 int64 index。
+    # EN: Production scans store resident top-k state as FP64 values and int64 indices.
+    topk_state = count * bucket * _TOPK_SLOT_BYTES
     return int(feature_and_vectors + topk_state)
 
 

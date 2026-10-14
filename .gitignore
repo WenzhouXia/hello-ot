@@ -6,6 +6,11 @@ __pycache__/
 /build_solvers/build_cache_cupdlpx/
 /build/
 
+# third_party
+/third_party/ETM/
+/third_party/C2OT/
+/third_party/PDCS/
+/third_party/ot-sim2real/
 # CN: 论文
 # EN: paper
 /paper/
@@ -29,6 +34,7 @@ __pycache__/
 !/tests/test_hello_ot_public_api.py
 !/tests/test_hello_ot_dependency_boundary.py
 !/tests/test_hello_ot_numerical_equivalence.py
+!/tests/test_hier_uot_stopping_norm.py
 !/tests/public_paper_experiments_test.py
 !/tests/_run_hello_equivalence_case.py
 !/paper_experiments/uot/test_*.py
@@ -83,8 +89,12 @@ __pycache__/
 /paper_experiments/main_scaling/results_support_compression/
 /paper_experiments/support_sparsification/results/
 /paper_experiments/main_scaling/results_hprlp/
+/paper_experiments/uot_playground/results/
 /src/hierarchical_ot/dual_assignment/_gcost_fused_ext/*.so
 /src/hierarchical_ot/hello/kernels/norm_cost_scan_ext/*.so
+/experiments/sdot_iteris/
+/experiments/sdot_openevolve/
+/paper_experiments/ot_adaptive_stepsize/
 # CN: 调试和示例运行输出
 # EN: Debug and example run outputs
 /debug/**/runs/

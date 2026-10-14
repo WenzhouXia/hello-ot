@@ -37,6 +37,7 @@ EXTRA_FILES = (
     "scripts/validate_variants_extended.py",
     "scripts/check_sdist.py",
     "tests/hello_cost_perturbation_test.py",
+    "tests/hello_gpu_resident_test.py",
     "tests/hello_algorithm_structure_test.py",
     "tests/hello_ot_variants_test.py",
     "tests/variants_numerical_equivalence_test.py",

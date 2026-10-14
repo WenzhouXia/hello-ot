@@ -7,6 +7,12 @@ import scipy.sparse as sp
 import torch
 
 import hello_ot
+from hello_ot.variants._validation import matrix, positive_mass, probability_mass
+from hello_ot.variants import (
+    GromovIterationRecord,
+    SemiDiscreteIterationRecord,
+    UOTIterationRecord,
+)
 
 
 def test_variants_public_surface() -> None:
@@ -19,12 +25,31 @@ def test_variants_public_surface() -> None:
         "solve_unbalanced",
         "solve_gromov",
         "SemiDiscreteResult",
+        "UOTConvergenceBounds",
         "UnbalancedResult",
         "GromovResult",
     ]
     for name in expected:
         assert hasattr(hello_ot, name), f"hello_ot should export {name}"
         assert name in hello_ot.__all__, f"{name} should be in hello_ot.__all__"
+
+
+def test_shared_variant_input_validation() -> None:
+    """
+    CN: variants 共用校验必须区分概率质量与非平衡 OT 绝对质量语义。
+    EN: Shared variant validation must distinguish probability mass from unbalanced absolute mass.
+    """
+    points = matrix([[1.0, 2.0]], name="points")
+    assert points.dtype == np.float32
+    assert points.flags.c_contiguous
+    with pytest.raises(ValueError, match="non-empty 2D"):
+        matrix([1.0, 2.0], name="points")
+    with pytest.raises(ValueError, match="sum to 1"):
+        probability_mass([1.0, 1.0], size=2, name="mass")
+    np.testing.assert_array_equal(
+        positive_mass([1.0, 1.0], size=2, name="mass"),
+        np.ones(2, dtype=np.float64),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HELLO is CUDA-only")
@@ -41,15 +66,19 @@ def test_solve_semidiscrete_basic() -> None:
     with pytest.raises(ValueError, match="sum to 1"):
         hello_ot.solve_semidiscrete(target_points, target_mass=np.ones(20) * 2.0)
 
+    progress = []
     res = hello_ot.solve_semidiscrete(
         target_points,
         num_repeats=2,
         source_sample_count=40,
         options=hello_ot.SolverOptions(coarsest_size_threshold=16),
+        progress_callback=progress.append,
     )
     assert isinstance(res, hello_ot.SemiDiscreteResult)
     assert res.target_dual.shape == (20,)
     assert len(res.records) == 2
+    assert all(isinstance(record, SemiDiscreteIterationRecord) for record in res.records)
+    assert progress[0]["record"] is res.records[0]
     assert np.isclose(float(np.mean(res.target_dual)), 0.0, atol=1e-5)
 
 
@@ -75,6 +104,7 @@ def test_solve_unbalanced_cold() -> None:
 
     # CN: 1. 冷启动求解
     # EN: 1. Cold-start solve
+    progress = []
     res_cold = hello_ot.solve_unbalanced(
         src_pts,
         tgt_pts,
@@ -85,8 +115,12 @@ def test_solve_unbalanced_cold() -> None:
         max_iterations=4,
         initialization=None,
         options=hello_ot.SolverOptions(coarsest_size_threshold=8),
+        progress_callback=progress.append,
     )
     assert isinstance(res_cold, hello_ot.UnbalancedResult)
+    assert all(isinstance(record, UOTIterationRecord) for record in res_cold.records)
+    assert progress == list(res_cold.records)
+    assert all(left is right for left, right in zip(progress, res_cold.records))
     assert res_cold.objective > 0.0
     assert res_cold.dual_objective <= res_cold.objective + 1e-4
     assert res_cold.transported_mass > 0.0
@@ -110,13 +144,18 @@ def test_solve_gromov_asymmetric_dimensions() -> None:
     with pytest.raises(ValueError, match="sum to 1"):
         hello_ot.solve_gromov(src_pts, tgt_pts, source_mass=np.ones(20))
 
+    progress = []
     res = hello_ot.solve_gromov(
         src_pts,
         tgt_pts,
         max_iterations=3,
         options=hello_ot.SolverOptions(coarsest_size_threshold=8),
+        progress_callback=progress.append,
     )
     assert isinstance(res, hello_ot.GromovResult)
+    assert all(isinstance(record, GromovIterationRecord) for record in res.records)
+    assert progress == list(res.records)
+    assert all(left is right for left, right in zip(progress, res.records))
     assert res.objective > 0.0
     assert res.solution.shape == (20, 24)
     sparse_p = res.solution.to_sparse_matrix()

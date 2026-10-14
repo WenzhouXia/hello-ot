@@ -29,10 +29,17 @@ from hello_ot.refinement.dual_violation import (
     detect_and_append_dual_violations,
 )
 from hello_ot.restricted_ot.solve_lp import (
-    _copy_primal_for_active_support,
     solve_lp as _solve_restricted_lp,
 )
 from hello_ot.restricted_ot.runtime import sparse_coupling_from_active_support
+from hello_ot.types import (
+    ActiveSupportStats,
+    BudgetedPruningStats,
+    ConvergenceStats,
+    DualViolationStats,
+    IterationStats,
+    SolveLPStats,
+)
 
 
 @dataclass
@@ -59,7 +66,7 @@ class RefinementRuntime:
     last_primal: Any = None
     last_dual: Any = None
     last_result: Any = None
-    iteration_records: List[Dict[str, Any]] = field(default_factory=list)
+    iteration_records: List[IterationStats] = field(default_factory=list)
     last_dual_feasibility_value: Optional[float] = None
     last_dual_feasibility_num_sq: Optional[float] = None
     last_dual_feasibility_den_sq: Optional[float] = None
@@ -137,6 +144,8 @@ class SupportUpdate:
     pruning_info: Dict[str, Any]
     support_after_dual_violation: int
     support_after_budgeted_pruning: int
+    violations_found: int = 0
+    edges_added: int = 0
     added_keys: Any = None
     pruned_keys: Any = None
 
@@ -278,7 +287,7 @@ def solve_lp(runtime: RefinementRuntime, iteration: int) -> LPIteration:
         iteration_trace.__exit__(None, None, None)
         raise RuntimeError("restricted LP returned a non-finite objective")
 
-    from hello_ot.refinement.loop import _dual_stabilization_pricing_dual
+    from hello_ot.refinement.dual_stabilization import _dual_stabilization_pricing_dual
 
     with (
         trace_collector.span(
@@ -316,9 +325,7 @@ def solve_lp(runtime: RefinementRuntime, iteration: int) -> LPIteration:
         runtime.last_primal = primal
         runtime.last_dual = dual
         runtime.last_result = result
-        solver.active_support.set_x_prev(
-            _copy_primal_for_active_support(solver.active_support, result.x)
-        )
+        solver.active_support.commit_primal(result.x)
 
     return LPIteration(
         index=inner_iter,
@@ -344,7 +351,7 @@ def check_optimality(
     CN: 扫描完整边集形成 optimality certificate；fused 候选保存在返回值中。
     EN: Scan the full edge set for an optimality certificate; fused candidates remain in the result.
     """
-    from hello_ot.refinement.loop import _run_dual_feasibility_scan_for_solver
+    from hello_ot.refinement.scan_dispatch import _run_dual_feasibility_scan_for_solver
 
     config = runtime.config
     solver = runtime.solver
@@ -356,11 +363,7 @@ def check_optimality(
     use_fused = cost_type in {"l1", "linf", "l2"} or bool(
         getattr(config, "use_fused_lowrank_feasibility_pricing", True)
     )
-    support_staging_context = (
-        solver.active_support.stage_storage_on_cpu()
-        if bool(getattr(solver.active_support, "is_cuda", False))
-        else nullcontext({})
-    )
+    support_staging_context = solver.active_support.release_device_storage_for_scan()
     with support_staging_context as support_staging_profile:
         with (
             trace_collector.span(
@@ -524,7 +527,7 @@ def update_support(
     )
     runtime.pricing_time += pricing_time
 
-    from hello_ot.refinement.loop import (
+    from hello_ot._internal.instrumentation.refinement import (
         _attach_dual_stabilization_info,
         _build_cleaning_profile_info,
     )
@@ -604,6 +607,8 @@ def update_support(
         pruning_info=pruning_info,
         support_after_dual_violation=support_after_violation,
         support_after_budgeted_pruning=support_after_pruning,
+        violations_found=int(pricing_info["found"]),
+        edges_added=int(pricing_info["added"]),
     )
     if track_reentry:
         from .reentry import edge_keys
@@ -633,7 +638,7 @@ def _converged_support_update(
     certificate: OptimalityCertificate,
     inner_iter: int,
 ) -> SupportUpdate:
-    from hello_ot.refinement.loop import _build_cleaning_profile_info
+    from hello_ot._internal.instrumentation.refinement import _build_cleaning_profile_info
 
     solver = runtime.solver
     scan_result = certificate.scan_result
@@ -685,16 +690,40 @@ def _converged_support_update(
     )
 
 
+def _optional_finite_float(value: Any) -> Optional[float]:
+    """
+    CN: 将可选诊断值转换为有限浮点数，缺失或无效值保持为 None。
+    EN: Convert an optional diagnostic to a finite float, preserving missing or invalid values as None.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if np.isfinite(parsed) else None
+
+
+def _optional_dual_feasibility_norm(value: Any) -> Optional[DualFeasibilityNorm]:
+    """
+    CN: 解析可选的 dual-feasibility norm，不为未知值提供默认规则。
+    EN: Parse an optional dual-feasibility norm without defaulting unknown values.
+    """
+    parsed = str(value).strip().lower() if value is not None else ""
+    if parsed == "l2":
+        return "l2"
+    if parsed == "linf":
+        return "linf"
+    return None
+
+
 def _complete_iteration(
     runtime: RefinementRuntime,
     iteration: LPIteration,
     certificate: OptimalityCertificate,
     update: SupportUpdate,
 ) -> None:
-    from hello_ot.refinement.loop import (
-        _attach_dual_stabilization_info,
-        _compact_pricing_info,
-    )
+    from hello_ot._internal.instrumentation.refinement import _attach_dual_stabilization_info
 
     runtime.peak_active_support_size = max(
         runtime.peak_active_support_size,
@@ -818,27 +847,85 @@ def _complete_iteration(
             profile_depth=runtime.warm_start_profile_depth,
             dual_stabilization_info=iteration.stabilization,
         )
+    lp_result = iteration.pack.get("res")
+    lp_diag = dict(iteration.pack.get("diag", {}) or {})
     runtime.iteration_records.append(
-        {
-            "iter": int(iteration.index + 1),
-            "objective": float(iteration.result.obj_val),
-            "lp_time": float(iteration.pack["lp_time"]),
-            "full_scan_time": full_scan_time,
-            "lp_iters": (
-                int(iteration.pack["res"].iterations)
-                if getattr(iteration.pack.get("res"), "iterations", None) is not None
-                else None
+        IterationStats(
+            index=int(iteration.index + 1),
+            objective=float(iteration.result.obj_val),
+            wall_time=float(time.perf_counter() - iteration.started_at),
+            bookkeeping_time=float(iteration.state_update_time)
+            + float(certificate.convergence_time),
+            full_scan_time=full_scan_time,
+            solve_lp=SolveLPStats(
+                wall_time=float(iteration.pack["lp_time"]),
+                backend_iterations=(
+                    None
+                    if getattr(lp_result, "iterations", None) is None
+                    else int(lp_result.iterations)
+                ),
+                primal_feasibility=_optional_finite_float(
+                    lp_diag.get("solver_algorithm_rel_primal_res_l2")
+                ),
+                primal_dual_gap=_optional_finite_float(
+                    lp_diag.get("solver_relative_primal_dual_gap")
+                ),
+                termination_norm=_optional_dual_feasibility_norm(
+                    lp_diag.get("solver_termination_norm")
+                ),
+                termination_reason=(
+                    None
+                    if lp_diag.get("solver_termination_reason") is None
+                    else str(lp_diag["solver_termination_reason"])
+                ),
+                termination_primal_feasibility=_optional_finite_float(
+                    lp_diag.get("solver_termination_rel_primal_res")
+                ),
+                termination_dual_feasibility=_optional_finite_float(
+                    lp_diag.get("solver_termination_rel_dual_res")
+                ),
+                algorithm_dual_feasibility=_optional_finite_float(
+                    lp_diag.get("solver_algorithm_rel_dual_res_l2")
+                ),
             ),
-            "lp_diag": dict(iteration.pack.get("diag", {}) or {}),
-            "active_support_before_lp": int(iteration.active_support_before_lp),
-            "active_support_after_pricing": int(update.support_after_dual_violation),
-            "active_support_after_cleaning": int(update.support_after_budgeted_pruning),
-            "pricing_info": _compact_pricing_info(update.pricing_info),
-            "cleaning_info": dict(update.pruning_info),
-            "convergence_info": dict(convergence_info),
-            "finalize_components": dict(finalize_components),
-            "wall_time": float(time.perf_counter() - iteration.started_at),
-        }
+            dual_violation=DualViolationStats(
+                wall_time=float(update.pricing_time),
+                violations_found=int(update.violations_found),
+                edges_added=int(update.edges_added),
+            ),
+            budgeted_pruning=BudgetedPruningStats(
+                wall_time=float(update.pruning_time),
+                support_before=int(update.support_after_dual_violation),
+                support_after=int(update.support_after_budgeted_pruning),
+                budget=int(update.pruning_info["budget"]),
+                budget_exceeded=bool(int(update.pruning_info["budget_overflow"]) > 0),
+            ),
+            support=ActiveSupportStats(
+                before_lp=int(iteration.active_support_before_lp),
+                after_dual_violation=int(update.support_after_dual_violation),
+                after_budgeted_pruning=int(update.support_after_budgeted_pruning),
+                peak=max(
+                    int(iteration.active_support_before_lp),
+                    int(update.support_after_dual_violation),
+                    int(update.support_after_budgeted_pruning),
+                ),
+            ),
+            convergence=ConvergenceStats(
+                dual_feasibility=float(certificate.stopping_dual_feasibility),
+                tolerance=float(
+                    getattr(runtime.config, "dual_feasibility_tol", 1e-6)
+                ),
+                passed=bool(certificate.converged),
+                relative_full_dual_feasibility=float(certificate.dual_feasibility),
+                relative_linf_dual_feasibility=_optional_finite_float(
+                    diagnostics.get("relative_linf_dual_feasibility")
+                ),
+                max_dual_violation=_optional_finite_float(
+                    diagnostics.get("dual_feasibility_max_violation")
+                ),
+                norm=_optional_dual_feasibility_norm(runtime.stopping_norm),
+            ),
+        )
     )
     if certificate.converged:
         _runtime_log(
@@ -869,7 +956,7 @@ def finalize_refinement(runtime: RefinementRuntime) -> Dict[str, Any]:
         )
     final_is_converged = bool(
         runtime.iteration_records
-        and runtime.iteration_records[-1]["convergence_info"].get("is_converged", False)
+        and runtime.iteration_records[-1].convergence.passed
     )
     hit_itermax = bool(
         not final_is_converged

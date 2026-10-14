@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
+import torch
 
-from .state import WarmStartState
+from .state import GPUWarmStartState, WarmStartState
 
 
 ArrayLike = Any
@@ -22,7 +23,14 @@ class HelloSolveError(RuntimeError):
     """
 
 
-def _float32_matrix(value: Any, *, name: str) -> np.ndarray:
+def _float32_matrix(value: Any, *, name: str) -> np.ndarray | torch.Tensor:
+    if torch.is_tensor(value):
+        value = value.detach()
+        if value.is_cuda:
+            if value.ndim != 2 or min(value.shape) < 1:
+                raise ValueError(f"{name} must be a non-empty 2D matrix")
+            return value
+        value = value.float().numpy()
     array = np.asarray(value, dtype=np.float32)
     if array.ndim != 2:
         raise ValueError(f"{name} must be a 2D array; got shape={array.shape}.")
@@ -38,15 +46,20 @@ def _float64_vector(value: Any, *, size: int, name: str) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float64)
 
 
-def _mass_vector(value: Optional[Any], *, size: int, name: str) -> np.ndarray:
+def _mass_vector(value: Optional[Any], *, size: int, name: str) -> np.ndarray | torch.Tensor:
+    if torch.is_tensor(value):
+        value = value.detach()
+        if value.is_cuda:
+            value = value.to(dtype=torch.float64).reshape(-1).contiguous()
+            if value.numel() != size or not bool(torch.all(torch.isfinite(value) & (value > 0))):
+                raise ValueError(f"{name} must have length {size} and finite, strictly positive values")
+            return value
+        value = value.double().numpy()
     if value is None:
         return np.full(int(size), 1.0 / float(size), dtype=np.float64)
     array = _float64_vector(value, size=size, name=name)
-    if np.any(array < 0.0) or not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must be finite and nonnegative.")
-    total = float(array.sum(dtype=np.float64))
-    if not np.isfinite(total) or total <= 0.0:
-        raise ValueError(f"{name} must have positive total mass.")
+    if not np.all(np.isfinite(array)) or np.any(array <= 0.0):
+        raise ValueError(f"{name} must contain only finite, strictly positive values.")
     return array
 
 
@@ -57,11 +70,11 @@ class Problem:
     EN: Formal balanced-OT input for HELLO; all four costs accept two point clouds.
     """
 
-    source_points: np.ndarray
-    target_points: np.ndarray
+    source_points: np.ndarray | torch.Tensor
+    target_points: np.ndarray | torch.Tensor
     cost_type: PointCloudCostType
-    source_mass: Optional[np.ndarray] = None
-    target_mass: Optional[np.ndarray] = None
+    source_mass: Optional[np.ndarray | torch.Tensor] = None
+    target_mass: Optional[np.ndarray | torch.Tensor] = None
 
     def __post_init__(self) -> None:
         source = _float32_matrix(self.source_points, name="source_points")
@@ -251,13 +264,27 @@ class PrewarmStats:
 @dataclass(frozen=True)
 class SparseOTSolution:
     shape: Tuple[int, int]
-    rows: np.ndarray
-    cols: np.ndarray
-    values: np.ndarray
-    source_dual: np.ndarray
-    target_dual: np.ndarray
+    rows: np.ndarray | torch.Tensor
+    cols: np.ndarray | torch.Tensor
+    values: np.ndarray | torch.Tensor
+    source_dual: np.ndarray | torch.Tensor
+    target_dual: np.ndarray | torch.Tensor
 
     def __post_init__(self) -> None:
+        if torch.is_tensor(self.values):
+            fields = ("rows", "cols", "values", "source_dual", "target_dual")
+            if not all(torch.is_tensor(getattr(self, key)) and getattr(self, key).device == self.values.device for key in fields):
+                raise ValueError("GPU solution arrays must share one device")
+            arrays = [getattr(self, key).detach().to(dtype=torch.int64 if key in {"rows", "cols"} else torch.float64).reshape(-1).contiguous() for key in fields]
+            rows, cols, values, source_dual, target_dual = arrays
+            if rows.numel() != values.numel() or cols.numel() != values.numel():
+                raise ValueError("rows, cols, and values must have equal lengths")
+            if source_dual.numel() != self.shape[0] or target_dual.numel() != self.shape[1]:
+                raise ValueError("dual lengths must match solution shape")
+            positive = values > 1e-12
+            for key, value in zip(fields, (rows[positive], cols[positive], values[positive], source_dual, target_dual)):
+                object.__setattr__(self, key, value)
+            return
         rows = np.ascontiguousarray(np.asarray(self.rows, dtype=np.int64).reshape(-1))
         cols = np.ascontiguousarray(np.asarray(self.cols, dtype=np.int64).reshape(-1))
         values = np.ascontiguousarray(np.asarray(self.values, dtype=np.float64).reshape(-1))
@@ -278,11 +305,27 @@ class SparseOTSolution:
         object.__setattr__(self, "target_dual", target_dual)
 
     def to_sparse_matrix(self) -> Any:
+        if torch.is_tensor(self.values):
+            return torch.sparse_coo_tensor(torch.stack((self.rows, self.cols)), self.values, self.shape).coalesce()
         from scipy import sparse
 
         return sparse.coo_matrix((self.values, (self.rows, self.cols)), shape=self.shape)
 
-    def to_warm_start_state(self) -> WarmStartState:
+    def to_cpu(self) -> "SparseOTSolution":
+        """
+        CN: 显式导出 CPU 结果；GPU 求解过程不会调用此方法。
+        EN: Explicitly export a CPU solution; GPU solves never call this method.
+        """
+        if not torch.is_tensor(self.values):
+            return self
+        return SparseOTSolution(self.shape, **{key: getattr(self, key).cpu().numpy() for key in ("rows", "cols", "values", "source_dual", "target_dual")})
+
+    def to_warm_start_state(self) -> WarmStartState | GPUWarmStartState:
+        if torch.is_tensor(self.values):
+            from .state import GPUWarmStartState
+
+            return GPUWarmStartState(self.rows.int().clone(), self.cols.int().clone(), self.values.clone(),
+                torch.cat((self.source_dual, self.target_dual)), self.shape[0], self.shape[1], str(self.values.device))
         dual_uv = np.concatenate([self.source_dual, self.target_dual]).astype(np.float64, copy=False)
         return WarmStartState(
             rows=self.rows.astype(np.int32, copy=True),

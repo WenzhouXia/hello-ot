@@ -4,6 +4,8 @@ import math
 import sys
 from typing import Any, Mapping
 
+from hello_ot.types import IterationStats
+
 
 def _enabled(value: Any) -> bool:
     return str(getattr(value, "verbosity", value)) in {"compact", "detailed"}
@@ -100,29 +102,20 @@ def report_level_initialized(execution: Any, initialized: Any) -> None:
 def report_iteration(execution: Any, runtime: Any) -> None:
     if not _enabled(execution.config) or not runtime.iteration_records:
         return
-    record: Mapping[str, Any] = runtime.iteration_records[-1]
-    lp = dict(record.get("lp_diag") or {})
-    convergence = dict(record.get("convergence_info") or {})
-    pricing = dict(record.get("pricing_info") or {})
-    components = dict(record.get("finalize_components") or {})
-    elapsed = record.get("wall_time")
-    if elapsed is None:
-        elapsed = float(record.get("lp_time", 0.0) or 0.0) + sum(
-            float(value or 0.0) for value in components.values()
-        )
+    record: IterationStats = runtime.iteration_records[-1]
     _emit(
         "  "
-        f"iter={int(record.get('iter', len(runtime.iteration_records)))} "
-        f"obj={_objective(record.get('objective'))} "
-        f"pFeas={_number(lp.get('solver_algorithm_rel_primal_res_l2'))} "
-        f"dFeas={_number(convergence.get('stopping_dual_feasibility', convergence.get('dual_feasibility')))} "
-        f"gap={_number(lp.get('solver_relative_primal_dual_gap'))} "
-        f"active={int(record.get('active_support_after_cleaning', 0) or 0):,} "
-        f"added={int(pricing.get('added_count', pricing.get('added', 0)) or 0):,} "
+        f"iter={record.index} "
+        f"obj={_objective(record.objective)} "
+        f"pFeas={_number(record.solve_lp.primal_feasibility)} "
+        f"dFeas={_number(record.convergence.dual_feasibility)} "
+        f"gap={_number(record.solve_lp.primal_dual_gap)} "
+        f"active={record.support.after_budgeted_pruning:,} "
+        f"added={record.dual_violation.edges_added:,} "
         "| "
-        f"lp={_elapsed(record.get('lp_time'))} "
-        f"full_scan={_elapsed(record.get('full_scan_time'))} "
-        f"elapsed={_elapsed(elapsed)}"
+        f"lp={_elapsed(record.solve_lp.wall_time)} "
+        f"full_scan={_elapsed(record.full_scan_time)} "
+        f"elapsed={_elapsed(record.wall_time)}"
     )
 
 
@@ -139,14 +132,12 @@ def report_level_done(
         return
     records = list(result.get("warm_start_iteration_records") or [])
     final_active = (
-        int(records[-1].get("active_support_after_cleaning", active) or active)
+        int(records[-1].support.after_budgeted_pruning)
         if records
         else int(active)
     )
-    lp_time = sum(float(record.get("lp_time", 0.0) or 0.0) for record in records)
-    full_scan_time = sum(
-        float(record.get("full_scan_time", 0.0) or 0.0) for record in records
-    )
+    lp_time = sum(float(record.solve_lp.wall_time) for record in records)
+    full_scan_time = sum(float(record.full_scan_time) for record in records)
     _emit(
         f"  level done | iterations={len(records)} "
         f"obj={_objective(result.get('distance'))} active={final_active:,} "
@@ -184,9 +175,51 @@ def report_perturbation_activated(execution: Any) -> None:
     )
 
 
+def report_perturbation_restart(execution: Any) -> None:
+    """
+    CN: 报告成本切换后的对偶可行性跳变安全重启。
+    EN: Report the safety restart caused by a post-switch dual-feasibility jump.
+    """
+    if not _enabled(execution.config):
+        return
+    metadata = execution.perturbation.metadata
+    _emit(
+        "cost perturbation restart | "
+        f"level={int(metadata['restart_trigger_level'])} "
+        f"before={_number(metadata['dual_feasibility_before_switch'])} "
+        f"after={_number(metadata['dual_feasibility_after_switch'])} "
+        f"ratio={_number(metadata['dual_feasibility_jump_ratio'])} "
+        f"threshold={_number(metadata['dual_feasibility_jump_threshold'])}"
+    )
+
+
 def report_original_transition(execution: Any) -> None:
     if _enabled(execution.config):
         _emit("cost perturbation | perturbed stage completed; switching back to original cost")
+
+
+def report_sparsification(
+    verbosity: Any,
+    *,
+    input_nnz: int,
+    output_nnz: int,
+    target_nnz: int,
+    cycle_updates: int,
+    wall_time: float,
+    dual_shift: float,
+) -> None:
+    """
+    CN: 仅在实际触发 sparsification 时输出一行紧凑诊断。
+    EN: Emit one compact diagnostic line only when sparsification actually runs.
+    """
+    if not _enabled(verbosity):
+        return
+    _emit(
+        "  [Sparsify] "
+        f"positive_nnz={int(input_nnz):,}->{int(output_nnz):,} "
+        f"cap={int(target_nnz):,} cycles={int(cycle_updates):,} "
+        f"time={_elapsed(wall_time)} dual_shift={_number(dual_shift)}"
+    )
 
 
 def final_metrics(result: Any) -> tuple[Any, Any, Any, Any] | None:
@@ -243,5 +276,6 @@ __all__ = [
     "report_level_initialized",
     "report_level_start",
     "report_original_transition",
+    "report_sparsification",
     "report_perturbation_activated",
 ]

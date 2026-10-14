@@ -10,7 +10,7 @@ import torch
 
 from hello_ot._internal.trace import _ChromeTraceCollector
 from hello_ot._internal.instrumentation.memory_accounting import use_solve_memory_tracker
-from hello_ot.config import SolverRuntimeConfig, finest_stopping_norm
+from hello_ot.config import SolverRuntimeConfig, finest_stopping_norm, level_cost_precision
 
 from .algorithm import _solve_hello_stage
 from .cost import (
@@ -20,21 +20,12 @@ from .cost import (
     prepare_cost,
 )
 from .hierarchy.construction import resolve_hierarchy_depth
+from .hierarchy.records import HierarchyLevelRecord
 from .types import (
-    ActiveSupportStats,
-    BudgetedPruningStats,
-    CoarsestSolveStats,
-    CostStageResult,
-    ConvergenceStats,
-    DualViolationStats,
     Result,
-    InitializationStats,
     IterationStats,
-    LevelResult,
     Problem,
     RefinementResult,
-    RefinementSummary,
-    SolveLPStats,
     SolveStageResult,
     SparseOTSolution,
     TraceResult,
@@ -89,11 +80,6 @@ def _optional_float(value: Any) -> Optional[float]:
     return parsed if np.isfinite(parsed) else None
 
 
-def _optional_norm(value: Any) -> Optional[str]:
-    parsed = str(value).strip().lower() if value is not None else ""
-    return parsed if parsed in {"l2", "linf"} else None
-
-
 def _synchronize_cuda_for_timing() -> None:
     """
     CN: 在正式 HELLO wall-time 边界同步当前 CUDA device，避免异步 kernel 落到计时区间之外。
@@ -113,88 +99,18 @@ def _require_cuda_runtime() -> None:
         raise RuntimeError("HELLO requires a CUDA-capable PyTorch runtime.")
 
 
-def _iteration_stats(records: Iterable[Mapping[str, Any]], *, config: _AlgorithmConfig) -> tuple[IterationStats, ...]:
-    output = []
+def _iteration_stats(records: Iterable[IterationStats]) -> tuple[IterationStats, ...]:
+    """
+    CN: 验证 refinement 层传入的强类型迭代记录，不接受可静默缺字段的字典。
+    EN: Validate typed refinement iteration records, rejecting mappings that can silently omit fields.
+    """
+    output: list[IterationStats] = []
     for record in records:
-        pricing = dict(record.get("pricing_info") or {})
-        cleaning = dict(record.get("cleaning_info") or {})
-        convergence = dict(record.get("convergence_info") or {})
-        lp_diag = dict(record.get("lp_diag") or {})
-        components = dict(record.get("finalize_components") or {})
-        before = int(record.get("active_support_before_lp", 0) or 0)
-        after_pricing = int(record.get("active_support_after_pricing", before) or before)
-        after_cleaning = int(record.get("active_support_after_cleaning", after_pricing) or after_pricing)
-        budget = int(cleaning.get("budget", int(config.support_budget_factor * max(1, before))))
-        output.append(
-            IterationStats(
-                index=int(record.get("iter", len(output) + 1)),
-                objective=float(record.get("objective", float("nan"))),
-                wall_time=float(
-                    record.get(
-                        "wall_time",
-                        float(record.get("lp_time", 0.0)) + sum(float(v or 0.0) for v in components.values()),
-                    )
-                ),
-                bookkeeping_time=float(components.get("state_update", 0.0)) + float(components.get("convergence_check", 0.0)),
-                full_scan_time=float(record.get("full_scan_time", 0.0) or 0.0),
-                solve_lp=SolveLPStats(
-                    wall_time=float(record.get("lp_time", 0.0)),
-                    backend_iterations=(None if record.get("lp_iters") is None else int(record["lp_iters"])),
-                    primal_feasibility=_optional_float(lp_diag.get("solver_algorithm_rel_primal_res_l2")),
-                    primal_dual_gap=_optional_float(lp_diag.get("solver_relative_primal_dual_gap")),
-                    termination_norm=_optional_norm(lp_diag.get("solver_termination_norm")),
-                    termination_reason=(
-                        None
-                        if lp_diag.get("solver_termination_reason") is None
-                        else str(lp_diag.get("solver_termination_reason"))
-                    ),
-                    termination_primal_feasibility=_optional_float(
-                        lp_diag.get("solver_termination_rel_primal_res")
-                    ),
-                    termination_dual_feasibility=_optional_float(
-                        lp_diag.get("solver_termination_rel_dual_res")
-                    ),
-                    algorithm_dual_feasibility=_optional_float(
-                        lp_diag.get("solver_algorithm_rel_dual_res_l2")
-                    ),
-                ),
-                dual_violation=DualViolationStats(
-                    wall_time=float(pricing.get("time", 0.0) or 0.0),
-                    violations_found=int(pricing.get("found_count", pricing.get("found", 0)) or 0),
-                    edges_added=int(pricing.get("added_count", pricing.get("added", 0)) or 0),
-                ),
-                budgeted_pruning=BudgetedPruningStats(
-                    wall_time=float(components.get("cleaning", 0.0) or 0.0),
-                    support_before=int(cleaning.get("before", after_pricing) or after_pricing),
-                    support_after=int(cleaning.get("after", after_cleaning) or after_cleaning),
-                    budget=budget,
-                    budget_exceeded=bool(int(cleaning.get("budget_overflow", 0) or 0) > 0),
-                ),
-                support=ActiveSupportStats(
-                    before_lp=before,
-                    after_dual_violation=after_pricing,
-                    after_budgeted_pruning=after_cleaning,
-                    peak=max(before, after_pricing, after_cleaning),
-                ),
-                convergence=ConvergenceStats(
-                    dual_feasibility=_optional_float(
-                        convergence.get("stopping_dual_feasibility", convergence.get("dual_feasibility"))
-                    ),
-                    tolerance=float(config.dual_feasibility_tolerance),
-                    passed=bool(convergence.get("is_converged", False)),
-                    relative_full_dual_feasibility=_optional_float(
-                        convergence.get("dual_feasibility")
-                    ),
-                    relative_linf_dual_feasibility=_optional_float(
-                        convergence.get("relative_linf_dual_feasibility")
-                    ),
-                    max_dual_violation=_optional_float(
-                        convergence.get("dual_feasibility_max_violation")
-                    ),
-                    norm=_optional_norm(convergence.get("finest_dual_feasibility_norm")),
-                ),
+        if not isinstance(record, IterationStats):
+            raise TypeError(
+                "HELLO refinement objective_trace must contain IterationStats values"
             )
-        )
+        output.append(record)
     return tuple(output)
 
 
@@ -204,85 +120,17 @@ def _stage_result(
     config: _AlgorithmConfig,
     wall_time: Optional[float] = None,
 ) -> SolveStageResult:
-    diagnostics = dict(raw.get("hello_diagnostics") or {})
-    raw_levels = list(diagnostics.get("levels") or [])
-    levels = []
-    for traversal_index, raw_level in enumerate(raw_levels):
-        # CN: tuple 保持执行顺序 coarsest->finest；论文层号固定 finest=0。
-        # EN: Keep tuple traversal coarsest->finest while paper level indices use finest=0.
-        level_index = int(raw_level.get("depth", len(raw_levels) - 1 - traversal_index))
-        kind = str(raw_level.get("kind", "node"))
-        n_source = int(raw_level.get("n_source", 0))
-        n_target = int(raw_level.get("n_target", 0))
-        level_wall_time = float(raw_level.get("time", 0.0) or 0.0)
-        if kind == "leaf":
-            levels.append(
-                LevelResult(
-                    level_index=level_index,
-                    kind="coarsest",
-                    n_source=n_source,
-                    n_target=n_target,
-                    initialization=None,
-                    solve=CoarsestSolveStats(
-                        wall_time=level_wall_time,
-                        objective=float((raw_level.get("solve_summary") or {}).get("distance", float("nan"))),
-                        support_size=int(raw_level.get("support_size", 0)),
-                    ),
-                    wall_time=level_wall_time,
-                )
-            )
-            continue
-        solve_summary = dict(raw_level.get("solve_summary") or {})
-        initialization = dict(solve_summary.get("initialization") or {})
-        components = dict(initialization.get("components") or {})
-        iterations = _iteration_stats(solve_summary.get("objective_trace") or [], config=config)
-        converged = bool(iterations and iterations[-1].convergence.passed)
-        support_before = int(raw_level.get("support_before_solve", 0) or 0)
-        support_after_forward = int(raw_level.get("topk_forward_support_size", support_before) or support_before)
-        reverse_value = raw_level.get("topk_reverse_support_size")
-        levels.append(
-            LevelResult(
-                level_index=level_index,
-                kind="refined",
-                n_source=n_source,
-                n_target=n_target,
-                initialization=InitializationStats(
-                    wall_time=float(
-                        raw_level.get(
-                            "initialization_time",
-                            sum(float(value or 0.0) for value in components.values()),
-                        )
-                    ),
-                    dual_propagation_time=float((raw_level.get("dual_completion_profile") or {}).get("total_time", 0.0) or 0.0),
-                    dual_assignment_time=float((raw_level.get("augment_profile") or {}).get("total_time", 0.0) or 0.0),
-                    northwest_augmentation_time=float(components.get("bfs_skeleton", 0.0) or 0.0),
-                    inherited_dual_side=(
-                        None if raw_level.get("split_axis") == "both" else
-                        "target" if raw_level.get("split_axis") == "source" else "source"
-                    ),
-                    assignment_topk=int(config.assignment_topk),
-                    support_after_forward=support_after_forward,
-                    support_after_reverse=(None if reverse_value is None else int(reverse_value)),
-                    northwest_edges_added=int(initialization.get("northwest_added", 0) or 0),
-                    initial_active_support_size=int(initialization.get("post_pricing_support_size", support_before) or support_before),
-                ),
-                solve=RefinementResult(
-                    iterations=iterations,
-                    summary=RefinementSummary(
-                        wall_time=float(solve_summary.get("time", 0.0) or 0.0),
-                        iterations=len(iterations),
-                        final_objective=float(solve_summary.get("distance", float("nan"))),
-                        final_active_support_size=int(raw_level.get("support_after_solve", 0) or 0),
-                        peak_active_support_size=max((item.support.peak for item in iterations), default=support_before),
-                        stop_reason=raw_level.get("stop_reason", "converged" if converged else "max_refinement_iterations"),
-                        converged=converged,
-                    ),
-                ),
-                wall_time=level_wall_time,
-            )
-        )
+    """
+    CN: 直接投影完成点的强类型记录；独立单层适配器没有 hierarchy records。
+    EN: Project typed completion records directly; standalone adapters have no hierarchy records.
+    """
+    if "hello_diagnostics" in raw and "hierarchy_levels" not in raw:
+        raise TypeError("HELLO hierarchy output requires typed hierarchy_levels")
+    records = tuple(raw.get("hierarchy_levels", ()))
+    if not all(isinstance(level, HierarchyLevelRecord) for level in records):
+        raise TypeError("hierarchy_levels must contain HierarchyLevelRecord values")
     measured = float(raw.get("time", 0.0) or 0.0) if wall_time is None else float(wall_time)
-    return SolveStageResult(levels=tuple(levels), wall_time=measured)
+    return SolveStageResult(levels=tuple(level.result for level in records), wall_time=measured)
 
 
 def _solution(raw: Mapping[str, Any], *, shape: tuple[int, int]) -> SparseOTSolution:
@@ -409,9 +257,7 @@ def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig)
             _synchronize_cuda_for_timing()
         stage_wall_time = float(time.perf_counter() - stage_started)
         cost_stages = tuple(
-            CostStageResult(item["name"], _stage_result(
-                {"hello_diagnostics": {"levels": item["levels"]}}, config=config, wall_time=item["wall_time"]
-            )) for item in raw.get("cost_stages", [])
+            item.to_result() for item in raw.get("cost_stages", [])
         )
         stage = _stage_result(
             raw,
@@ -435,6 +281,14 @@ def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig)
         "assignment_topk": int(config.assignment_topk),
         "feature_precision": "fp64" if config.backend == "torch" else "fp32",
         "score_precision": "fp64" if config.backend == "torch" else "fp32_dimension_fp64_scalar",
+        "cost_precision": str(config.cost_precision),
+        "input_feature_precision": "fp32",
+        "intermediate_cost_precision": level_cost_precision(
+            config.cost_precision, level_index=1
+        ),
+        "finest_cost_precision": level_cost_precision(
+            config.cost_precision, level_index=0
+        ),
         "backend": str(config.backend),
         "device": str(solve_device),
         "coarsest_solver": "pot",
@@ -487,6 +341,18 @@ def solve_problem(problem: Problem, config: _AlgorithmConfig) -> Result:
     """
     if not isinstance(problem, Problem):
         raise TypeError("solve_problem requires Problem")
+    if config.gpu_resident:
+        from .gpu_resident.solver import solve as solve_gpu
+
+        return solve_gpu(problem, config)
+    if any(torch.is_tensor(value) for value in (problem.source_points, problem.target_points, problem.source_mass, problem.target_mass)):
+        def host(value):
+            if torch.is_tensor(value):
+                value = value.detach().cpu()
+                return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+            return value
+        problem = Problem(host(problem.source_points), host(problem.target_points), problem.cost_type,
+                          host(problem.source_mass), host(problem.target_mass))
     return _solve(problem, config)
 
 

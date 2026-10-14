@@ -12,7 +12,13 @@ import hello_ot
 from hello_ot.diagnose import collect_diagnostics
 
 
-def _run_backend(backend: str, cost: str = "l2^2", policy: str = "off", torch_device: str = "cuda") -> dict[str, Any]:
+def _run_backend(
+    backend: str,
+    cost: str = "l2^2",
+    policy: str = "off",
+    torch_device: str = "cuda",
+    cost_precision: str = "fp32",
+) -> dict[str, Any]:
     """
     CN: 在确定性小问题上运行指定 backend，并返回数值与耗时摘要。
     EN: Run one backend on a deterministic small problem and return numerical and timing summaries.
@@ -27,6 +33,7 @@ def _run_backend(backend: str, cost: str = "l2^2", policy: str = "off", torch_de
         cost_perturbation=policy,
         coarsest_size_threshold=64,
         assignment_topk=8,
+        cost_precision=cost_precision,  # type: ignore[arg-type]
     )
     started = time.perf_counter()
     result = hello_ot.solve(source, target, options=options, cost=cost, random_seed=42)
@@ -42,6 +49,7 @@ def _run_backend(backend: str, cost: str = "l2^2", policy: str = "off", torch_de
         "backend": backend,
         "cost": cost,
         "cost_perturbation": policy,
+        "cost_precision": cost_precision,
         "passed": passed,
         "objective": float(result.objective),
         "edges": int(result.solution.values.size),
@@ -55,6 +63,11 @@ def main() -> None:
     parser.add_argument("--backend", choices=("native", "torch", "both"), default="both")
     parser.add_argument("--output", type=Path, default=Path("hello_ot_validation.json"))
     parser.add_argument("--torch-device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument(
+        "--cost-precision",
+        choices=("fp32", "fp64", "finest_fp64"),
+        default="fp32",
+    )
     args = parser.parse_args()
     backends = ("torch", "native") if args.backend == "both" else (args.backend,)
     report = collect_diagnostics()
@@ -63,10 +76,12 @@ def main() -> None:
         for cost in ("l2^2", "l2", "l1", "linf"):
             for policy in ("off", "on", "auto"):
                 try:
-                    item = _run_backend(backend, cost, policy, args.torch_device)
+                    item = _run_backend(
+                        backend, cost, policy, args.torch_device, args.cost_precision
+                    )
                 except Exception as exc:
                     item = dict(backend=backend, cost=cost, cost_perturbation=policy,
-                                passed=False, error=str(exc))
+                                cost_precision=args.cost_precision, passed=False, error=str(exc))
                 report["validation"].append(item)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))

@@ -16,7 +16,7 @@ from hello_ot._internal.trace import _ChromeTraceCollector
 from hello_ot.config import SolverRuntimeConfig
 from hello_ot.state import GPUWarmStartState as OTWarmStartGPUState, WarmStartState as OTWarmStartState
 
-from .kernels.norm_cost_scan import (
+from .costs.metric import (
     _init_metric_warm_start_refinement,
     augment_topk_metric,
     check_metric_dual_feasibility,
@@ -25,7 +25,7 @@ from .kernels.norm_cost_scan import (
     solve_leaf_metric,
 )
 from .kernels.scan_contract import DualFeasibilityCertificate
-from .kernels.bilinear_scan import (
+from .costs.bilinear import (
     augment_topk_lowrank,
     complete_dual_lowrank,
     materialize_lowrank_candidate_union,
@@ -206,6 +206,7 @@ class HelloCostContext:
     cost_type: Literal["lowrank", "l1", "linf", "l2"]
     dot_scale: float = 1.0
     perturbation: Optional[Dict[str, Any]] = None
+    compute_precision: Literal["fp32", "fp64"] = "fp32"
 
     def sliced(self, source_slice: slice, target_slice: slice) -> "HelloCostContext":
         """
@@ -229,6 +230,8 @@ class HelloCostContext:
             raise ValueError("bilinear dot_scale must be exactly 1 or 2")
         if self.score_family == "norm_cost" and float(self.dot_scale) != 1.0:
             raise ValueError("norm costs do not accept dot_scale")
+        if self.compute_precision not in {"fp32", "fp64"}:
+            raise ValueError("compute_precision must be one of: fp32, fp64")
 
 
 def solve_leaf_by_cost(
@@ -251,6 +254,8 @@ def solve_leaf_by_cost(
     tracer: Optional[_ChromeTraceCollector],
 ) -> Tuple[DualAssignmentState, Dict[str, Any]]:
     if cost_context.score_family == "inner_product":
+        leaf_config = replace(config)
+        leaf_config.cost_precision = cost_context.compute_precision
         return solve_leaf_lowrank(
             source_F_full=source_F_full,
             target_G_full=target_G_full,
@@ -262,7 +267,7 @@ def solve_leaf_by_cost(
             source_stop=int(source_stop),
             target_start=int(target_start),
             target_stop=int(target_stop),
-            config=config,
+            config=leaf_config,
             node_trace_args=node_trace_args,
             node_path=str(node_path),
             depth_level=int(depth_level),
@@ -283,6 +288,7 @@ def solve_leaf_by_cost(
             node_trace_args=node_trace_args,
             tracer=tracer,
             perturbation=cost_context.perturbation,
+            compute_precision=cost_context.compute_precision,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -318,6 +324,7 @@ def _directional_assignment_by_cost(
             topk=int(assignment_topk),
             device=str(torch_device),
             perturbation=cost_context.perturbation,
+            compute_precision=cost_context.compute_precision,
         )
     if cost_context.score_family == "inner_product":
         return augment_topk_lowrank(
@@ -331,6 +338,7 @@ def _directional_assignment_by_cost(
             tracer=tracer,
             trace_args=trace_args,
             dot_scale=float(cost_context.dot_scale),
+            compute_precision=cost_context.compute_precision,
         )
     if cost_context.score_family == "norm_cost":
         return augment_topk_metric(
@@ -343,6 +351,7 @@ def _directional_assignment_by_cost(
             tracer=tracer,
             trace_args=trace_args,
             perturbation=cost_context.perturbation,
+            compute_precision=cost_context.compute_precision,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -402,6 +411,7 @@ def scan_deferred_assignment_candidates(
         tracer=tracer,
         trace_args=trace_args,
         dot_scale=float(cost_context.dot_scale),
+        compute_precision=cost_context.compute_precision,
     )
 
 
@@ -466,6 +476,7 @@ def complete_dual(
             trace_args=trace_args,
             trace_prefix=str(trace_prefix),
             dot_scale=float(cost_context.dot_scale),
+            compute_precision=cost_context.compute_precision,
         )
     if cost_context.score_family == "norm_cost":
         return complete_dual_metric(
@@ -479,6 +490,7 @@ def complete_dual(
             trace_args=trace_args,
             trace_prefix=str(trace_prefix),
             perturbation=cost_context.perturbation,
+            compute_precision=cost_context.compute_precision,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -512,6 +524,7 @@ def check_dual_feasibility(
             gpu_id=gpu_id,
             diagnostics=diagnostics,
             dot_scale=float(cost_context.dot_scale),
+            compute_precision=cost_context.compute_precision,
         )
         return (
             DualFeasibilityCertificate(
@@ -539,6 +552,7 @@ def check_dual_feasibility(
             perturbation=cost_context.perturbation,
             source_global_index=None if cost_context.perturbation is None else cost_context.perturbation["source_global_index"],
             target_global_index=None if cost_context.perturbation is None else cost_context.perturbation["target_global_index"],
+            compute_precision=cost_context.compute_precision,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 
@@ -599,6 +613,7 @@ def begin_refinement_by_cost(
             target_mass,
         )
         solve_config = replace(config)
+        solve_config.cost_precision = cost_context.compute_precision
         solve_config.pricing_strategy = "nodewise_full"
         solve_config.convergence_criterion = "dual_feasibility"
         solve_config.require_dual_feasibility_convergence = False
@@ -666,8 +681,10 @@ def begin_refinement_by_cost(
         if str(dual_feasibility_norm) != "l2":
             raise ValueError("L-infinity finest-level stopping is currently supported only for lowrank/l2^2 costs.")
         if bool(skip_initial_pricing):
-            raise ValueError("skip_initial_pricing is only supported by lowrank asymmetric-chain refinement.")
+            raise ValueError("skip_initial_pricing is only supported by lowrank HELLO refinement.")
         del pricing_index_pool
+        solve_config = replace(config)
+        solve_config.cost_precision = cost_context.compute_precision
         initialized = _init_metric_warm_start_refinement(
             source_points=source_F,
             target_points=target_G,
@@ -675,7 +692,7 @@ def begin_refinement_by_cost(
             target_mass=target_mass,
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
             warm_start=warm_start,
-            config=config,
+            config=solve_config,
             dual_feasibility_tol=float(dual_feasibility_tol),
             tracer=tracer,
             trace_prefix=str(trace_prefix),
@@ -773,13 +790,21 @@ def pair_costs_by_cost(
             cols=cols,
             cost_type=cost_context.cost_type,  # type: ignore[arg-type]
             perturbation=cost_context.perturbation,
+            compute_precision=cost_context.compute_precision,
         )
     if cost_context.score_family == "inner_product":
         source = np.asarray(source_F, dtype=np.float32, order="C")
         target = np.asarray(target_G, dtype=np.float32, order="C")
         rr = np.asarray(rows, dtype=np.int64)
         cc = np.asarray(cols, dtype=np.int64)
-        dot = np.einsum("ij,ij->i", source[rr], target[cc], optimize=True)
+        dot_dtype = np.float64 if cost_context.compute_precision == "fp64" else np.float32
+        dot = np.einsum(
+            "ij,ij->i",
+            source[rr].astype(dot_dtype, copy=False),
+            target[cc].astype(dot_dtype, copy=False),
+            dtype=dot_dtype,
+            optimize=True,
+        )
         return np.asarray(
             np.asarray(source_cost_vec, dtype=np.float64)[rr]
             + np.asarray(target_cost_vec, dtype=np.float64)[cc]

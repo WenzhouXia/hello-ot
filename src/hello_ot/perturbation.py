@@ -9,9 +9,48 @@ import torch
 
 from .cost import assign_from_complete_dual, begin_refinement_by_cost
 from .hierarchy.construction import slice_node_arrays
+from .hierarchy.records import HierarchyLevelRecord, HierarchyStageRecord
+from .hierarchy.execution import (
+    DualAssignmentResult,
+    HierarchyExecution,
+    HierarchyLevelFinalizer,
+    InitializedHierarchyLevel,
+)
 from .refinement.iterations import check_optimality, finish_interrupted_iteration, solve_lp, update_support
 from .refinement.reentry import ReentryDetector
 from .state import WarmStartState
+
+
+DUAL_FEASIBILITY_JUMP_THRESHOLD = 10.0
+
+
+def dual_feasibility_jump_diagnostics(
+    before: float,
+    after: float,
+    *,
+    threshold: float = DUAL_FEASIBILITY_JUMP_THRESHOLD,
+) -> dict[str, Any]:
+    """
+    CN: 计算成本切换首轮的对偶可行性跳变，并决定是否从扰动成本的最粗层重启。
+    EN: Measure the first post-switch dual-feasibility jump and decide whether to restart at the perturbed coarsest level.
+    """
+    before = float(before)
+    after = float(after)
+    threshold = float(threshold)
+    if not np.isfinite(before) or before <= 0:
+        raise RuntimeError("pre-switch dual feasibility must be finite and positive")
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise RuntimeError("dual-feasibility jump threshold must be finite and positive")
+    if np.isfinite(after) and after < 0:
+        raise RuntimeError("post-switch dual feasibility must be nonnegative")
+    ratio = after / before if np.isfinite(after) else float("inf")
+    return {
+        "dual_feasibility_before_switch": before,
+        "dual_feasibility_after_switch": after,
+        "dual_feasibility_jump_ratio": ratio,
+        "dual_feasibility_jump_threshold": threshold,
+        "restarted_from_perturbed_coarsest": bool(not np.isfinite(after) or ratio >= threshold),
+    }
 
 
 @dataclass
@@ -26,12 +65,16 @@ class CostPerturbationRun:
     random_seed: int
     source_index: np.ndarray
     target_index: np.ndarray
+    cost_precision: str = "fp32"
     activated: bool = False
     phase: str = "original"
     metadata: dict[str, Any] = field(default_factory=dict)
-    stages: list[dict[str, Any]] = field(default_factory=list)
+    stages: list[HierarchyStageRecord] = field(default_factory=list)
     original: Any = None
     stage_started: float = field(default_factory=time.perf_counter)
+    jump_probe_pending: bool = False
+    _dual_feasibility_before_switch: float | None = field(default=None, repr=False)
+    _switch_level: int | None = field(default=None, repr=False)
 
     def new_detector(self) -> ReentryDetector | None:
         """
@@ -40,13 +83,13 @@ class CostPerturbationRun:
         """
         return ReentryDetector() if self.policy == "auto" and not self.activated else None
 
-    def record_stage(self, levels: list[dict]) -> None:
+    def record_stage(self, levels: list[HierarchyLevelRecord]) -> None:
         """
         CN: 保存完整阶段记录，阶段间不保留稀疏解的大数组。
         EN: Save complete stage records without retaining sparse solution arrays between stages.
         """
         now = time.perf_counter()
-        self.stages.append({"name": self.phase, "levels": list(levels), "wall_time": now - self.stage_started})
+        self.stages.append(HierarchyStageRecord(self.phase, tuple(levels), now - self.stage_started))
         self.stage_started = now
         levels.clear()
 
@@ -65,22 +108,26 @@ class CostPerturbationRun:
         rows = np.argsort(self.source_index)[rng.integers(n, size=65536)]
         cols = np.argsort(self.target_index)[rng.integers(m, size=65536)]
         sampled = np.empty(65536, dtype=np.float64)
+        sample_dtype = np.float64 if self.cost_precision in {"fp64", "finest_fp64"} else np.float32
         bilinear = execution.cost_context.score_family == "inner_product"
         for start in range(0, 65536, 1024):
             rr, cc = rows[start:start + 1024], cols[start:start + 1024]
-            source, target = execution.source_F[rr], execution.target_G[cc]
+            source = execution.source_F[rr].astype(sample_dtype, copy=False)
+            target = execution.target_G[cc].astype(sample_dtype, copy=False)
             if bilinear:
                 sampled[start:start + 1024] = (
                     execution.source_cost[rr] + execution.target_cost[cc]
-                    - execution.cost_context.dot_scale * np.einsum("ij,ij->i", source, target)
+                    - execution.cost_context.dot_scale * np.einsum(
+                        "ij,ij->i", source, target, dtype=sample_dtype
+                    )
                 )
             else:
                 difference = np.abs(source - target)
                 cost = execution.cost_context.cost_type
                 sampled[start:start + 1024] = (
-                    difference.sum(axis=1) if cost == "l1" else
+                    difference.sum(axis=1, dtype=sample_dtype) if cost == "l1" else
                     difference.max(axis=1) if cost == "linf" else
-                    np.sqrt((difference * difference).sum(axis=1))
+                    np.sqrt((difference * difference).sum(axis=1, dtype=sample_dtype))
                 )
         mean = float(sampled.mean())
         sigma = self.relative_scale * mean
@@ -115,14 +162,57 @@ class CostPerturbationRun:
         self.activated = True
         self.phase = "perturbed"
 
+    def arm_jump_probe(self, dual_feasibility: float, *, level: int) -> None:
+        """
+        CN: 保存原成本触发轮证书，等待扰动成本首轮作同层比较。
+        EN: Save the triggering original-cost certificate for a same-level first perturbed-iteration comparison.
+        """
+        value = float(dual_feasibility)
+        if not np.isfinite(value) or value <= 0:
+            raise RuntimeError("pre-switch dual feasibility must be finite and positive")
+        self._dual_feasibility_before_switch = value
+        self._switch_level = int(level)
+        self.jump_probe_pending = True
+        self.metadata.update(
+            dual_feasibility_before_switch=value,
+            dual_feasibility_after_switch=None,
+            dual_feasibility_jump_ratio=None,
+            dual_feasibility_jump_threshold=DUAL_FEASIBILITY_JUMP_THRESHOLD,
+            restarted_from_perturbed_coarsest=False,
+            restart_trigger_level=None,
+        )
 
-def initialize_from_dual(node: Any, dual: Any, execution: Any, *, proposal: Any = None) -> Any:
+    def evaluate_jump_probe(self, dual_feasibility: float) -> bool:
+        """
+        CN: 完成一次性跳变探测，并返回是否需要丢弃当前层状态后从最粗层重启。
+        EN: Complete the one-shot jump probe and return whether to discard the current-level state and restart from coarsest.
+        """
+        if not self.jump_probe_pending or self._dual_feasibility_before_switch is None:
+            raise RuntimeError("no cost-switch dual-feasibility probe is pending")
+        diagnostics = dual_feasibility_jump_diagnostics(
+            self._dual_feasibility_before_switch,
+            dual_feasibility,
+        )
+        restarted = bool(diagnostics["restarted_from_perturbed_coarsest"])
+        diagnostics["restart_trigger_level"] = self._switch_level if restarted else None
+        self.metadata.update(diagnostics)
+        self.jump_probe_pending = False
+        self._dual_feasibility_before_switch = None
+        self._switch_level = None
+        return restarted
+
+
+def initialize_from_dual(
+    node: Any,
+    dual: Any,
+    execution: HierarchyExecution,
+    *,
+    proposal: Any = None,
+) -> InitializedHierarchyLevel:
     """
     CN: 只继承双侧对偶势，以候选成本重建支撑，再按求解成本初始化 LP。
     EN: Inherit only both dual potentials, rebuild support with proposal costs, then initialize the LP with solve costs.
     """
-    from .algorithm import _DualAssignmentResult, _InitializedHierarchyLevel
-
     started = time.perf_counter()
     dual_np = dual.detach().cpu().numpy() if torch.is_tensor(dual) else np.asarray(dual)
     if dual_np.size != node.n_source + node.n_target or not np.isfinite(dual_np).all():
@@ -152,7 +242,7 @@ def initialize_from_dual(node: Any, dual: Any, execution: Any, *, proposal: Any 
         counts.append(int(state.rows.numel()) if torch.is_tensor(state.rows) else len(state.rows))
         profiles.append(profile)
         stats.append(stat)
-    assignment = _DualAssignmentResult(
+    assignment = DualAssignmentResult(
         state=state, topk_stats=stats[-1],
         augment_profile={"total_time": sum(p.get("total_time", 0.0) for p in profiles),
                          "forward": profiles[0], "reverse": profiles[1]},
@@ -174,7 +264,7 @@ def initialize_from_dual(node: Any, dual: Any, execution: Any, *, proposal: Any 
         pricing_index_pool=execution.pricing_index_pool, warm_start_profile_depth=node.depth,
     )
     initialization_elapsed = float(time.perf_counter() - started)
-    return _InitializedHierarchyLevel(
+    return InitializedHierarchyLevel(
         node=node, arrays=arrays, state=state, split_axis="both", trace_args={},
         started_at=started, initialization_elapsed=initialization_elapsed,
         support_before_solve=counts[-1], stitch_profile={},
@@ -182,24 +272,34 @@ def initialize_from_dual(node: Any, dual: Any, execution: Any, *, proposal: Any 
     )
 
 
-def switch_level_to_perturbed_cost(initialized: Any, iteration: Any, certificate: Any,
-                                  execution: Any, levels: list[dict], detector: ReentryDetector) -> Any:
+def switch_level_to_perturbed_cost(
+    initialized: InitializedHierarchyLevel,
+    iteration: Any,
+    certificate: Any,
+    execution: HierarchyExecution,
+    levels: list[HierarchyLevelRecord],
+    detector: ReentryDetector,
+    *,
+    finalize_level: HierarchyLevelFinalizer,
+) -> InitializedHierarchyLevel:
     """
     CN: 完成触发轮记录并切换当前层；不在辅助函数内隐藏 refinement 循环。
     EN: Complete trigger-round records and switch this level without hiding a refinement loop.
     """
-    from .algorithm import _finalize_hierarchy_level
-
     dual = iteration.dual
     finish_interrupted_iteration(initialized.refinement.runtime, iteration, certificate)
     from .progress import report_iteration, report_level_start, report_perturbation_activated
 
     report_iteration(execution, initialized.refinement.runtime)
-    _finalize_hierarchy_level(initialized, levels=levels, execution=execution)
+    finalize_level(initialized, levels=levels, execution=execution)
     run = execution.perturbation
-    levels[-1]["stop_reason"] = "cost_perturbation_requested"
+    levels[-1] = levels[-1].with_stop_reason("cost_perturbation_requested")
     run.metadata.update(trigger_level=initialized.node.depth, trigger_iteration=iteration.index + 1,
                         reentry_count=detector.reentry_count)
+    run.arm_jump_probe(
+        certificate.stopping_dual_feasibility,
+        level=initialized.node.depth,
+    )
     run.record_stage(levels)
     run.activate(execution)
     report_perturbation_activated(execution)
@@ -211,13 +311,18 @@ def switch_level_to_perturbed_cost(initialized: Any, iteration: Any, certificate
     return restarted
 
 
-def finish_original_problem(root: Any, state: Any, execution: Any, levels: list[dict]) -> tuple[Any, Any]:
+def finish_original_problem(
+    root: Any,
+    state: Any,
+    execution: HierarchyExecution,
+    levels: list[HierarchyLevelRecord],
+    *,
+    finalize_level: HierarchyLevelFinalizer,
+) -> tuple[Any, Any]:
     """
     CN: 以扰动成本构建候选支撑，在全尺寸原问题上完成最后 refinement。
     EN: Propose support with perturbed costs and finish refinement on the full original problem.
     """
-    from .algorithm import _finalize_hierarchy_level
-
     run = execution.perturbation
     run.record_stage(levels)
     from .progress import (
@@ -249,4 +354,4 @@ def finish_original_problem(root: Any, state: Any, execution: Any, levels: list[
             break
         update_support(refinement.runtime, iteration, certificate)
         report_iteration(execution, refinement.runtime)
-    return _finalize_hierarchy_level(initialized, levels=levels, execution=execution)
+    return finalize_level(initialized, levels=levels, execution=execution)

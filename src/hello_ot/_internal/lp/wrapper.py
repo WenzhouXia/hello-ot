@@ -7,35 +7,48 @@ from typing import Dict
 
 @dataclass
 class SolverResult:
-    """统一的求解结果对象"""
+    """
+    CN: 统一的 restricted-LP 求解结果。
+    EN: Unified restricted-LP solver result.
+    """
     success: bool
-    x: np.ndarray = None        # Primal solution (transport plan) values
-    y: np.ndarray = None        # Dual solution (potentials)
+    # CN: primal transport plan 变量。
+    # EN: Primal transport-plan variables.
+    x: np.ndarray = None
+    # CN: 对偶势。
+    # EN: Dual potentials.
+    y: np.ndarray = None
     obj_val: float = 0.0
     dual_obj_val: float = None
     duration: float = 0.0
     iterations: int = 0
-    peak_mem: float = 0.0       # Memory usage in MB
+    # CN: 以 MiB 计的峰值内存。
+    # EN: Peak memory in MiB.
+    peak_mem: float = 0.0
     termination_reason: str = None
-    # 新增：收敛指标 (HALO 风格)
-    primal_feas: float = None   # Primal feasibility (infeasibility)
-    dual_feas: float = None     # Dual feasibility
-    gap: float = None           # Duality gap
-    solver_diag: Dict = None    # Backend wrapper timing/details
+    # CN: 求解器收敛指标。
+    # EN: Solver convergence metrics.
+    primal_feas: float = None
+    dual_feas: float = None
+    gap: float = None
+    # CN: backend wrapper 的计时与诊断信息。
+    # EN: Backend-wrapper timing and diagnostics.
+    solver_diag: Dict = None
 
 
 class LPSolver(ABC):
     """
-    LP 求解器的抽象基类。
+    CN: restricted-LP 求解器的抽象基类。
+    EN: Abstract base class for restricted-LP solvers.
     """
     @abstractmethod
     def solve(
         self,
-        c: np.ndarray,            # Cost vector
-        A_csc: sparse.csc_matrix,  # Constraint matrix
-        b_eq: np.ndarray,         # RHS (marginals)
-        lb: np.ndarray,           # Lower bounds
-        ub: np.ndarray,           # Upper bounds
+        c: np.ndarray,
+        A_csc: sparse.csc_matrix,
+        b_eq: np.ndarray,
+        lb: np.ndarray,
+        ub: np.ndarray,
         n_eqs: int,
         warm_start_primal=None,
         warm_start_dual=None,

@@ -85,9 +85,9 @@ __device__ __forceinline__ void insert_topk(ValueT (&vals)[K], IndexT (&idxs)[K]
     idxs[pos] = idx;
 }
 
-template <int K, int THREADS>
+template <typename DotT, int K, int THREADS>
 __global__ void update_topk_stats_raw_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -125,7 +125,7 @@ __global__ void update_topk_stats_raw_kernel(
     const double qb = query_bias[q_offset + row];
 
     for (int64_t col = threadIdx.x; col < db_count; col += blockDim.x) {
-        float dot = dots[row * dot_ld + col];
+        DotT dot = dots[row * dot_ld + col];
         double rc = static_cast<double>(dot) + qb + db_bias[db_offset + col];
         insert_topk<K>(local_vals, local_idxs, rc, static_cast<int>(db_offset + col));
         if (compute_stats) {
@@ -250,8 +250,9 @@ __device__ __forceinline__ void merge_initialization_thread_queue(
     __syncwarp();
 }
 
+template <typename DotT>
 __global__ void update_initialization_topk16_warp_queue_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -334,9 +335,9 @@ __global__ void update_initialization_topk16_warp_queue_kernel(
     }
 }
 
-template <int K, int COLS>
+template <typename DotT, int K, int COLS>
 __global__ void update_col_partial_topk_raw_grouped_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -364,7 +365,7 @@ __global__ void update_col_partial_topk_raw_grouped_kernel(
     if (col < db_count) {
         const double dbb = db_bias[db_offset + col];
         for (int64_t row = row_lane; row < q_count; row += kColGroupRows) {
-            float dot = dots[row * dot_ld + col];
+            DotT dot = dots[row * dot_ld + col];
             double rc = static_cast<double>(dot) + query_bias[q_offset + row] + dbb;
             insert_topk<K>(local_vals, local_idxs, rc, static_cast<int>(q_offset + row));
         }
@@ -398,8 +399,9 @@ __global__ void update_col_partial_topk_raw_grouped_kernel(
 }
 
 
+template <typename DotT>
 __global__ void col_partial_load_only_raw_grouped_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -422,7 +424,7 @@ __global__ void col_partial_load_only_raw_grouped_kernel(
     if (col < db_count) {
         const double dbb = db_bias[db_offset + col];
         for (int64_t row = row_lane; row < q_count; row += kColGroupRows) {
-            float dot = dots[row * dot_ld + col];
+            DotT dot = dots[row * dot_ld + col];
             local_sum += static_cast<double>(dot) + query_bias[q_offset + row] + dbb;
         }
     }
@@ -435,9 +437,9 @@ __global__ void col_partial_load_only_raw_grouped_kernel(
     }
 }
 
-template <int K, int COLS>
+template <typename DotT, int K, int COLS>
 __global__ void col_partial_topk_no_partial_write_raw_grouped_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -465,7 +467,7 @@ __global__ void col_partial_topk_no_partial_write_raw_grouped_kernel(
     if (col < db_count) {
         const double dbb = db_bias[db_offset + col];
         for (int64_t row = row_lane; row < q_count; row += kColGroupRows) {
-            float dot = dots[row * dot_ld + col];
+            DotT dot = dots[row * dot_ld + col];
             double rc = static_cast<double>(dot) + query_bias[q_offset + row] + dbb;
             insert_topk<K>(local_vals, local_idxs, rc, static_cast<int>(q_offset + row));
         }
@@ -531,8 +533,9 @@ __device__ __forceinline__ void merge_top2_arrays(
     }
 }
 
+template <typename DotT>
 __global__ void update_col_partial_topk2_raw_warp_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -559,7 +562,7 @@ __global__ void update_col_partial_topk2_raw_warp_kernel(
     if (col < db_count) {
         const double dbb = db_bias[db_offset + col];
         for (int64_t row = lane_in_col; row < q_count; row += kLanesPerCol) {
-            float dot = dots[row * dot_ld + col];
+            DotT dot = dots[row * dot_ld + col];
             double rc = static_cast<double>(dot) + query_bias[q_offset + row] + dbb;
             insert_topk<2>(local_vals, local_idxs, rc, static_cast<int>(q_offset + row));
         }
@@ -602,8 +605,9 @@ __device__ __forceinline__ void merge_top4_arrays(
     }
 }
 
+template <typename DotT>
 __global__ void update_col_partial_topk4_raw_warp_kernel(
-        const float* __restrict__ dots,
+        const DotT* __restrict__ dots,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -630,7 +634,7 @@ __global__ void update_col_partial_topk4_raw_warp_kernel(
     if (col < db_count) {
         const double dbb = db_bias[db_offset + col];
         for (int64_t row = lane_in_col; row < q_count; row += kLanesPerCol) {
-            float dot = dots[row * dot_ld + col];
+            DotT dot = dots[row * dot_ld + col];
             double rc = static_cast<double>(dot) + query_bias[q_offset + row] + dbb;
             insert_topk<4>(local_vals, local_idxs, rc, static_cast<int>(q_offset + row));
         }
@@ -729,6 +733,79 @@ void check_cublas(cublasStatus_t status, const char* what) {
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cuBLAS status ", static_cast<int>(status));
 }
 
+template <typename DotT>
+void gemm_dot_tile(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const DotT* db_ptr,
+        const DotT* query_ptr,
+        DotT* dot_ptr);
+
+template <>
+void gemm_dot_tile<float>(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const float* db_ptr,
+        const float* query_ptr,
+        float* dot_ptr) {
+    const float alpha = static_cast<float>(dot_scale);
+    const float beta = 0.0f;
+    check_cublas(
+            cublasSgemm(
+                    handle,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    static_cast<int>(cur_db),
+                    static_cast<int>(cur_q),
+                    static_cast<int>(dim),
+                    &alpha,
+                    db_ptr,
+                    static_cast<int>(dim),
+                    query_ptr,
+                    static_cast<int>(dim),
+                    &beta,
+                    dot_ptr,
+                    static_cast<int>(cur_db)),
+            "cublasSgemm");
+}
+
+template <>
+void gemm_dot_tile<double>(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const double* db_ptr,
+        const double* query_ptr,
+        double* dot_ptr) {
+    const double alpha = dot_scale;
+    const double beta = 0.0;
+    check_cublas(
+            cublasDgemm(
+                    handle,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    static_cast<int>(cur_db),
+                    static_cast<int>(cur_q),
+                    static_cast<int>(dim),
+                    &alpha,
+                    db_ptr,
+                    static_cast<int>(dim),
+                    query_ptr,
+                    static_cast<int>(dim),
+                    &beta,
+                    dot_ptr,
+                    static_cast<int>(cur_db)),
+            "cublasDgemm");
+}
+
 int reduce_threads_from_tile(int64_t col_reduce_tile) {
     int threads = 1;
     while (threads < kThreads && static_cast<int64_t>(threads * 2) <= col_reduce_tile) {
@@ -737,9 +814,9 @@ int reduce_threads_from_tile(int64_t col_reduce_tile) {
     return std::min<int>(threads, kTopkThreads);
 }
 
-template <int K>
+template <typename DotT, int K>
 void launch_update_topk_stats_raw(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -758,7 +835,7 @@ void launch_update_topk_stats_raw(
     constexpr int threads = K == 32 ? kTopkThreadsK32 : kTopkThreads;
     const size_t dynamic_shared_bytes =
             collect_linf_stats ? static_cast<size_t>(threads) * sizeof(double) : 0;
-    update_topk_stats_raw_kernel<K, threads><<<
+    update_topk_stats_raw_kernel<DotT, K, threads><<<
             static_cast<unsigned int>(q_count), threads, dynamic_shared_bytes, stream>>>(
             dot_ptr,
             dot_ld,
@@ -777,9 +854,10 @@ void launch_update_topk_stats_raw(
             collect_linf_stats);
 }
 
+template <typename DotT>
 void launch_update_topk_stats_raw_for_k(
         int64_t k,
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -796,27 +874,27 @@ void launch_update_topk_stats_raw_for_k(
         bool collect_linf_stats,
         cudaStream_t stream) {
     if (k == 1) {
-        launch_update_topk_stats_raw<1>(
+        launch_update_topk_stats_raw<DotT, 1>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else if (k == 2) {
-        launch_update_topk_stats_raw<2>(
+        launch_update_topk_stats_raw<DotT, 2>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else if (k == 4) {
-        launch_update_topk_stats_raw<4>(
+        launch_update_topk_stats_raw<DotT, 4>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else if (k == 8) {
-        launch_update_topk_stats_raw<8>(
+        launch_update_topk_stats_raw<DotT, 8>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else if (k == 16) {
-        launch_update_topk_stats_raw<16>(
+        launch_update_topk_stats_raw<DotT, 16>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else if (k == 32) {
-        launch_update_topk_stats_raw<32>(
+        launch_update_topk_stats_raw<DotT, 32>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, query_cost, db_cost, query_bias, db_bias,
                 out_val, out_idx, stats, compute_stats, collect_linf_stats, stream);
     } else {
@@ -824,9 +902,10 @@ void launch_update_topk_stats_raw_for_k(
     }
 }
 
+template <typename DotT>
 void launch_initialization_topk_raw_for_k(
         int64_t k,
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -843,7 +922,7 @@ void launch_initialization_topk_raw_for_k(
     if (k == 16 && db_count <= kInitializationTopk16DbTile) {
         const unsigned int blocks = static_cast<unsigned int>(
                 (q_count + kInitializationTopk16Warps - 1) / kInitializationTopk16Warps);
-        update_initialization_topk16_warp_queue_kernel<<<blocks, kInitializationTopk16Threads, 0, stream>>>(
+        update_initialization_topk16_warp_queue_kernel<DotT><<<blocks, kInitializationTopk16Threads, 0, stream>>>(
                 dot_ptr,
                 dot_ld,
                 q_offset,
@@ -878,9 +957,9 @@ void launch_initialization_topk_raw_for_k(
             stream);
 }
 
-template <int K>
+template <typename DotT, int K>
 void launch_update_col_partial_topk_raw(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -896,7 +975,7 @@ void launch_update_col_partial_topk_raw(
     constexpr int cols = K == 32 ? 64 : kColGroupCols;
     dim3 col_grid(static_cast<unsigned int>((db_count + cols - 1) / cols));
     dim3 col_block(cols, kColGroupRows);
-    update_col_partial_topk_raw_grouped_kernel<K, cols><<<col_grid, col_block, 0, stream>>>(
+    update_col_partial_topk_raw_grouped_kernel<DotT, K, cols><<<col_grid, col_block, 0, stream>>>(
             dot_ptr,
             dot_ld,
             q_offset,
@@ -913,8 +992,9 @@ void launch_update_col_partial_topk_raw(
 
 
 
+template <typename DotT>
 void launch_update_col_partial_topk2_raw_warp(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -932,7 +1012,7 @@ void launch_update_col_partial_topk2_raw_warp(
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
     constexpr int kColsPerBlock = kColsPerWarp * kWarpsPerBlock;
     dim3 grid(static_cast<unsigned int>((db_count + kColsPerBlock - 1) / kColsPerBlock));
-    update_col_partial_topk2_raw_warp_kernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+    update_col_partial_topk2_raw_warp_kernel<DotT><<<grid, kThreadsPerBlock, 0, stream>>>(
             dot_ptr,
             dot_ld,
             q_offset,
@@ -947,8 +1027,9 @@ void launch_update_col_partial_topk2_raw_warp(
             partial_idx);
 }
 
+template <typename DotT>
 void launch_update_col_partial_topk4_raw_warp(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -966,7 +1047,7 @@ void launch_update_col_partial_topk4_raw_warp(
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
     constexpr int kColsPerBlock = kColsPerWarp * kWarpsPerBlock;
     dim3 grid(static_cast<unsigned int>((db_count + kColsPerBlock - 1) / kColsPerBlock));
-    update_col_partial_topk4_raw_warp_kernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+    update_col_partial_topk4_raw_warp_kernel<DotT><<<grid, kThreadsPerBlock, 0, stream>>>(
             dot_ptr,
             dot_ld,
             q_offset,
@@ -981,9 +1062,10 @@ void launch_update_col_partial_topk4_raw_warp(
             partial_idx);
 }
 
+template <typename DotT>
 void launch_update_col_partial_topk_raw_for_k(
         int64_t k,
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -997,27 +1079,27 @@ void launch_update_col_partial_topk_raw_for_k(
         int32_t* partial_idx,
         cudaStream_t stream) {
     if (k == 1) {
-        launch_update_col_partial_topk_raw<1>(
+        launch_update_col_partial_topk_raw<DotT, 1>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else if (k == 2) {
-        launch_update_col_partial_topk_raw<2>(
+        launch_update_col_partial_topk_raw<DotT, 2>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else if (k == 4) {
-        launch_update_col_partial_topk_raw<4>(
+        launch_update_col_partial_topk_raw<DotT, 4>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else if (k == 8) {
-        launch_update_col_partial_topk_raw<8>(
+        launch_update_col_partial_topk_raw<DotT, 8>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else if (k == 16) {
-        launch_update_col_partial_topk_raw<16>(
+        launch_update_col_partial_topk_raw<DotT, 16>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else if (k == 32) {
-        launch_update_col_partial_topk_raw<32>(
+        launch_update_col_partial_topk_raw<DotT, 32>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 partial_val, partial_idx, stream);
     } else {
@@ -1026,8 +1108,9 @@ void launch_update_col_partial_topk_raw_for_k(
 }
 
 
+template <typename DotT>
 void launch_col_partial_load_only_raw(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -1041,13 +1124,13 @@ void launch_col_partial_load_only_raw(
         cudaStream_t stream) {
     dim3 col_grid(static_cast<unsigned int>((db_count + kColGroupCols - 1) / kColGroupCols));
     dim3 col_block(kColGroupCols, kColGroupRows);
-    col_partial_load_only_raw_grouped_kernel<<<col_grid, col_block, 0, stream>>>(
+    col_partial_load_only_raw_grouped_kernel<DotT><<<col_grid, col_block, 0, stream>>>(
             dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias, sink);
 }
 
-template <int K>
+template <typename DotT, int K>
 void launch_col_partial_topk_no_partial_write_raw(
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -1063,7 +1146,7 @@ void launch_col_partial_topk_no_partial_write_raw(
     constexpr int cols = K == 32 ? 64 : kColGroupCols;
     dim3 col_grid(static_cast<unsigned int>((db_count + cols - 1) / cols));
     dim3 col_block(cols, kColGroupRows);
-    col_partial_topk_no_partial_write_raw_grouped_kernel<K, cols><<<col_grid, col_block, 0, stream>>>(
+    col_partial_topk_no_partial_write_raw_grouped_kernel<DotT, K, cols><<<col_grid, col_block, 0, stream>>>(
             dot_ptr,
             dot_ld,
             q_offset,
@@ -1078,9 +1161,10 @@ void launch_col_partial_topk_no_partial_write_raw(
             sink_idx);
 }
 
+template <typename DotT>
 void launch_col_partial_topk_no_partial_write_raw_for_k(
         int64_t k,
-        const float* dot_ptr,
+        const DotT* dot_ptr,
         int64_t dot_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -1094,27 +1178,27 @@ void launch_col_partial_topk_no_partial_write_raw_for_k(
         int32_t* sink_idx,
         cudaStream_t stream) {
     if (k == 1) {
-        launch_col_partial_topk_no_partial_write_raw<1>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 1>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else if (k == 2) {
-        launch_col_partial_topk_no_partial_write_raw<2>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 2>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else if (k == 4) {
-        launch_col_partial_topk_no_partial_write_raw<4>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 4>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else if (k == 8) {
-        launch_col_partial_topk_no_partial_write_raw<8>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 8>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else if (k == 16) {
-        launch_col_partial_topk_no_partial_write_raw<16>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 16>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else if (k == 32) {
-        launch_col_partial_topk_no_partial_write_raw<32>(
+        launch_col_partial_topk_no_partial_write_raw<DotT, 32>(
                 dot_ptr, dot_ld, q_offset, db_offset, q_count, db_count, n_db, q_tile_id, query_bias, db_bias,
                 sink_val, sink_idx, stream);
     } else {
@@ -1234,7 +1318,8 @@ void record_stop_accumulate(
 
 } // namespace
 
-std::vector<torch::Tensor> directional_topk_raw_cuda_impl(
+template <typename DotT>
+std::vector<torch::Tensor> directional_topk_raw_cuda_impl_t(
         torch::Tensor query_feat,
         torch::Tensor db_feat,
         torch::Tensor query_bias,
@@ -1262,14 +1347,13 @@ std::vector<torch::Tensor> directional_topk_raw_cuda_impl(
             ? std::min<int64_t>(db_tile, kInitializationTopk16DbTile)
             : db_tile;
     const int64_t d_tile = std::min<int64_t>(requested_d_tile, n_db);
-    auto float_opts = query_feat.options().dtype(torch::kFloat32);
     auto double_opts = query_feat.options().dtype(torch::kFloat64);
     auto int_opts = query_feat.options().dtype(torch::kInt32);
 
     torch::Tensor values = torch::full(
             {n_query, k}, -std::numeric_limits<double>::infinity(), double_opts);
     torch::Tensor indices = torch::full({n_query, k}, -1, int_opts);
-    torch::Tensor dots = torch::empty({q_tile, d_tile}, float_opts);
+    torch::Tensor dots = torch::empty({q_tile, d_tile}, query_feat.options());
     torch::Tensor query_cost;
     torch::Tensor db_cost;
     torch::Tensor stats;
@@ -1282,32 +1366,14 @@ std::vector<torch::Tensor> directional_topk_raw_cuda_impl(
         db_cost = torch::zeros({n_db}, double_opts);
         stats = torch::zeros({4}, double_opts);
     }
-    const float alpha = static_cast<float>(dot_scale);
-    const float beta = 0.0f;
     for (int64_t q0 = 0; q0 < n_query; q0 += q_tile) {
         const int64_t cur_q = std::min<int64_t>(q_tile, n_query - q0);
-        const float* q_ptr = query_feat.data_ptr<float>() + q0 * dim;
+        const DotT* q_ptr = query_feat.data_ptr<DotT>() + q0 * dim;
         for (int64_t d0 = 0; d0 < n_db; d0 += d_tile) {
             const int64_t cur_db = std::min<int64_t>(d_tile, n_db - d0);
-            const float* db_ptr = db_feat.data_ptr<float>() + d0 * dim;
-            float* dot_ptr = dots.data_ptr<float>();
-            check_cublas(
-                    cublasSgemm(
-                            handle,
-                            CUBLAS_OP_T,
-                            CUBLAS_OP_N,
-                            static_cast<int>(cur_db),
-                            static_cast<int>(cur_q),
-                            static_cast<int>(dim),
-                            &alpha,
-                            db_ptr,
-                            static_cast<int>(dim),
-                            q_ptr,
-                            static_cast<int>(dim),
-                            &beta,
-                            dot_ptr,
-                            static_cast<int>(cur_db)),
-                    "cublasSgemm");
+            const DotT* db_ptr = db_feat.data_ptr<DotT>() + d0 * dim;
+            DotT* dot_ptr = dots.data_ptr<DotT>();
+            gemm_dot_tile<DotT>(handle, cur_db, cur_q, dim, dot_scale, db_ptr, q_ptr, dot_ptr);
             if (initialization_select) {
                 launch_initialization_topk_raw_for_k(
                         k,
@@ -1352,6 +1418,24 @@ std::vector<torch::Tensor> directional_topk_raw_cuda_impl(
     return {values, indices};
 }
 
+std::vector<torch::Tensor> directional_topk_raw_cuda_impl(
+        torch::Tensor query_feat,
+        torch::Tensor db_feat,
+        torch::Tensor query_bias,
+        torch::Tensor db_bias,
+        int64_t query_tile,
+        int64_t db_tile,
+        int64_t k,
+        double dot_scale,
+        bool initialization_select) {
+    if (query_feat.scalar_type() == torch::kFloat32) {
+        return directional_topk_raw_cuda_impl_t<float>(
+                query_feat, db_feat, query_bias, db_bias, query_tile, db_tile, k, dot_scale, initialization_select);
+    }
+    return directional_topk_raw_cuda_impl_t<double>(
+            query_feat, db_feat, query_bias, db_bias, query_tile, db_tile, k, dot_scale, initialization_select);
+}
+
 std::vector<torch::Tensor> fused_directional_topk_raw_cuda(
         torch::Tensor query_feat,
         torch::Tensor db_feat,
@@ -1378,7 +1462,8 @@ std::vector<torch::Tensor> initialization_directional_topk_raw_cuda(
             query_feat, db_feat, query_bias, db_bias, query_tile, db_tile, k, dot_scale, true);
 }
 
-std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
+template <typename DotT>
+std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda_t(
         torch::Tensor query_feat,
         torch::Tensor db_feat,
         torch::Tensor query_cost,
@@ -1410,7 +1495,6 @@ std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
     const int64_t n_q_tiles = (n_query + q_tile - 1) / q_tile;
     const int reduce_threads = reduce_threads_from_tile(col_reduce_tile);
 
-    auto float_opts = query_feat.options().dtype(torch::kFloat32);
     auto int_opts = query_feat.options().dtype(torch::kInt32);
     auto double_opts = query_feat.options().dtype(torch::kFloat64);
 
@@ -1421,7 +1505,7 @@ std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
     s2t_val.fill_(-std::numeric_limits<double>::infinity());
     s2t_idx.fill_(-1);
 
-    torch::Tensor dots = torch::empty({q_tile, d_tile}, float_opts);
+    torch::Tensor dots = torch::empty({q_tile, d_tile}, query_feat.options());
     torch::Tensor partial_t2s_val = torch::empty({n_q_tiles, n_db, k}, double_opts);
     torch::Tensor partial_t2s_idx = torch::empty({n_q_tiles, n_db, k}, int_opts);
     torch::Tensor stats = torch::empty({4}, double_opts);
@@ -1436,37 +1520,19 @@ std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
         C10_CUDA_CHECK(cudaEventCreate(&stop_event));
     }
 
-    const float alpha = static_cast<float>(dot_scale);
-    const float beta = 0.0f;
     int64_t q_tile_id = 0;
     for (int64_t q0 = 0; q0 < n_query; q0 += q_tile, ++q_tile_id) {
         int64_t cur_q = std::min<int64_t>(q_tile, n_query - q0);
-        const float* q_ptr = query_feat.data_ptr<float>() + q0 * dim;
+        const DotT* q_ptr = query_feat.data_ptr<DotT>() + q0 * dim;
         for (int64_t d0 = 0; d0 < n_db; d0 += d_tile) {
             int64_t cur_db = std::min<int64_t>(d_tile, n_db - d0);
-            const float* db_ptr = db_feat.data_ptr<float>() + d0 * dim;
-            float* dot_ptr = dots.data_ptr<float>();
+            const DotT* db_ptr = db_feat.data_ptr<DotT>() + d0 * dim;
+            DotT* dot_ptr = dots.data_ptr<DotT>();
 
             // CN: row-major dot(q, db) 被当成 column-major dot^T(db, q) 写入。
             // EN: Row-major dot(q, db) is written as column-major dot^T(db, q).
             record_start(start_event, stream.stream(), collect_timing);
-            check_cublas(
-                    cublasSgemm(
-                            handle,
-                            CUBLAS_OP_T,
-                            CUBLAS_OP_N,
-                            static_cast<int>(cur_db),
-                            static_cast<int>(cur_q),
-                            static_cast<int>(dim),
-                            &alpha,
-                            db_ptr,
-                            static_cast<int>(dim),
-                            q_ptr,
-                            static_cast<int>(dim),
-                            &beta,
-                            dot_ptr,
-                            static_cast<int>(cur_db)),
-                    "cublasSgemm");
+            gemm_dot_tile<DotT>(handle, cur_db, cur_q, dim, dot_scale, db_ptr, q_ptr, dot_ptr);
             record_stop_accumulate(start_event, stop_event, stream.stream(), collect_timing, phase_ms[0]);
 
             record_start(start_event, stream.stream(), collect_timing);
@@ -1571,6 +1637,34 @@ std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
 
     check_cublas(cublasSetMathMode(handle, previous_math_mode), "cublasSetMathMode restore");
     return {s2t_val, s2t_idx, t2s_val, t2s_idx, stats, phase_tensor};
+}
+
+std::vector<torch::Tensor> fused_bidir_topk_stats_raw_cuda(
+        torch::Tensor query_feat,
+        torch::Tensor db_feat,
+        torch::Tensor query_cost,
+        torch::Tensor db_cost,
+        torch::Tensor query_bias,
+        torch::Tensor db_bias,
+        int64_t query_tile,
+        int64_t db_tile,
+        int64_t col_reduce_tile,
+        int64_t k,
+        bool compute_stats,
+        bool collect_linf_stats,
+        bool collect_timing,
+        int64_t col_kernel,
+        double dot_scale) {
+    if (query_feat.scalar_type() == torch::kFloat32) {
+        return fused_bidir_topk_stats_raw_cuda_t<float>(
+                query_feat, db_feat, query_cost, db_cost, query_bias, db_bias,
+                query_tile, db_tile, col_reduce_tile, k, compute_stats,
+                collect_linf_stats, collect_timing, col_kernel, dot_scale);
+    }
+    return fused_bidir_topk_stats_raw_cuda_t<double>(
+            query_feat, db_feat, query_cost, db_cost, query_bias, db_bias,
+            query_tile, db_tile, col_reduce_tile, k, compute_stats,
+            collect_linf_stats, collect_timing, col_kernel, dot_scale);
 }
 
 

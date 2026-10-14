@@ -18,19 +18,6 @@ from hello_ot.refinement.dual_feasibility import run_lowrank_dual_feasibility_sc
 from hello_ot.restricted_ot.backend import solve_lp as _solve_lp_backend
 
 
-def _copy_primal_for_active_support(active_support: Any, value: Any) -> Any:
-    """
-    CN: 按 active-support backend 复制 primal；GPU 走 D2D，CPU 仅在该边界走 D2H。
-    EN: Copy the primal for the active-support backend; use D2D on GPU and D2H only at the CPU boundary.
-    """
-    if hasattr(value, "detach"):
-        tensor = value.detach()
-        if bool(getattr(active_support, "is_torch_backend", False)):
-            return tensor.clone()
-        return tensor.cpu().numpy().copy()
-    return value.copy()
-
-
 @dataclass(frozen=True)
 class SolveLPResult:
     """
@@ -113,6 +100,19 @@ def solve_lp(
             diagnostics=dict((solve_meta or {}).get("diag", {})),
         )
 
+    from hello_ot.restricted_ot.sparsification_postprocess import (
+        sparsify_restricted_lp_output,
+    )
+
+    primal_new, dual_new, res = sparsify_restricted_lp_output(
+        solver,
+        lvl_s,
+        lvl_t,
+        primal_new,
+        dual_new,
+        res,
+    )
+
     if solver._logger_is_enabled_info():
         primal_nnz = primal_new.nnz
         primal_nnz_thr = int(np.count_nonzero(primal_new.data > 1e-10)) if primal_new.data.size > 0 else 0
@@ -123,6 +123,8 @@ def solve_lp(
         )
 
     diag = dict((solve_meta or {}).get("diag", {}) or {})
+    if getattr(res, "gap", None) is not None:
+        diag["solver_relative_primal_dual_gap"] = float(res.gap)
     solver_diag = getattr(res, "solver_diag", None)
     if not isinstance(solver_diag, dict):
         solver_diag = {}
@@ -181,9 +183,7 @@ def solve_active_support_lp_and_commit(
         _require_gpu=False,
     )
     if result.success:
-        solver.active_support.set_x_prev(
-            _copy_primal_for_active_support(solver.active_support, result.backend_result.x)
-        )
+        solver.active_support.commit_primal(result.backend_result.x)
     return result.as_legacy_dict()
 
 

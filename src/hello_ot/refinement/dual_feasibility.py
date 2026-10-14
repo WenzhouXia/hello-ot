@@ -122,6 +122,7 @@ def run_lowrank_dual_feasibility_scan(
             topk=int(getattr(config, "pricing_topk", 2)),
             theta=0.0,
             device=str(getattr(config, "torch_device", "auto")),
+            compute_precision=str(getattr(config, "cost_precision", "fp32")),
             collect_linf_diagnostics=(
                 normalize_dual_feasibility_norm(dual_feasibility_norm) == "linf"
                 or bool(getattr(config, "record_dual_linf_diagnostics", False))
@@ -173,6 +174,7 @@ def run_lowrank_dual_feasibility_scan(
                     or bool(getattr(config, "record_dual_linf_diagnostics", False))
                 ),
                 dot_scale=float(getattr(config, "dot_scale", 1.0)),
+                compute_precision=str(getattr(config, "cost_precision", "fp32")),
             )
             mem_tracker.tick()
         rows = fused_scan.rows

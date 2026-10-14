@@ -100,7 +100,7 @@ def test_refinement_executes_paper_operator_order() -> None:
                 coarsest_size_threshold=4,
                 assignment_topk=1,
                 pricing_topk=1,
-                support_budget_factor=2.0,
+                support_budget_factor=3.0,
             ),
         )
 

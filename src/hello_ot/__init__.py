@@ -12,6 +12,7 @@ from .types import PointCloudCostType, PrewarmStats, Problem, Result
 from .variants import (
     GromovResult,
     SemiDiscreteResult,
+    UOTConvergenceBounds,
     UnbalancedResult,
     solve_gromov,
     solve_semidiscrete,
@@ -89,6 +90,7 @@ __all__ = [
     "Result",
     "SemiDiscreteResult",
     "SolverOptions",
+    "UOTConvergenceBounds",
     "UnbalancedResult",
     "prewarm",
     "solve",

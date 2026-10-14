@@ -4,10 +4,28 @@ from dataclasses import dataclass
 import math
 from typing import Any, Dict, Literal, Optional, Union
 
+from hello_ot.refinement.support_budget import (
+    normalize_pricing_topk,
+    validate_support_budget_factor,
+)
+
 StoppingNormPolicy = Literal["l2", "finest_linf"]
 BackendName = Literal["native", "torch"]
 TorchDeviceName = Literal["auto", "cpu", "cuda"]
 VerboseMode = Literal["off", "compact", "detailed"]
+CostPrecision = Literal["fp32", "fp64", "finest_fp64"]
+
+
+def level_cost_precision(
+    policy: CostPrecision, *, level_index: int
+) -> Literal["fp32", "fp64"]:
+    """
+    CN: 解析某个 hierarchy level 的实际 cost 计算精度，level 0 为最精细层。
+    EN: Resolve effective cost arithmetic for a hierarchy level, where level 0 is finest.
+    """
+    if policy not in {"fp32", "fp64", "finest_fp64"}:
+        raise ValueError("cost_precision must be one of: fp32, fp64, finest_fp64")
+    return "fp64" if policy == "fp64" or (policy == "finest_fp64" and int(level_index) == 0) else "fp32"
 
 
 def finest_stopping_norm(policy: StoppingNormPolicy) -> Literal["l2", "linf"]:
@@ -50,8 +68,14 @@ class SolverOptions:
     torch_device: TorchDeviceName = "auto"
     cost_perturbation: Literal["on", "off", "auto"] = "auto"
     cost_perturbation_relative_scale: float = 0.01
+    cost_precision: CostPrecision = "fp32"
+    gpu_resident: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.gpu_resident, bool):
+            raise ValueError("gpu_resident must be a boolean")
+        if self.gpu_resident and (self.backend != "native" or self.torch_device == "cpu"):
+            raise ValueError("gpu_resident requires the native CUDA backend")
         if not isinstance(self.verbose, str) or self.verbose not in {"off", "compact", "detailed"}:
             raise ValueError("verbose must be one of: off, compact, detailed; boolean values are not supported")
         if self.stopping_norm not in {"l2", "finest_linf"}:
@@ -60,14 +84,21 @@ class SolverOptions:
             raise ValueError("cost_perturbation must be one of: on, off, auto")
         if not math.isfinite(self.cost_perturbation_relative_scale) or self.cost_perturbation_relative_scale <= 0:
             raise ValueError("cost_perturbation_relative_scale must be finite and > 0; use 'off' to disable")
+        if self.cost_precision not in {"fp32", "fp64", "finest_fp64"}:
+            raise ValueError("cost_precision must be one of: fp32, fp64, finest_fp64")
         if self.split_count not in {2, 4, 8}:
             raise ValueError("split_count must be one of: 2, 4, 8")
         if self.coarsest_size_threshold < 1:
             raise ValueError("coarsest_size_threshold must be >= 1")
-        if self.assignment_topk < 1 or self.pricing_topk < 1:
-            raise ValueError("assignment_topk and pricing_topk must be >= 1")
-        if self.support_budget_factor <= 0.0:
-            raise ValueError("support_budget_factor must be > 0")
+        if isinstance(self.assignment_topk, bool) or self.assignment_topk < 1:
+            raise ValueError("assignment_topk must be >= 1")
+        pricing_topk = normalize_pricing_topk(self.pricing_topk)
+        support_budget_factor = validate_support_budget_factor(
+            self.support_budget_factor,
+            pricing_topk,
+        )
+        object.__setattr__(self, "pricing_topk", pricing_topk)
+        object.__setattr__(self, "support_budget_factor", support_budget_factor)
         if self.fused_scan_memory_floor_mib <= 0.0:
             raise ValueError("fused_scan_memory_floor_mib must be > 0")
         if self.backend not in {"native", "torch"}:
@@ -87,7 +118,6 @@ class SolverOptions:
             assignment_topk=self.assignment_topk,
             pricing_topk=self.pricing_topk,
             support_budget_factor=self.support_budget_factor,
-            primal_tolerance=1e-10,
             max_iterations=max_iterations,
             fused_scan_memory_floor_mib=self.fused_scan_memory_floor_mib,
             stopping_norm=self.stopping_norm,
@@ -95,10 +125,12 @@ class SolverOptions:
             record_trace=self.record_trace,
             profile_memory=self.profile_memory,
             consume_input_features=self.consume_input_features,
+            gpu_resident=self.gpu_resident,
             backend=self.backend,
             torch_device=self.torch_device,
             cost_perturbation=self.cost_perturbation,
             cost_perturbation_relative_scale=self.cost_perturbation_relative_scale,
+            cost_precision=self.cost_precision,
         )
 
 
@@ -115,7 +147,6 @@ class _AlgorithmConfig:
     assignment_topk: int
     pricing_topk: int
     support_budget_factor: float
-    primal_tolerance: float
     max_iterations: int
     fused_scan_memory_floor_mib: float
     verbose: VerboseMode
@@ -126,6 +157,7 @@ class _AlgorithmConfig:
     torch_device: TorchDeviceName
     cost_perturbation: str = "off"
     cost_perturbation_relative_scale: float = 0.01
+    cost_precision: CostPrecision = "fp32"
     dual_feasibility_tolerance: float = 1e-6
     lp_tolerance: float = 1e-6
     stopping_norm: StoppingNormPolicy = "l2"
@@ -135,6 +167,7 @@ class _AlgorithmConfig:
     vector_sum_mode: str = "direct_reduce"
     bound_objective_rescaling: Union[bool, Literal["auto"]] = "auto"
     cupdlpx_python_pre_rescale: bool = True
+    gpu_resident: bool = False
 
 
 @dataclass
@@ -154,7 +187,6 @@ class SolverRuntimeConfig:
     dual_feasibility_tol: float
     lp_termination_norm: str
     pricing_topk: float
-    cleaning_primal_tol: float
     cleaning_threshold_factor: float
     lp_solver_verbose: bool
     enable_profiling: bool
@@ -189,6 +221,7 @@ class SolverRuntimeConfig:
     debug: Optional[Dict[str, Any]] = None
     metric_cost_perturbation: Optional[Any] = None
     verbosity: VerboseMode = "off"
+    cost_precision: CostPrecision = "fp32"
 
     @classmethod
     def from_options(cls, config: _AlgorithmConfig, *, cost_type: str) -> "SolverRuntimeConfig":
@@ -223,7 +256,6 @@ class SolverRuntimeConfig:
             dual_feasibility_tol=float(config.dual_feasibility_tolerance),
             lp_termination_norm=finest_stopping_norm(config.stopping_norm),
             pricing_topk=float(config.pricing_topk),
-            cleaning_primal_tol=float(config.primal_tolerance),
             cleaning_threshold_factor=float(config.support_budget_factor),
             lp_solver_verbose=detailed,
             enable_profiling=False,
@@ -241,6 +273,7 @@ class SolverRuntimeConfig:
             ensure_final_dual_feasible=bool(config.ensure_final_dual_feasible),
             fused_lowrank_scan_memory_floor_mib=float(config.fused_scan_memory_floor_mib),
             verbosity=config.verbose,
+            cost_precision=config.cost_precision,
         )
         runtime.validate()
         return runtime
@@ -268,17 +301,26 @@ class SolverRuntimeConfig:
             raise ValueError("LP tolerance must be > 0 and dual-feasibility tolerance must be >= 0")
         if self.lp_termination_norm not in {"l2", "linf"}:
             raise ValueError("lp_termination_norm must be one of: l2, linf")
+        if self.cost_precision not in {"fp32", "fp64", "finest_fp64"}:
+            raise ValueError("cost_precision must be one of: fp32, fp64, finest_fp64")
         if self.pricing_direction != "both":
             raise ValueError("formal HELLO pricing_direction must be 'both'")
         if self.cleaning_strategy != "dual_gap":
             raise ValueError("formal HELLO cleaning_strategy must be 'dual_gap'")
+        self.pricing_topk = normalize_pricing_topk(self.pricing_topk)
+        self.cleaning_threshold_factor = validate_support_budget_factor(
+            self.cleaning_threshold_factor,
+            self.pricing_topk,
+        )
 
 
 __all__ = [
     "SolverOptions",
+    "CostPrecision",
     "SolverRuntimeConfig",
     "StoppingNormPolicy",
     "VerboseMode",
     "finest_stopping_norm",
     "level_stopping_norm",
+    "level_cost_precision",
 ]

@@ -113,13 +113,13 @@ def test_uot_32k_numerical_equivalence(baseline_data, dataset_32k) -> None:
         err_msg="UOT 32k primal objective mismatch",
     )
     np.testing.assert_allclose(
-        res.dual_objective,
+        res.best_bounds.dual_objective,
         float(baseline_data["uot_dual_objective"][0]),
         rtol=1e-5,
         err_msg="UOT 32k dual objective mismatch",
     )
     np.testing.assert_allclose(
-        res.relative_primal_dual_gap,
+        res.best_bounds.relative_primal_dual_gap,
         float(baseline_data["uot_relative_gap"][0]),
         rtol=1e-4,
         err_msg="UOT 32k relative duality gap mismatch",

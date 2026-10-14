@@ -12,8 +12,9 @@ from hello_ot._internal.prewarm import (
 )
 from hello_ot.hierarchy.plan import _prewarm_inplace_feature_reorder
 
-from .config import SolverOptions, SolverRuntimeConfig, _AlgorithmConfig
-from .kernels.norm_cost_scan import _fused_metric_kmin, run_metric_dual_feasibility_scan
+from .config import SolverOptions, SolverRuntimeConfig, _AlgorithmConfig, level_cost_precision
+from .kernels.norm_cost_scan import _fused_metric_kmin
+from .costs.metric import run_metric_dual_feasibility_scan
 from .types import Problem, PrewarmStats
 
 
@@ -51,6 +52,7 @@ def _prewarm_torch_backend(problem: Problem, config: _AlgorithmConfig) -> tuple[
         theta=0.0,
         device=device,
         max_tile_bytes=4096,
+        compute_precision=level_cost_precision(config.cost_precision, level_index=0),
     )
     lp_solver = TorchRestrictedOTPDLP(
         device=device,
@@ -89,6 +91,7 @@ def _prewarm_norm_cost(problem: Problem, config: _AlgorithmConfig) -> tuple[str,
     if target.shape[0] < size:
         target = np.repeat(problem.target_points[:1], size, axis=0).astype(np.float32, copy=False)
     zero = np.zeros(size, dtype=np.float64)
+    compute_precision = level_cost_precision(config.cost_precision, level_index=0)
     for query, database, query_is_source in (
         (source, target, True),
         (target, source, False),
@@ -100,8 +103,10 @@ def _prewarm_norm_cost(problem: Problem, config: _AlgorithmConfig) -> tuple[str,
             cost_type=problem.cost_type,  # type: ignore[arg-type]
             k=int(config.assignment_topk),
             query_is_source=query_is_source,
+            compute_precision=compute_precision,
         )
     runtime = SolverRuntimeConfig.from_options(config, cost_type=str(problem.cost_type))
+    runtime.cost_precision = compute_precision
     run_metric_dual_feasibility_scan(
         config=runtime,
         lvl_s=SimpleNamespace(points=source),
@@ -113,6 +118,37 @@ def _prewarm_norm_cost(problem: Problem, config: _AlgorithmConfig) -> tuple[str,
     )
     torch.cuda.synchronize()
     return ("norm_assignment", "norm_dual_certificate")
+
+
+def _prewarm_native_lowrank_precision(
+    problem: Problem, config: _AlgorithmConfig
+) -> tuple[str, ...]:
+    """
+    CN: 触发 native lowrank 最精细层所选精度的双向扫描路径。
+    EN: Exercise the native low-rank bidirectional scan at the selected finest-level precision.
+    """
+    from hello_ot.kernels.bilinear_topk import raw_lowrank_bidir_feasibility_pricing_scan
+
+    source = np.ascontiguousarray(problem.source_points[:8], dtype=np.float32)
+    target = np.ascontiguousarray(problem.target_points[:8], dtype=np.float32)
+    if source.shape[0] == 0 or target.shape[0] == 0:
+        raise ValueError("prewarm requires a non-empty problem")
+    source_cost = np.einsum("ij,ij->i", source, source, dtype=np.float64)
+    target_cost = np.einsum("ij,ij->i", target, target, dtype=np.float64)
+    raw_lowrank_bidir_feasibility_pricing_scan(
+        source,
+        target,
+        source_cost,
+        target_cost,
+        np.zeros(source.shape[0], dtype=np.float64),
+        np.zeros(target.shape[0], dtype=np.float64),
+        topk=1,
+        gpu_id=int(torch.cuda.current_device()),
+        memory_floor_mib=1.0,
+        dot_scale=2.0,
+        compute_precision=level_cost_precision(config.cost_precision, level_index=0),
+    )
+    return ("native_lowrank_scan",)
 
 
 def prewarm(problem: Problem, options: SolverOptions | None = None) -> PrewarmStats:
@@ -139,6 +175,9 @@ def prewarm(problem: Problem, options: SolverOptions | None = None) -> PrewarmSt
         )
     if not torch.cuda.is_available():
         raise RuntimeError("HELLO prewarm requires a CUDA-capable PyTorch runtime")
+    precision_operations: tuple[str, ...] = ()
+    if problem.cost_type == "l2^2":
+        precision_operations = _prewarm_native_lowrank_precision(problem, config)
     cold = prewarm_hierarchy_cold_paths(
         source_f=problem.source_points,
         solver_engine="cupdlpx",
@@ -154,7 +193,7 @@ def prewarm(problem: Problem, options: SolverOptions | None = None) -> PrewarmSt
             if not bool(stage.get("success", False))
         }
         raise RuntimeError(f"HELLO prewarm failed: {failures}")
-    operations = [str(name) for name in dict(cold.get("stages") or {})]
+    operations = [*precision_operations, *[str(name) for name in dict(cold.get("stages") or {})]]
     if bool(config.consume_input_features):
         operations.append("inplace_feature_reorder")
     if problem.cost_type in {"l1", "l2", "linf"}:

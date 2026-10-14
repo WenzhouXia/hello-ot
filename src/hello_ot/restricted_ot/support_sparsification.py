@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+
+from hello_ot.refinement.support_budget import POSITIVE_SUPPORT_TOLERANCE
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,8 @@ def sparsify_transport_support(
     n_source: int,
     n_target: int,
     target_nnz: int,
-    zero_tolerance: float = 1e-15,
+    zero_tolerance: float = POSITIVE_SUPPORT_TOLERANCE,
+    engine: Literal["cpp_lct", "numba_lct"] = "cpp_lct",
 ) -> SupportSparsificationResult:
     """
     CN: 沿非增代价方向消去 support cycle，直至正 support 不超过目标大小。
@@ -102,18 +105,36 @@ def sparsify_transport_support(
             wall_time=0.0,
         )
 
-    extension = _load_extension()
     started = time.perf_counter()
-    raw = extension.sparsify_transport_support(
-        n_source,
-        n_target,
-        rows_array,
-        cols_array,
-        values_array,
-        costs_array,
-        target_nnz,
-        zero_tolerance,
-    )
+    if engine == "cpp_lct":
+        extension = _load_extension()
+        raw = extension.sparsify_transport_support(
+            n_source,
+            n_target,
+            rows_array,
+            cols_array,
+            values_array,
+            costs_array,
+            target_nnz,
+            zero_tolerance,
+        )
+    elif engine == "numba_lct":
+        from hello_ot.restricted_ot.support_sparsifier_numba import (
+            sparsify_transport_support_numba,
+        )
+
+        raw = sparsify_transport_support_numba(
+            n_source,
+            n_target,
+            rows_array,
+            cols_array,
+            values_array,
+            costs_array,
+            target_nnz,
+            zero_tolerance,
+        )
+    else:
+        raise ValueError("engine must be one of: cpp_lct, numba_lct")
     wall_time = float(time.perf_counter() - started)
     output = np.asarray(raw["values"], dtype=np.float64)
     return SupportSparsificationResult(

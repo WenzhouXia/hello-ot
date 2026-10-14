@@ -24,14 +24,18 @@ def test_hello_ot_does_not_import_internal_repository_package() -> None:
 
 
 def test_public_modules_import_without_loading_hierarchical_ot() -> None:
+    import subprocess
     import sys
 
-    import hello_ot
-    import hello_ot.api
-
-    assert "hierarchical_ot" not in sys.modules
-    assert hello_ot.solve is not None
-    assert hello_ot.api.solve_problem is not None
+    code = """
+import sys
+import hello_ot
+import hello_ot.api
+assert 'hierarchical_ot' not in sys.modules
+assert hello_ot.solve is not None
+assert hello_ot.api.solve_problem is not None
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_removed_compatibility_features_do_not_reappear_in_package_sources() -> None:

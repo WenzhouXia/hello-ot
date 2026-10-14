@@ -33,7 +33,11 @@ def main():
         if not any(device.platform == "gpu" for device in jax.devices()):
             raise SystemExit("--with-ott requires working GPU JAX; check CUDA library paths.")
     root = Path(__file__).resolve().parents[1]
-    tests = ["tests/hello_cost_perturbation_test.py", "tests/hello_ot_variants_test.py"]
+    tests = [
+        "tests/hello_cost_perturbation_test.py",
+        "tests/hello_gpu_resident_test.py",
+        "tests/hello_ot_variants_test.py",
+    ]
     if args.extended:
         fixture = root / "tests/fixtures/variants_baseline_32k.npz"
         if not fixture.is_file():

@@ -1140,7 +1140,7 @@ static void copy_scaled_primal_from_unscaled_to_buffer(
     const double alpha_x = (state->constraint_bound_rescaling != 0.0) ? state->constraint_bound_rescaling : 1.0;
     double *x_unscaled_d = nullptr;
     CUDA_CHECK(cudaMalloc(&x_unscaled_d, (size_t)n_vars * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(x_unscaled_d, x_unscaled, (size_t)n_vars * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(x_unscaled_d, x_unscaled, (size_t)n_vars * sizeof(double), cudaMemcpyDefault));
     scale_primal_unscaled_to_scaled_kernel<<<blocks_primal, THREADS_PER_BLOCK>>>(
         x_unscaled_d,
         state->variable_rescaling,
@@ -1170,7 +1170,7 @@ static void copy_scaled_dual_from_unscaled_to_buffer(
     const double alpha_y = (state->objective_vector_rescaling != 0.0) ? state->objective_vector_rescaling : 1.0;
     double *y_unscaled_d = nullptr;
     CUDA_CHECK(cudaMalloc(&y_unscaled_d, (size_t)n_cons * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(y_unscaled_d, y_unscaled, (size_t)n_cons * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(y_unscaled_d, y_unscaled, (size_t)n_cons * sizeof(double), cudaMemcpyDefault));
     scale_dual_unscaled_to_scaled_kernel<<<blocks_dual, THREADS_PER_BLOCK>>>(
         y_unscaled_d,
         state->constraint_rescaling,

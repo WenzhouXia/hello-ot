@@ -14,7 +14,8 @@ std::vector<torch::Tensor> fused_gcost_topk_cuda(
         int64_t seed,
         int64_t perturb_mode,
         bool row_is_source,
-        torch::Tensor index_hash_coeffs);
+        torch::Tensor index_hash_coeffs,
+        int64_t compute_precision);
 
 std::vector<torch::Tensor> fused_gcost_certificate_cuda(
         torch::Tensor query,
@@ -29,7 +30,8 @@ std::vector<torch::Tensor> fused_gcost_certificate_cuda(
         int64_t perturb_mode,
         bool row_is_source,
         torch::Tensor index_hash_coeffs,
-        int64_t compute_denominator);
+        int64_t compute_denominator,
+        int64_t compute_precision);
 
 std::vector<torch::Tensor> fused_gcost_bidir_certificate_cuda(
         torch::Tensor query,
@@ -44,7 +46,8 @@ std::vector<torch::Tensor> fused_gcost_bidir_certificate_cuda(
         int64_t seed,
         int64_t perturb_mode,
         bool row_is_source,
-        torch::Tensor index_hash_coeffs);
+        torch::Tensor index_hash_coeffs,
+        int64_t compute_precision);
 
 std::vector<torch::Tensor> fused_mips_topk_cuda(
         torch::Tensor query,
@@ -76,7 +79,8 @@ std::vector<torch::Tensor> fused_gcost_topk(
         int64_t seed,
         int64_t perturb_mode,
         bool row_is_source,
-        torch::Tensor index_hash_coeffs) {
+        torch::Tensor index_hash_coeffs,
+        int64_t compute_precision) {
     return fused_gcost_topk_cuda(
             query,
             db,
@@ -89,7 +93,8 @@ std::vector<torch::Tensor> fused_gcost_topk(
             seed,
             perturb_mode,
             row_is_source,
-            index_hash_coeffs);
+            index_hash_coeffs,
+            compute_precision);
 }
 
 // CN: 证书归约入口：一次全矩阵遍历返回 (numerator, denominator)，
@@ -114,7 +119,8 @@ std::vector<torch::Tensor> fused_gcost_certificate(
         int64_t perturb_mode,
         bool row_is_source,
         torch::Tensor index_hash_coeffs,
-        int64_t compute_denominator) {
+        int64_t compute_denominator,
+        int64_t compute_precision) {
     return fused_gcost_certificate_cuda(
             query,
             db,
@@ -128,7 +134,8 @@ std::vector<torch::Tensor> fused_gcost_certificate(
             perturb_mode,
             row_is_source,
             index_hash_coeffs,
-            compute_denominator);
+            compute_denominator,
+            compute_precision);
 }
 
 std::vector<torch::Tensor> fused_gcost_bidir_certificate(
@@ -144,11 +151,12 @@ std::vector<torch::Tensor> fused_gcost_bidir_certificate(
         int64_t seed,
         int64_t perturb_mode,
         bool row_is_source,
-        torch::Tensor index_hash_coeffs) {
+        torch::Tensor index_hash_coeffs,
+        int64_t compute_precision) {
     return fused_gcost_bidir_certificate_cuda(
             query, db, query_dual, db_dual, k, cost_type,
             query_global_index, database_global_index, sigma, seed,
-            perturb_mode, row_is_source, index_hash_coeffs);
+            perturb_mode, row_is_source, index_hash_coeffs, compute_precision);
 }
 
 // CN: MIPS top-k 入口：score(i, j) = dot(query[i], db[j])（augmented 向量内积），
@@ -168,34 +176,47 @@ std::vector<torch::Tensor> fused_mips_topk(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("supports_cost_perturbation") = true;
+    m.attr("supports_fp64_accumulation") = true;
     m.attr("index_hash_arithmetic") = "fp32_remainder_v1";
     m.def("fused_gcost_topk", [](torch::Tensor q, torch::Tensor d, torch::Tensor v, int64_t k, int64_t c) {
         auto idx = torch::empty({0}, q.options().dtype(torch::kInt64));
-        return fused_gcost_topk(q, d, v, k, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()));
+        return fused_gcost_topk(q, d, v, k, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()), 0);
     });
 
     m.def("fused_gcost_certificate", [](torch::Tensor q, torch::Tensor d, torch::Tensor u, torch::Tensor v, int64_t c, int64_t den) {
         auto idx = torch::empty({0}, q.options().dtype(torch::kInt64));
-        return fused_gcost_certificate(q, d, u, v, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()), den);
+        return fused_gcost_certificate(q, d, u, v, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()), den, 0);
     });
 
     m.def("fused_gcost_bidir_certificate", [](torch::Tensor q, torch::Tensor d, torch::Tensor u, torch::Tensor v, int64_t k, int64_t c) {
         auto idx = torch::empty({0}, q.options().dtype(torch::kInt64));
-        return fused_gcost_bidir_certificate(q, d, u, v, k, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()));
+        return fused_gcost_bidir_certificate(q, d, u, v, k, c, idx, idx, 0.0, 0, 1, true, torch::zeros({6}, idx.options()), 0);
     });
 
     m.def(
             "fused_gcost_topk",
             &fused_gcost_topk,
-            "Fused CUDA top-k for general metric costs (l1/linf/l2) with on-the-fly distance, optional cost perturbation, and dual subtraction");
+            "Fused CUDA top-k for general metric costs (l1/linf/l2) with on-the-fly distance, optional cost perturbation, and dual subtraction",
+            py::arg("query"), py::arg("db"), py::arg("dual_db"), py::arg("k"), py::arg("cost_type"),
+            py::arg("query_global_index"), py::arg("database_global_index"), py::arg("sigma"), py::arg("seed"),
+            py::arg("perturb_mode"), py::arg("row_is_source"), py::arg("index_hash_coeffs"),
+            py::arg("compute_precision") = 0);
     m.def(
             "fused_gcost_certificate",
             &fused_gcost_certificate,
-            "Fused CUDA dual-feasibility certificate (numerator/denominator reductions) for general metric costs with optional perturbation; set compute_denominator=0 to skip the denominator reduction");
+            "Fused CUDA dual-feasibility certificate (numerator/denominator reductions) for general metric costs with optional perturbation; set compute_denominator=0 to skip the denominator reduction",
+            py::arg("query"), py::arg("db"), py::arg("query_dual"), py::arg("db_dual"), py::arg("cost_type"),
+            py::arg("query_global_index"), py::arg("database_global_index"), py::arg("sigma"), py::arg("seed"),
+            py::arg("perturb_mode"), py::arg("row_is_source"), py::arg("index_hash_coeffs"),
+            py::arg("compute_denominator"), py::arg("compute_precision") = 0);
     m.def(
             "fused_gcost_bidir_certificate",
             &fused_gcost_bidir_certificate,
-            "One-pass bidirectional dual-violation top-k and L2/Linf certificate for norm costs");
+            "One-pass bidirectional dual-violation top-k and L2/Linf certificate for norm costs",
+            py::arg("query"), py::arg("db"), py::arg("query_dual"), py::arg("db_dual"), py::arg("k"), py::arg("cost_type"),
+            py::arg("query_global_index"), py::arg("database_global_index"), py::arg("sigma"), py::arg("seed"),
+            py::arg("perturb_mode"), py::arg("row_is_source"), py::arg("index_hash_coeffs"),
+            py::arg("compute_precision") = 0);
     m.def(
             "fused_mips_topk",
             &fused_mips_topk,

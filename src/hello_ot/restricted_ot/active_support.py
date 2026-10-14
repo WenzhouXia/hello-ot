@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 
 import numpy as np
@@ -12,13 +13,21 @@ STRUCTURAL_EDGE = -1
 INITIAL_EDGE = -2
 
 
+@dataclass(frozen=True)
+class SupportLPPayload:
+    rows: Any
+    cols: Any
+    costs: Any
+    primal: Any
+
+
 class ActiveSupport:
     """
     CN: HELLO refinement 使用的 Torch-device active support。
     EN: Torch-device active support used by HELLO refinement.
 
-    CN: 该类型只维护数据、不决定 dual violation、判敛或 budgeted pruning。
-    EN: This type only maintains data; it does not decide dual violations, stopping, or budgeted pruning.
+    CN: 封装候选边、存储变更及 LP 导出；不决定 dual violation、判敛或 pruning 选择策略。
+    EN: Encapsulate candidate edges, storage changes and LP export without deciding dual violations, stopping or pruning selection policy.
     """
 
     def __init__(
@@ -290,6 +299,15 @@ class ActiveSupport:
         size = self._array_size(rows)
         self.add_pairs(rows, cols, self._zeros(size, np.float64), iter_idx=iter_idx)
 
+    def add_evaluated_pairs(self, rows: Any, cols: Any, costs: Any, iter_idx: int) -> None:
+        """
+        CN: 接收候选边成本，保留原有主机成本先转 FP32 再存 FP64 的精度路径。
+        EN: Admit evaluated candidates, preserving the existing host-cost FP32 conversion before FP64 storage.
+        """
+        if not torch.is_tensor(costs):
+            costs = torch.as_tensor(costs, dtype=torch.float32, device=self.device)
+        self.add_pairs(rows, cols, costs, iter_idx)
+
     def replace_costs(self, costs: Any) -> None:
         values = self._coerce_array(costs, np.float64)
         if int(values.numel()) != self.size:
@@ -301,6 +319,106 @@ class ActiveSupport:
         if int(primal.numel()) != self.size:
             raise ValueError("primal vector length must match active support size")
         self.x_prev = primal
+
+    def commit_primal(self, values: Any) -> None:
+        """
+        CN: 复制 LP 输出后保存，避免 support 与 backend 的可变缓冲区共享存储。
+        EN: Copy LP output before storing it to avoid sharing mutable backend buffers.
+        """
+        copied = values.detach().clone() if torch.is_tensor(values) else values.copy()
+        self.set_x_prev(copied)
+
+    def lp_payload(self, *, on_cpu: bool) -> SupportLPPayload:
+        """
+        CN: 按 LP 执行位置导出数据；设备路径直接借用现有张量。
+        EN: Export data for LP execution, borrowing existing tensors on the device path.
+        """
+        if on_cpu:
+            payload = self.export_numpy()
+            return SupportLPPayload(payload['rows'], payload['cols'], payload['c_vec'], payload['x_prev'])
+        return SupportLPPayload(self.rows, self.cols, self.c_vec, self.x_prev)
+
+    def release_device_storage_for_scan(self):
+        """
+        CN: 扫描期间临时释放 CUDA 存储，CPU support 无需迁移。
+        EN: Temporarily release CUDA storage during a scan; CPU support needs no movement.
+        """
+        return self.stage_storage_on_cpu() if self.is_cuda else nullcontext({})
+
+    def mark_structural_positions(self, positions: Any) -> bool:
+        """
+        CN: 验证全部位置后标记结构边；无 creation tracking 时无需标记。
+        EN: Mark structural edges after validating all positions; no marking is needed without creation tracking.
+        """
+        if positions is None:
+            return False
+        if self.creation_iteration is None:
+            return True
+        positions = torch.as_tensor(positions, dtype=torch.long, device=self.device).reshape(-1)
+        if positions.numel() == 0:
+            return True
+        valid = (positions >= 0) & (positions < self.creation_iteration.numel())
+        if not bool(torch.all(valid).item()):
+            return False
+        self.creation_iteration[positions] = STRUCTURAL_EDGE
+        return True
+
+    def missing_structural_pairs(self, keys: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        CN: 保护已有结构边并返回缺失边，保持输入顺序及原有 membership 规则。
+        EN: Protect existing structural edges and return missing pairs, preserving input order and membership rules.
+        """
+        keys = torch.as_tensor(keys, dtype=torch.int64, device=self.device)
+        active_keys = self.keys.to(dtype=torch.int64)
+        if self.creation_iteration is not None and active_keys.numel() > 0:
+            existing = torch.isin(active_keys, keys)
+            if bool(torch.any(existing).item()):
+                self.creation_iteration[existing] = STRUCTURAL_EDGE
+        missing = keys if self.keys.numel() == 0 else keys[~torch.isin(keys, active_keys)]
+        return (
+            torch.div(missing, self.n_target, rounding_mode='floor').to(dtype=torch.int32),
+            torch.remainder(missing, self.n_target).to(dtype=torch.int32),
+        )
+
+    def keys_at_positions(self, positions: Any) -> torch.Tensor:
+        """
+        CN: 在 support 设备上返回选中边的 key，不复制完整 support。
+        EN: Return selected edge keys on the support device without copying the complete support.
+        """
+        positions = torch.as_tensor(positions, dtype=torch.long, device=self.rows.device)
+        return self.rows[positions].to(torch.int64) * self.n_target + self.cols[positions].to(torch.int64)
+
+    def remove_positions(self, positions: Any) -> None:
+        """
+        CN: 按位置删除边，同步所有持久字段并失效排序缓存。
+        EN: Remove edges by position, updating all persistent fields and invalidating ordering caches.
+        """
+        keep = torch.ones(self.size, dtype=torch.bool, device=self.device)
+        positions = self._coerce_array(positions, np.int64)
+        keep[positions] = False
+        self.prune(keep)
+
+    def pruning_values(
+        self, duals: Any, n_source: int,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+        """
+        CN: 在存储设备计算 pruning 所需数值，保护和排序规则由调用者决定。
+        EN: Compute pruning values on the storage device; callers decide protection and ordering rules.
+        """
+        costs = self.c_vec
+        duals_t = duals if torch.is_tensor(duals) else torch.as_tensor(duals, dtype=costs.dtype, device=costs.device)
+        if duals_t.device != costs.device:
+            duals_t = duals_t.to(device=costs.device)
+        if duals_t.dtype != costs.dtype:
+            duals_t = duals_t.to(dtype=costs.dtype)
+        u, v = duals_t[:int(n_source)], duals_t[int(n_source):]
+        abs_x = torch.abs(self.x_prev)
+        rows, cols = self.rows.to(dtype=torch.long), self.cols.to(dtype=torch.long)
+        if bool(torch.any(rows >= int(n_source))) or bool(torch.any(cols >= int(v.numel()))):
+            return None
+        reduced_costs = costs - (u.index_select(0, rows) + v.index_select(0, cols))
+        reduced_costs = torch.where(torch.isfinite(reduced_costs), reduced_costs, torch.full_like(reduced_costs, -torch.inf))
+        return abs_x, self.creation_iteration, reduced_costs
 
     def prune(self, mask: Any) -> None:
         keep = self._coerce_array(mask, np.bool_)

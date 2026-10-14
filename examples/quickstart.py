@@ -68,6 +68,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="torch",
         help="solver backend (default: torch)",
     )
+    parser.add_argument(
+        "--cost-precision",
+        choices=("fp32", "fp64", "finest_fp64"),
+        default="fp32",
+        help="cost arithmetic policy (default: fp32)",
+    )
     return parser.parse_args(argv)
 
 
@@ -134,6 +140,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         coarsest_size_threshold=1024,
         cost_perturbation="auto",
         verbose="compact",
+        cost_precision=args.cost_precision,
     )
     result = hello_ot.solve(
         source,

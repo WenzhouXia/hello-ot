@@ -1,4 +1,7 @@
-"""Shared phase/component names for structured runtime profiling."""
+"""
+CN: 结构化运行时 profiling 共享的 phase/component 名称。
+EN: Shared phase/component names for structured runtime profiling.
+"""
 
 PHASE_INIT_RUN_STATE = "init_run_state"
 PHASE_INIT_LEVEL_STATE = "init_level_state"

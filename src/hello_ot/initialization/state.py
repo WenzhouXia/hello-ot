@@ -216,14 +216,16 @@ def _make_query_feature_chunk_cuda(
     q_stop: int,
     *,
     device: "torch.device",
+    dtype: Optional["torch.dtype"] = None,
 ) -> "torch.Tensor":
     """
     CN: 仅上传原始 feature chunk；bias 由 scan ABI 单独传递，禁止物化增广 feature。
     EN: Upload only the raw feature chunk; the scan ABI receives bias separately and never materializes augmented features.
     """
+    feature_dtype = torch.float32 if dtype is None else dtype
     return _as_cuda_2d_tensor(
         query_np[int(q_start) : int(q_stop)],
-        dtype=torch.float32,
+        dtype=feature_dtype,
         device=device,
     )
 
@@ -516,6 +518,7 @@ def _topk_ip_indices_streamed_cuda(
     top_k: int,
     *,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
     device: Optional[Any] = None,
     tracer: Optional[_ChromeTraceCollector] = None,
     trace_args: Optional[Dict[str, Any]] = None,
@@ -527,6 +530,10 @@ def _topk_ip_indices_streamed_cuda(
     """
     if not _torch_cuda_available():
         raise RuntimeError("streamed CUDA top-k requires torch CUDA to be available.")
+    if str(compute_precision) not in {"fp32", "fp64"}:
+        raise ValueError("compute_precision must be one of: fp32, fp64")
+    feature_dtype = torch.float64 if str(compute_precision) == "fp64" else torch.float32
+    feature_dim_multiplier = 2 if feature_dtype == torch.float64 else 1
     db_t = None
     db_np = None
     # CN: database 只常驻一种表示；优先复用 CUDA tensor，否则保留 CPU numpy 供流式上传。
@@ -581,7 +588,7 @@ def _topk_ip_indices_streamed_cuda(
         memory_plan = plan_resident_side(
             source_count=int(q_rows),
             target_count=int(db_rows),
-            feature_dim=int(db_dim),
+            feature_dim=int(db_dim * feature_dim_multiplier),
             topk_bucket=int(kernel_k),
             available_bytes=int(available_bytes),
             driver_free_bytes=int(driver_free_bytes),
@@ -592,7 +599,7 @@ def _topk_ip_indices_streamed_cuda(
         custom_chunk_rows = plan_stream_chunk_rows(
             memory_plan,
             streamed_count=int(streamed_count),
-            feature_dim=int(db_dim),
+            feature_dim=int(db_dim * feature_dim_multiplier),
             max_rows=int(_DUAL_ASSIGNMENT_STREAM_TOPK_QUERY_CHUNK_ROWS),
         )
     profile = {
@@ -612,6 +619,7 @@ def _topk_ip_indices_streamed_cuda(
         "resident_bytes": None if memory_plan is None else int(memory_plan.resident_bytes),
         "total_time": 0.0,
         "query_chunk_rows": int(_DUAL_ASSIGNMENT_STREAM_TOPK_QUERY_CHUNK_ROWS),
+        "cost_compute_precision": str(compute_precision),
     }
     t_total = time.perf_counter()
     if q_rows <= 0:
@@ -630,7 +638,9 @@ def _topk_ip_indices_streamed_cuda(
             profile["query_chunk_rows"] = int(chunk_rows)
             if memory_plan.resident_side == "target":
                 if db_t is None:
-                    db_t = _as_cuda_2d_tensor(db_np, dtype=torch.float32, device=device_obj)
+                    db_t = _as_cuda_2d_tensor(db_np, dtype=feature_dtype, device=device_obj)
+                elif db_t.dtype != feature_dtype:
+                    db_t = db_t.to(dtype=feature_dtype).contiguous()
                 db_bias = _as_cuda_1d_tensor(db_bias_np, dtype=torch.float64, device=device_obj)
                 # CN: 直接写入最终输出，避免 chunk list 与 torch.cat 同时持有两份完整 top-k。
                 # EN: Write directly into final outputs, avoiding full top-k duplication by chunk lists plus torch.cat.
@@ -639,7 +649,7 @@ def _topk_ip_indices_streamed_cuda(
                 for q_start in range(0, q_rows, chunk_rows):
                     q_stop = min(q_rows, q_start + chunk_rows)
                     t_query_prepare = time.perf_counter()
-                    q_feat_t = make_query_feature_chunk(q_start, q_stop).to(device=device_obj, dtype=torch.float32).contiguous()
+                    q_feat_t = make_query_feature_chunk(q_start, q_stop).to(device=device_obj, dtype=feature_dtype).contiguous()
                     profile["query_augment_time"] += float(time.perf_counter() - t_query_prepare)
                     query_bias = torch.zeros(int(q_stop - q_start), dtype=torch.float64, device=device_obj)
                     vals_t, idx_t = custom_ext.initialization_directional_topk_raw(
@@ -659,17 +669,17 @@ def _topk_ip_indices_streamed_cuda(
                 # CN: query 侧常驻时，每个 database chunk 产生一组候选，再在设备上精确合并。
                 # EN: With resident queries, each database chunk produces candidates that are merged exactly on device.
                 if db_np is not None:
-                    database_cpu = torch.as_tensor(db_np, dtype=torch.float32)
+                    database_cpu = torch.as_tensor(db_np, dtype=feature_dtype)
                 else:
-                    database_cpu = db_t.detach().to(device="cpu", dtype=torch.float32)
+                    database_cpu = db_t.detach().to(device="cpu", dtype=feature_dtype)
                     del db_t
-                resident_query = make_query_feature_chunk(0, q_rows).to(device=device_obj, dtype=torch.float32).contiguous()
+                resident_query = make_query_feature_chunk(0, q_rows).to(device=device_obj, dtype=feature_dtype).contiguous()
                 resident_bias = torch.zeros(q_rows, dtype=torch.float64, device=device_obj)
                 best_vals = torch.full((q_rows, k), -torch.inf, dtype=torch.float64, device=device_obj)
                 best_idx = torch.full((q_rows, k), -1, dtype=torch.int64, device=device_obj)
                 for d_start in range(0, db_rows, chunk_rows):
                     d_stop = min(db_rows, d_start + chunk_rows)
-                    database_chunk = database_cpu[d_start:d_stop].to(device=device_obj, dtype=torch.float32).contiguous()
+                    database_chunk = database_cpu[d_start:d_stop].to(device=device_obj, dtype=feature_dtype).contiguous()
                     database_bias = _as_cuda_1d_tensor(
                         db_bias_np[d_start:d_stop],
                         dtype=torch.float64,
@@ -712,6 +722,7 @@ def _complete_dual_by_ctransform_top1(
     trace_args: Optional[Dict[str, Any]] = None,
     trace_prefix: str = "dual_completion",
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Tuple[OTWarmStartGPUState, Dict[str, Any]]:
     if str(dual_assignment_pipeline) != "gpu":
         raise ValueError("dual_assignment_pipeline must be 'gpu'.")
@@ -772,11 +783,18 @@ def _complete_dual_by_ctransform_top1(
             db_bias_np = np.asarray(beta_np - tgt_cost, dtype=np.float64)
             vals_t, topk_idx, topk_profile = _topk_ip_indices_streamed_cuda(
                 n_source,
-                lambda q_start, q_stop: _make_query_feature_chunk_cuda(src_f, q_start, q_stop, device=device),
+                lambda q_start, q_stop: _make_query_feature_chunk_cuda(
+                    src_f,
+                    q_start,
+                    q_stop,
+                    device=device,
+                    dtype=torch.float64 if str(compute_precision) == "fp64" else torch.float32,
+                ),
                 tgt_g,
                 db_bias_np,
                 1,
                 dot_scale=float(dot_scale),
+                compute_precision=str(compute_precision),
                 device=device,
                 tracer=tracer,
                 trace_args=trace_args,
@@ -794,11 +812,18 @@ def _complete_dual_by_ctransform_top1(
             db_bias_np = np.asarray(alpha_np - src_cost, dtype=np.float64)
             vals_t, topk_idx, topk_profile = _topk_ip_indices_streamed_cuda(
                 n_target,
-                lambda q_start, q_stop: _make_query_feature_chunk_cuda(tgt_g, q_start, q_stop, device=device),
+                lambda q_start, q_stop: _make_query_feature_chunk_cuda(
+                    tgt_g,
+                    q_start,
+                    q_stop,
+                    device=device,
+                    dtype=torch.float64 if str(compute_precision) == "fp64" else torch.float32,
+                ),
                 src_f,
                 db_bias_np,
                 1,
                 dot_scale=float(dot_scale),
+                compute_precision=str(compute_precision),
                 device=device,
                 tracer=tracer,
                 trace_args=trace_args,
@@ -848,6 +873,7 @@ def _ensure_lowrank_final_dual_feasible(
     tracer: Optional[_ChromeTraceCollector] = None,
     trace_prefix: str = "final_dual_feasibility_correction",
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Tuple[OTWarmStartState, Dict[str, Any]]:
     """
     CN: 用一次逐点 c-transform 修正最终 lowrank dual，并同步返回 CPU warm-start state。
@@ -872,6 +898,7 @@ def _ensure_lowrank_final_dual_feasible(
         tracer=tracer,
         trace_prefix=str(trace_prefix),
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
     )
     corrected = _normalize_dual_assignment_state(corrected_gpu, pipeline="cpu")
     if not isinstance(corrected, OTWarmStartState) or corrected.dual_uv is None:
@@ -1174,6 +1201,7 @@ def _assign_state_from_known_dual_directional_scan(
     tracer: Optional[_ChromeTraceCollector] = None,
     trace_args: Optional[Dict[str, Any]] = None,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Any:
     """
     CN: 使用某一侧已知 dual 做全局 top-k augment；known_side 指出已知 dual 所在侧。
@@ -1207,11 +1235,18 @@ def _assign_state_from_known_dual_directional_scan(
 
     vals_t, topk_idx_t, topk_profile = _topk_ip_indices_streamed_cuda(
         int(query_np.shape[0]),
-        lambda q_start, q_stop: _make_query_feature_chunk_cuda(query_np, q_start, q_stop, device=device),
+        lambda q_start, q_stop: _make_query_feature_chunk_cuda(
+            query_np,
+            q_start,
+            q_stop,
+            device=device,
+            dtype=torch.float64 if str(compute_precision) == "fp64" else torch.float32,
+        ),
         database_np,
         known_bias_np,
         int(assignment_topk),
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
         device=device,
         tracer=tracer,
         trace_args={**(trace_args or {}), "query_side_streamed": True, "database_side_resident": True},

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
+
+from hello_ot.hierarchy.records import HierarchyLevelRecord
+from hello_ot.hierarchy.completion import coarsest_level_record, refined_level_record
 import torch
 
 from hello_ot.cost import (
@@ -20,12 +22,21 @@ from hello_ot.cost import (
     scan_deferred_assignment_candidates,
     solve_leaf_by_cost,
 )
-from hello_ot.refinement.iterations import check_optimality, solve_lp, update_support
-from hello_ot.perturbation import switch_level_to_perturbed_cost as _switch_level_to_perturbed_cost
+from hello_ot.refinement.iterations import check_optimality, finish_interrupted_iteration, solve_lp, update_support
+from hello_ot.perturbation import (
+    CostPerturbationRun,
+    finish_original_problem,
+    switch_level_to_perturbed_cost as _switch_level_to_perturbed_cost,
+)
 from hello_ot.hierarchy.construction import (
     HierarchyNodeRange as _HierarchyNodeRange,
     first_child_range as _first_child_range,
     slice_node_arrays as _slice_node_arrays,
+)
+from hello_ot.hierarchy.execution import (
+    DualAssignmentResult as _DualAssignmentResult,
+    HierarchyExecution as _HierarchyExecution,
+    InitializedHierarchyLevel as _InitializedHierarchyLevel,
 )
 from hello_ot.hierarchy.plan import (
     _hierarchy_global_reorder,
@@ -41,12 +52,7 @@ from hello_ot.initialization.state import (
 from hello_ot._internal.trace import _ChromeTraceCollector
 from hello_ot._internal.runtime_context import record_solve_event
 from hello_ot.restricted_ot.runtime import extract_level_zero_summary
-from hello_ot.config import (
-    SolverRuntimeConfig,
-    StoppingNormPolicy,
-    finest_stopping_norm,
-    level_stopping_norm,
-)
+from hello_ot.config import SolverRuntimeConfig, finest_stopping_norm, level_cost_precision
 from hello_ot.state import (
     GPUWarmStartState as OTWarmStartGPUState,
     WarmStartState as OTWarmStartState,
@@ -177,84 +183,6 @@ def _print_augment_profile_before_refine(
     )
 
 
-@dataclass
-class _DualAssignmentResult:
-    state: OTWarmStartState | OTWarmStartGPUState
-    topk_stats: Dict[str, Any]
-    augment_profile: Dict[str, Any]
-    dual_completion_profile: Dict[str, Any]
-    forward_topk_stats: Dict[str, Any]
-    support_after_forward: int
-    reverse_topk_stats: Dict[str, Any]
-    support_after_reverse: Optional[int]
-
-
-@dataclass
-class _HierarchyExecution:
-    """
-    CN: hierarchy 算法之外准备好的数据与运行设施，避免其污染论文级控制流。
-    EN: Data and runtime facilities prepared outside the hierarchy algorithm so they do not pollute its paper-level control flow.
-    """
-
-    cost_context: HelloCostContext
-    source_F: np.ndarray
-    target_G: np.ndarray
-    source_cost: np.ndarray
-    target_cost: np.ndarray
-    source_mass: np.ndarray
-    target_mass: np.ndarray
-    config: SolverRuntimeConfig
-    assignment_topk: int
-    split_count: int
-    dual_feasibility_tol: float
-    stopping_norm: StoppingNormPolicy
-    tracer: Optional[_ChromeTraceCollector]
-    pricing_index_pool: Optional[Any]
-    memory_recorder: Optional[Any]
-    log: bool
-    perturbation: Any = None
-
-    def context_for(self, node: _HierarchyNodeRange) -> HelloCostContext:
-        """
-        CN: 获取当前层成本上下文，保留扰动的全局边标识。
-        EN: Get this level's cost context while preserving global perturbation identities.
-        """
-        return self.cost_context.sliced(
-            slice(node.source_start, node.source_stop),
-            slice(node.target_start, node.target_stop),
-        )
-
-    def new_reentry_detector(self) -> Any:
-        """
-        CN: 为当前原成本层建立独立检测器。
-        EN: Create an independent detector for the current original-cost level.
-        """
-        return None if self.perturbation is None else self.perturbation.new_detector()
-
-    def stopping_norm_for(self, node: _HierarchyNodeRange) -> Literal["l2", "linf"]:
-        """
-        CN: 粗层固定使用 L2；finest_linf 只将最精细层切换到 L-infinity。
-        EN: Keep coarse levels on L2; finest_linf switches only the finest level to L-infinity.
-        """
-        return level_stopping_norm(self.stopping_norm, level_index=int(node.depth))
-
-
-@dataclass
-class _InitializedHierarchyLevel:
-    node: _HierarchyNodeRange
-    arrays: Dict[str, np.ndarray]
-    state: OTWarmStartState | OTWarmStartGPUState
-    split_axis: str
-    trace_args: Dict[str, Any]
-    started_at: float
-    initialization_elapsed: float
-    support_before_solve: int
-    stitch_profile: Dict[str, Any]
-    assignment: _DualAssignmentResult
-    refinement: Any
-    refine_span: Any
-
-
 def _dual_assign_stitched_node(
     *,
     node: _HierarchyNodeRange,
@@ -281,7 +209,10 @@ def _dual_assign_stitched_node(
     # EN: The forward pass runs nodewise top-k dual assignment over the complete opposite side.
     augment_span = memory_recorder.begin_span(phase="augment", node=node, state=stitched_state) if memory_recorder is not None else None
     with (tracer.span("hello.initialization.dual_assignment", "hierarchy", args={**trace_args, "augment_pass": "forward"}) if tracer is not None else nullcontext()):
-        if cost_context.score_family == "inner_product" and str(backend) == "native":
+        if (
+            cost_context.score_family == "inner_product"
+            and str(backend) == "native"
+        ):
             parent_state, topk_stats, augment_profile, completion_candidate, forward_candidates = (
                 scan_deferred_assignment_candidates(
                     cost_context=cost_context,
@@ -583,7 +514,7 @@ def _initialize_hierarchy_level(
 def _finalize_hierarchy_level(
     initialized: _InitializedHierarchyLevel,
     *,
-    levels: List[Dict[str, Any]],
+    levels: List[HierarchyLevelRecord],
     execution: _HierarchyExecution,
 ) -> Tuple[OTWarmStartState | OTWarmStartGPUState, Dict[str, Any]]:
     """
@@ -606,65 +537,49 @@ def _finalize_hierarchy_level(
 
     level_summary = extract_level_zero_summary(node_result)
     solve_summary = {
-        "distance": float(node_result.get("distance", float("nan"))),
-        "time": float(node_result.get("time", 0.0)),
-        "lp_solve_time_total": float(node_result.get("lp_solve_time_total", 0.0)),
-        "full_scan_time": float(
-            sum(
-                float(record.get("full_scan_time", 0.0) or 0.0)
-                for record in node_result.get("warm_start_iteration_records", ())
-            )
-        ),
-        "lp_backend_peak_mem_mib": node_result.get("lp_backend_peak_mem_mib"),
-        "pricing_peak_mem_mib": node_result.get("pricing_peak_mem_mib"),
-        "dual_feas_peak_mem_mib": node_result.get("dual_feas_peak_mem_mib"),
-        "objective_trace": list(node_result.get("warm_start_iteration_records") or []),
-        "initialization": dict(node_result.get("warm_start_init") or {}),
+        'full_scan_time': float(sum(
+            record.full_scan_time for record in node_result['warm_start_iteration_records']
+        )),
+        'lp_backend_peak_mem_mib': node_result.get('lp_backend_peak_mem_mib'),
+        'pricing_peak_mem_mib': node_result.get('pricing_peak_mem_mib'),
+        'dual_feas_peak_mem_mib': node_result.get('dual_feas_peak_mem_mib'),
+        'initialization': dict(node_result.get('warm_start_init') or {}),
         **level_summary,
     }
     assignment = initialized.assignment
     support_after_solve = int(_state_support_size(final_state))
     levels.append(
-        {
-            "path": str(node.path),
-            "depth": int(node.depth),
-            "kind": "node",
-            "split_axis": initialized.split_axis,
-            "selected_child_index": 0,
-            "split_count": int(execution.split_count),
-            "augment_direction": "bidirectional",
-            "n_source": int(node.n_source),
-            "n_target": int(node.n_target),
-            "source_range": [int(node.source_start), int(node.source_stop)],
-            "target_range": [int(node.target_start), int(node.target_stop)],
-            "support_before_solve": int(initialized.support_before_solve),
-            "support_after_solve": support_after_solve,
-            "support_size": support_after_solve,
-            "initial_active_support_size": int(initialized.support_before_solve),
-            "topk_added_raw": int(assignment.topk_stats.get("cross_transfer_added_raw", 0)),
-            "topk_added_unique": int(assignment.topk_stats.get("cross_transfer_added_unique", 0)),
-            "topk_forward_added_raw": int(assignment.forward_topk_stats.get("cross_transfer_added_raw", 0)),
-            "topk_forward_support_size": int(assignment.support_after_forward),
-            "topk_reverse_added_raw": int(assignment.reverse_topk_stats.get("cross_transfer_added_raw", 0)),
-            "topk_reverse_added_unique": (
-                0
-                if assignment.support_after_reverse is None
-                else max(0, int(assignment.support_after_reverse) - int(assignment.support_after_forward))
-            ),
-            "topk_reverse_support_size": assignment.support_after_reverse,
-            "topk_bidirectional_union_support_size": assignment.support_after_reverse,
-            "local_build_time": float(
-                initialized.stitch_profile.get("total_time", 0.0)
-                + assignment.augment_profile.get("total_time", 0.0)
-                + assignment.dual_completion_profile.get("total_time", 0.0)
-            ),
-            "initialization_time": float(initialized.initialization_elapsed),
-            "time": float(time.perf_counter() - initialized.started_at),
-            "stitch_profile": initialized.stitch_profile,
-            "augment_profile": assignment.augment_profile,
-            "dual_completion_profile": assignment.dual_completion_profile,
-            "solve_summary": solve_summary,
-        }
+        refined_level_record(
+            initialized=initialized, node_result=node_result,
+            assignment_topk=int(execution.assignment_topk), support_after=support_after_solve,
+            elapsed=float(time.perf_counter() - initialized.started_at),
+            diagnostics={
+                'split_axis': initialized.split_axis,
+                'selected_child_index': 0,
+                'split_count': int(execution.split_count),
+                'augment_direction': 'bidirectional',
+                'source_range': [int(node.source_start), int(node.source_stop)],
+                'target_range': [int(node.target_start), int(node.target_stop)],
+                'initial_active_support_size': int(initialized.support_before_solve),
+                'topk_added_raw': int(assignment.topk_stats.get('cross_transfer_added_raw', 0)),
+                'topk_added_unique': int(assignment.topk_stats.get('cross_transfer_added_unique', 0)),
+                'topk_forward_added_raw': int(assignment.forward_topk_stats.get('cross_transfer_added_raw', 0)),
+                'topk_reverse_added_raw': int(assignment.reverse_topk_stats.get('cross_transfer_added_raw', 0)),
+                'topk_reverse_added_unique': (
+                    0 if assignment.support_after_reverse is None else
+                    max(0, int(assignment.support_after_reverse) - int(assignment.support_after_forward))
+                ),
+                'topk_bidirectional_union_support_size': assignment.support_after_reverse,
+                'local_build_time': float(
+                    initialized.stitch_profile.get('total_time', 0.0)
+                    + assignment.augment_profile.get('total_time', 0.0)
+                    + assignment.dual_completion_profile.get('total_time', 0.0)
+                ),
+                'stitch_profile': initialized.stitch_profile,
+                'augment_profile': assignment.augment_profile,
+                'dual_completion_profile': assignment.dual_completion_profile,
+            }, solve_diagnostics=solve_summary,
+        )
     )
     from .progress import report_level_done
 
@@ -683,7 +598,7 @@ def _solve_coarsest_level(
     *,
     node: _HierarchyNodeRange,
     execution: _HierarchyExecution,
-) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[HierarchyLevelRecord], Optional[Dict[str, Any]]]:
     """
     CN: 直接求解 hierarchy 的 coarsest 层。
     EN: Solve the coarsest hierarchy level directly.
@@ -691,7 +606,6 @@ def _solve_coarsest_level(
     from .progress import report_coarsest_done, report_level_start
 
     report_level_start(execution, node, coarsest=True)
-    t_node = time.perf_counter()
     cost_context = execution.context_for(node)
     config = execution.config
     tracer = execution.tracer
@@ -742,17 +656,12 @@ def _solve_coarsest_level(
             )
             if memory_recorder is not None:
                 memory_recorder.end_span(leaf_span, state=normalized_leaf_state)
-            level = {
-                "path": str(node.path),
-                "depth": int(node.depth),
-                "kind": "leaf",
-                "n_source": int(node.n_source),
-                "n_target": int(node.n_target),
-                "support_size": int(_state_support_size(normalized_leaf_state)),
-                "time": float(leaf_report.get("node_build_time_total", 0.0)) if isinstance(leaf_report, dict) else float(time.perf_counter() - t_node),
-                "lp_solve_time_total": _leaf_report_lp_time(leaf_report),
-                "solve_summary": dict(leaf_report.get("solve_summary") or {}),
-            }
+            level = coarsest_level_record(
+                path=str(node.path), depth=int(node.depth), n_source=int(node.n_source),
+                n_target=int(node.n_target), support_size=int(_state_support_size(normalized_leaf_state)),
+                elapsed=float(leaf_report["node_build_time_total"]),
+                solve_summary=leaf_report["solve_summary"],
+            )
             if memory_recorder is not None:
                 memory_recorder.record(phase="node_exit", node=node, state=normalized_leaf_state)
             root_result = None
@@ -760,12 +669,12 @@ def _solve_coarsest_level(
                 # CN: 当整个问题已位于 coarsest threshold 内时，leaf exact solve 就是正式最终结果。
                 # EN: When the full problem is within the coarsest threshold, the exact leaf solve is the formal final result.
                 state_cpu = _normalize_dual_assignment_state(normalized_leaf_state, pipeline="cpu")
-                leaf_solve = dict(leaf_report.get("solve_summary") or {})
+                leaf_solve = leaf_report["solve_summary"]
                 root_result = {
-                    "distance": float(leaf_solve.get("distance", float("nan"))),
-                    "time": float(leaf_solve.get("time", 0.0) or 0.0),
+                    "distance": float(leaf_solve["distance"]),
+                    "time": float(leaf_solve["time"]),
                     "lp_solve_time_total": float(
-                        leaf_solve.get("lp_solve_time_total", 0.0) or 0.0
+                        leaf_solve["lp_solve_time_total"]
                     ),
                     "level_summaries": [
                         {
@@ -773,10 +682,10 @@ def _solve_coarsest_level(
                             "n_source": int(node.n_source),
                             "n_target": int(node.n_target),
                             "iters": int(leaf_solve.get("level0_inner_iterations", 1) or 1),
-                            "time": float(leaf_solve.get("time", 0.0) or 0.0),
-                            "objective": float(leaf_solve.get("distance", float("nan"))),
+                            "time": float(leaf_solve["time"]),
+                            "objective": float(leaf_solve["distance"]),
                             "lp_time": float(
-                                leaf_solve.get("lp_solve_time_total", 0.0) or 0.0
+                                leaf_solve["lp_solve_time_total"]
                             ),
                             "pricing_time": 0.0,
                             "support_final": int(_state_support_size(state_cpu)),
@@ -797,7 +706,7 @@ def _solve_coarsest_level(
                 )
                 root_result["dual_source"] = np.asarray(state_cpu.dual_uv, dtype=np.float64)
                 root_result["warm_start_state"] = state_cpu
-            report_coarsest_done(execution, node, level)
+            report_coarsest_done(execution, node, level.to_diagnostics())
             return normalized_leaf_state, [level], root_result
         raise ValueError("_solve_coarsest_level requires a coarsest hierarchy node")
 
@@ -805,7 +714,8 @@ def _solve_hierarchy(
     *,
     root: _HierarchyNodeRange,
     execution: _HierarchyExecution,
-) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    levels_prefix: Optional[List[HierarchyLevelRecord]] = None,
+) -> Tuple[OTWarmStartState | OTWarmStartGPUState, List[HierarchyLevelRecord], Optional[Dict[str, Any]]]:
     """
     CN: 按论文顺序执行 HELLO：构造 hierarchy，在 coarsest 层求解，再逐层 initialization 与 refinement。
     EN: Execute HELLO in paper order: build the hierarchy, solve the coarsest level, then initialize and refine each finer level.
@@ -821,11 +731,18 @@ def _solve_hierarchy(
         )
         hierarchy.append(child)
 
-    state, levels, result = _solve_coarsest_level(
+    state, fresh_levels, result = _solve_coarsest_level(
         node=hierarchy[-1],
         execution=execution,
     )
-    from .progress import report_iteration, report_level_initialized, report_level_start
+    levels = list(levels_prefix or [])
+    levels.extend(fresh_levels)
+    from .progress import (
+        report_iteration,
+        report_level_initialized,
+        report_level_start,
+        report_perturbation_restart,
+    )
 
     for level in reversed(hierarchy[:-1]):
         report_level_start(execution, level)
@@ -842,11 +759,41 @@ def _solve_hierarchy(
         while iteration_index < refinement.max_iterations:
             iteration = solve_lp(refinement.runtime, iteration_index)
             certificate = check_optimality(refinement.runtime, iteration)
-            if certificate.converged:
+            if certificate.converged and not execution.perturbation.jump_probe_pending:
                 break
+            perturbation = execution.perturbation
+            if perturbation is not None and perturbation.jump_probe_pending:
+                restart = perturbation.evaluate_jump_probe(
+                    certificate.stopping_dual_feasibility
+                )
+                if restart:
+                    finish_interrupted_iteration(refinement.runtime, iteration, certificate)
+                    report_iteration(execution, refinement.runtime)
+                    state, result = _finalize_hierarchy_level(
+                        initialized,
+                        levels=levels,
+                        execution=execution,
+                    )
+                    levels[-1] = levels[-1].with_stop_reason(
+                        "dual_feasibility_jump_restart"
+                    )
+                    report_perturbation_restart(execution)
+                    return _solve_hierarchy(
+                        root=root,
+                        execution=execution,
+                        levels_prefix=levels,
+                    )
+                if certificate.converged:
+                    break
             if detector is not None and detector.should_trigger():
                 initialized = _switch_level_to_perturbed_cost(
-                    initialized, iteration, certificate, execution, levels, detector
+                    initialized,
+                    iteration,
+                    certificate,
+                    execution,
+                    levels,
+                    detector,
+                    finalize_level=_finalize_hierarchy_level,
                 )
                 refinement = initialized.refinement
                 detector = None
@@ -871,31 +818,17 @@ def _solve_hierarchy(
     return state, levels, result
 
 
-def _leaf_report_lp_time(leaf_report: Any) -> float:
-    """
-    CN: 从 HELLO leaf report 的 solve_summary 中读取 LP 时间。
-    EN: Read LP time from the solve_summary nested in an HELLO leaf report.
-    """
-    if not isinstance(leaf_report, dict):
-        return 0.0
-    solve_summary = leaf_report.get("solve_summary")
-    if not isinstance(solve_summary, dict):
-        return float(leaf_report.get("lp_solve_time_total", 0.0) or 0.0)
-    return float(solve_summary.get("lp_solve_time_total", 0.0) or 0.0)
 
 
-def _root_refinement_lp_time(root_level: Dict[str, Any]) -> float:
+def _root_refinement_lp_time(root_level: Optional[HierarchyLevelRecord]) -> float:
     """
     CN: 读取 root refinement 自身的 LP 时间，不包含其余 hierarchy 层级。
     EN: Read the root refinement's own LP time, excluding other hierarchy levels.
     """
-    solve_summary = root_level.get("solve_summary")
-    if not isinstance(solve_summary, dict):
-        return 0.0
-    return float(solve_summary.get("lp_solve_time_total", 0.0) or 0.0)
+    return 0.0 if root_level is None else root_level.lp_solve_time_total
 
 
-def _aggregate_hierarchy_lp_times(levels: List[Dict[str, Any]]) -> Dict[str, float]:
+def _aggregate_hierarchy_lp_times(levels: List[HierarchyLevelRecord]) -> Dict[str, float]:
     """
     CN: 汇总 hierarchy 中 coarsest solve 与 refinement 的 LP 时间且每层只计一次。
     EN: Sum coarsest-solve and refinement LP time across the hierarchy exactly once per level.
@@ -903,12 +836,10 @@ def _aggregate_hierarchy_lp_times(levels: List[Dict[str, Any]]) -> Dict[str, flo
     leaf_total = 0.0
     refinement_total = 0.0
     for level in levels:
-        if str(level.get("kind", "")) == "leaf":
-            leaf_total += float(level.get("lp_solve_time_total", 0.0) or 0.0)
+        if level.result.kind == "coarsest":
+            leaf_total += level.lp_solve_time_total
             continue
-        solve_summary = level.get("solve_summary")
-        if isinstance(solve_summary, dict):
-            refinement_total += float(solve_summary.get("lp_solve_time_total", 0.0) or 0.0)
+        refinement_total += level.lp_solve_time_total
     return {
         "leaf_lp_time_total": float(leaf_total),
         "refinement_lp_time_total": float(refinement_total),
@@ -916,7 +847,7 @@ def _aggregate_hierarchy_lp_times(levels: List[Dict[str, Any]]) -> Dict[str, flo
     }
 
 
-def _hierarchy_timing_summary(levels: List[Dict[str, Any]], *, hierarchy_time: float) -> Dict[str, float]:
+def _hierarchy_timing_summary(levels: List[HierarchyLevelRecord], *, hierarchy_time: float) -> Dict[str, float]:
     """
     CN: 构造 HELLO 整段 hierarchy traversal 的耗时汇总。
     EN: Build the timing summary for the complete HELLO hierarchy traversal.
@@ -1076,14 +1007,13 @@ def _solve_hello_stage(
             log=bool(progress_enabled),
         )
         t_hierarchy = time.perf_counter()
-        from .perturbation import CostPerturbationRun, finish_original_problem
-
         perturbation = CostPerturbationRun(
             policy=cost_perturbation,
             relative_scale=cost_perturbation_relative_scale,
             random_seed=node_seed,
             source_index=source_perm,
             target_index=target_perm,
+            cost_precision=str(config.cost_precision),
         )
         hierarchy_execution.perturbation = perturbation
         if cost_perturbation == "on":
@@ -1093,7 +1023,13 @@ def _solve_hello_stage(
             execution=hierarchy_execution,
         )
         if perturbation.activated:
-            root_state, root_result = finish_original_problem(root, root_state, hierarchy_execution, levels)
+            root_state, root_result = finish_original_problem(
+                root,
+                root_state,
+                hierarchy_execution,
+                levels,
+                finalize_level=_finalize_hierarchy_level,
+            )
         if root_result is None:
             raise RuntimeError("hello root node did not produce a solve result")
         perturbation.record_stage(list(levels))
@@ -1106,7 +1042,7 @@ def _solve_hello_stage(
         memory_recorder.record(phase="after_hierarchy_solve", node=root, state=root_state)
     if root_result is None:
         raise RuntimeError("hello root node did not produce a solve result.")
-    all_stage_levels = [level for stage in perturbation.stages for level in stage["levels"]]
+    all_stage_levels = [level for stage in perturbation.stages for level in stage.levels]
     hierarchy_timing = _hierarchy_timing_summary(all_stage_levels, hierarchy_time=hierarchy_time)
     root_result.update(
         {
@@ -1116,11 +1052,11 @@ def _solve_hello_stage(
         }
     )
     root_level = next(
-        (item for item in levels if int(item.get("depth", -1)) == 0 and str(item.get("path", "")) == "root"),
-        {},
+        (item for item in levels if item.result.level_index == 0 and item.path == "root"),
+        None,
     )
     root_refinement_lp_time = _root_refinement_lp_time(root_level)
-    support_before_solve = int(root_level.get("support_before_solve") or _state_support_size(root_state))
+    support_before_solve = int((root_level.support_before_solve if root_level is not None else None) or _state_support_size(root_state))
     # CN: 释放gpu显存
     # EN: Release GPU memory
     del root_state
@@ -1186,6 +1122,9 @@ def _solve_hello_stage(
                 tracer=tracer,
                 trace_prefix="hello.final_dual_feasibility_correction",
                 dot_scale=float(cost_context.dot_scale),
+                compute_precision=level_cost_precision(
+                    config.cost_precision, level_index=0
+                ),
             )
         )
         root_result["warm_start_state"] = corrected_state
@@ -1235,9 +1174,9 @@ def _solve_hello_stage(
         "total_hierarchy_solve_time": float(total_time),
         "num_leaf_subproblems": 1,
         "num_internal_nodes": int(
-            sum(1 for item in levels if str(item.get("kind")) == "node" and int(item.get("depth", 0)) > 0)
+            sum(1 for item in levels if item.result.kind == "refined" and item.result.level_index > 0)
         ),
-        "levels": levels,
+        "levels": [level.to_diagnostics() for level in levels],
         "shuffle_once": {
             "source_perm_size": int(source_perm.size),
             "target_perm_size": int(target_perm.size),
@@ -1249,6 +1188,7 @@ def _solve_hello_stage(
         "requested_hierarchy_depth": str(depth_remaining),
     }
     root_result["hello_diagnostics"] = dict(diagnostics)
+    root_result["hierarchy_levels"] = tuple(levels)
     return _standard_output_from_log_result(
         root_result,
         log=bool(log),

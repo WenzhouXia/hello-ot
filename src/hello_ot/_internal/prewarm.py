@@ -61,7 +61,7 @@ def prewarm_hierarchy_cold_paths(
             info["stages"][name] = stage_info
 
     def _prewarm_numba_support() -> dict[str, Any]:
-        from hello_ot._internal.core.solver import _northwest_corner_numba
+        from hello_ot._internal.support_kernels import _northwest_corner_numba
         nw_rows, nw_cols = _northwest_corner_numba(
             np.asarray([0.5, 0.5], dtype=np.float64),
             np.asarray([0.25, 0.75], dtype=np.float64),

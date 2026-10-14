@@ -16,6 +16,7 @@ def test_public_surface_is_small_and_flat() -> None:
         "Result",
         "SemiDiscreteResult",
         "SolverOptions",
+        "UOTConvergenceBounds",
         "UnbalancedResult",
         "prewarm",
         "solve",
@@ -67,6 +68,23 @@ def test_problem_input_rejects_repeated_problem_data(monkeypatch: pytest.MonkeyP
         hello_ot.solve(problem, cost="l2^2")
 
 
+@pytest.mark.parametrize(
+    "mass",
+    [
+        np.asarray([0.0, 1.0]),
+        np.asarray([-0.1, 1.1]),
+        np.asarray([np.nan, 1.0]),
+        np.asarray([np.inf, 1.0]),
+    ],
+)
+def test_problem_requires_strictly_positive_finite_masses(mass: np.ndarray) -> None:
+    points = np.zeros((2, 1), dtype=np.float32)
+    with pytest.raises(ValueError, match="strictly positive"):
+        hello_ot.Problem(points, points, "l2^2", source_mass=mass)
+    with pytest.raises(ValueError, match="strictly positive"):
+        hello_ot.Problem(points, points, "l2^2", target_mass=mass)
+
+
 def test_advanced_options_are_flat() -> None:
     options = hello_ot.SolverOptions(assignment_topk=8, support_budget_factor=6.0)
     config = options._to_internal_config(max_iterations=12, random_seed=7)
@@ -109,3 +127,17 @@ def test_finest_linf_stopping_schedule() -> None:
     assert level_stopping_norm("l2", level_index=3) == "l2"
     assert level_stopping_norm("finest_linf", level_index=0) == "linf"
     assert level_stopping_norm("finest_linf", level_index=1) == "l2"
+
+
+def test_cost_precision_public_choices_and_schedule() -> None:
+    from hello_ot.config import level_cost_precision
+
+    assert hello_ot.SolverOptions().cost_precision == "fp32"
+    for value in ("fp32", "fp64", "finest_fp64"):
+        assert hello_ot.SolverOptions(cost_precision=value).cost_precision == value
+    with pytest.raises(ValueError, match="cost_precision"):
+        hello_ot.SolverOptions(cost_precision="auto")  # type: ignore[arg-type]
+    assert level_cost_precision("fp32", level_index=0) == "fp32"
+    assert level_cost_precision("fp64", level_index=3) == "fp64"
+    assert level_cost_precision("finest_fp64", level_index=0) == "fp64"
+    assert level_cost_precision("finest_fp64", level_index=1) == "fp32"

@@ -180,8 +180,9 @@ __global__ void update_stats_only_kernel(
 }
 
 
+template <typename DotT>
 __global__ void update_raw_lowrank_stats_only_kernel(
-        const float* __restrict__ scores,
+        const DotT* __restrict__ scores,
         int64_t score_ld,
         int64_t q_offset,
         int64_t db_offset,
@@ -209,15 +210,15 @@ __global__ void update_raw_lowrank_stats_only_kernel(
     for (int64_t idx = thread; idx < total_count; idx += stride) {
         int64_t row = idx / db_count;
         int64_t col = idx - row * db_count;
-        float dot = scores[row * score_ld + col];
+        DotT dot = scores[row * score_ld + col];
         double cost_d = query_cost[q_offset + row] + db_cost[db_offset + col] - static_cast<double>(dot);
-        double reduced_cost = query_dual[q_offset + row] + db_dual[db_offset + col] - cost_d;
+        double dual_score = query_dual[q_offset + row] + db_dual[db_offset + col] - cost_d;
         den_sum += cost_d * cost_d;
         cost_linf = fmax(cost_linf, fabs(cost_d));
-        if (reduced_cost > 0.0) {
-            num_sum += reduced_cost * reduced_cost;
+        if (dual_score > 0.0) {
+            num_sum += dual_score * dual_score;
             ++pos_count;
-            max_violation = fmax(max_violation, reduced_cost);
+            max_violation = fmax(max_violation, dual_score);
         }
     }
 
@@ -252,6 +253,55 @@ __global__ void update_raw_lowrank_stats_only_kernel(
 
 void check_cublas(cublasStatus_t status, const char* what) {
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cuBLAS status ", static_cast<int>(status));
+}
+
+template <typename DotT>
+void raw_gemm_dot_tile(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const DotT* db_ptr,
+        const DotT* query_ptr,
+        DotT* dot_ptr);
+
+template <>
+void raw_gemm_dot_tile<float>(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const float* db_ptr,
+        const float* query_ptr,
+        float* dot_ptr) {
+    const float alpha = static_cast<float>(dot_scale);
+    const float beta = 0.0f;
+    check_cublas(cublasSgemm(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            static_cast<int>(cur_db), static_cast<int>(cur_q), static_cast<int>(dim),
+            &alpha, db_ptr, static_cast<int>(dim), query_ptr, static_cast<int>(dim),
+            &beta, dot_ptr, static_cast<int>(cur_db)), "cublasSgemm");
+}
+
+template <>
+void raw_gemm_dot_tile<double>(
+        cublasHandle_t handle,
+        int64_t cur_db,
+        int64_t cur_q,
+        int64_t dim,
+        double dot_scale,
+        const double* db_ptr,
+        const double* query_ptr,
+        double* dot_ptr) {
+    const double alpha = dot_scale;
+    const double beta = 0.0;
+    check_cublas(cublasDgemm(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            static_cast<int>(cur_db), static_cast<int>(cur_q), static_cast<int>(dim),
+            &alpha, db_ptr, static_cast<int>(dim), query_ptr, static_cast<int>(dim),
+            &beta, dot_ptr, static_cast<int>(cur_db)), "cublasDgemm");
 }
 
 } // namespace
@@ -328,7 +378,8 @@ torch::Tensor fused_stats_only_cuda(
     return stats;
 }
 
-torch::Tensor raw_lowrank_stats_only_cuda(
+template <typename DotT>
+torch::Tensor raw_lowrank_stats_only_cuda_t(
         torch::Tensor query_feat,
         torch::Tensor db_feat,
         torch::Tensor query_cost,
@@ -352,44 +403,25 @@ torch::Tensor raw_lowrank_stats_only_cuda(
     const int64_t q_tile = std::min<int64_t>(query_tile, n_query);
     const int64_t d_tile = std::min<int64_t>(db_tile, n_db);
 
-    auto float_opts = query_feat.options().dtype(torch::kFloat32);
     auto double_opts = query_feat.options().dtype(torch::kFloat64);
 
-    torch::Tensor scores = torch::empty({q_tile, d_tile}, float_opts);
+    torch::Tensor scores = torch::empty({q_tile, d_tile}, query_feat.options());
     torch::Tensor stats = torch::empty({5}, double_opts);
     init_stats_kernel<<<1, 1, 0, stream.stream()>>>(stats.data_ptr<double>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    const float alpha = static_cast<float>(dot_scale);
-    const float beta = 0.0f;
     for (int64_t q0 = 0; q0 < n_query; q0 += q_tile) {
         int64_t cur_q = std::min<int64_t>(q_tile, n_query - q0);
-        const float* q_ptr = query_feat.data_ptr<float>() + q0 * dim;
+        const DotT* q_ptr = query_feat.data_ptr<DotT>() + q0 * dim;
         for (int64_t d0 = 0; d0 < n_db; d0 += d_tile) {
             int64_t cur_db = std::min<int64_t>(d_tile, n_db - d0);
-            const float* db_ptr = db_feat.data_ptr<float>() + d0 * dim;
-            float* score_ptr = scores.data_ptr<float>();
-            check_cublas(
-                    cublasSgemm(
-                            handle,
-                            CUBLAS_OP_T,
-                            CUBLAS_OP_N,
-                            static_cast<int>(cur_db),
-                            static_cast<int>(cur_q),
-                            static_cast<int>(dim),
-                            &alpha,
-                            db_ptr,
-                            static_cast<int>(dim),
-                            q_ptr,
-                            static_cast<int>(dim),
-                            &beta,
-                            score_ptr,
-                            static_cast<int>(cur_db)),
-                    "cublasSgemm");
+            const DotT* db_ptr = db_feat.data_ptr<DotT>() + d0 * dim;
+            DotT* score_ptr = scores.data_ptr<DotT>();
+            raw_gemm_dot_tile<DotT>(handle, cur_db, cur_q, dim, dot_scale, db_ptr, q_ptr, score_ptr);
 
             int64_t total_count = cur_q * cur_db;
             int64_t blocks = std::min<int64_t>(1024, (total_count + kThreads - 1) / kThreads);
-            update_raw_lowrank_stats_only_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, stream.stream()>>>(
+            update_raw_lowrank_stats_only_kernel<DotT><<<static_cast<unsigned int>(blocks), kThreads, 0, stream.stream()>>>(
                     score_ptr,
                     cur_db,
                     q0,
@@ -406,4 +438,24 @@ torch::Tensor raw_lowrank_stats_only_cuda(
     }
     check_cublas(cublasSetMathMode(handle, previous_math_mode), "cublasSetMathMode restore");
     return stats;
+}
+
+torch::Tensor raw_lowrank_stats_only_cuda(
+        torch::Tensor query_feat,
+        torch::Tensor db_feat,
+        torch::Tensor query_cost,
+        torch::Tensor db_cost,
+        torch::Tensor query_dual,
+        torch::Tensor db_dual,
+        int64_t query_tile,
+        int64_t db_tile,
+        double dot_scale) {
+    if (query_feat.scalar_type() == torch::kFloat32) {
+        return raw_lowrank_stats_only_cuda_t<float>(
+                query_feat, db_feat, query_cost, db_cost, query_dual, db_dual,
+                query_tile, db_tile, dot_scale);
+    }
+    return raw_lowrank_stats_only_cuda_t<double>(
+            query_feat, db_feat, query_cost, db_cost, query_dual, db_dual,
+            query_tile, db_tile, dot_scale);
 }

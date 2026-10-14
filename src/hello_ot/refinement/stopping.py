@@ -41,10 +41,19 @@ def _load_cuda_cpp_dual_feasibility_extension() -> Any:
         raise RuntimeError(_CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR) from exc
 
 
-def _cuda_float32_tensor(data: Any, device: torch.device) -> torch.Tensor:
+def _cuda_feature_tensor(
+    data: Any, device: torch.device, *, compute_precision: str
+) -> torch.Tensor:
+    """
+    CN: 将 FP32 存储的 feature 转为本次扫描选择的 CUDA 计算精度。
+    EN: Convert FP32-stored features to the CUDA arithmetic precision selected for this scan.
+    """
+    if compute_precision not in {"fp32", "fp64"}:
+        raise ValueError("compute_precision must be one of: fp32, fp64")
+    dtype = torch.float64 if compute_precision == "fp64" else torch.float32
     if torch.is_tensor(data):
-        return data.to(device=device, dtype=torch.float32).contiguous()
-    return torch.as_tensor(data, dtype=torch.float32, device=device).contiguous()
+        return data.to(device=device, dtype=dtype).contiguous()
+    return torch.as_tensor(data, dtype=dtype, device=device).contiguous()
 
 
 def _cuda_float64_tensor(data: Any, device: torch.device) -> torch.Tensor:
@@ -91,6 +100,7 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
     gpu_id: int | None = None,
     diagnostics: Dict[str, Any] | None = None,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> float:
     """
     CN: 使用 raw feature/cost/dual 的 CUDA C++ streaming 扫描，避免同时构造 source/target augmented feature。
@@ -100,6 +110,9 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA C++ lowrank dual feasibility requires CUDA to be available.")
+    if compute_precision not in {"fp32", "fp64"}:
+        raise ValueError("compute_precision must be one of: fp32, fp64")
+    feature_itemsize = 8 if compute_precision == "fp64" else 4
     source_shape = _data_shape(source_F)
     target_shape = _data_shape(target_G)
     if len(source_shape) != 2 or len(target_shape) != 2:
@@ -121,7 +134,7 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
     memory_plan = plan_resident_side(
         source_count=int(n_source),
         target_count=int(n_target),
-        feature_dim=int(source_dim),
+        feature_dim=int(source_dim * feature_itemsize // 4),
         topk_bucket=1,
         available_bytes=int(available_bytes),
         driver_free_bytes=int(driver_free_bytes),
@@ -154,7 +167,9 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
             }
         )
 
-    resident_feat = _cuda_float32_tensor(resident_feat_data, device)
+    resident_feat = _cuda_feature_tensor(
+        resident_feat_data, device, compute_precision=compute_precision
+    )
     resident_cost = _cuda_float64_tensor(resident_cost_data, device).view(-1)
     resident_dual = _cuda_float64_tensor(resident_dual_data, device).view(-1)
     n_stream = n_target if source_is_resident else n_source
@@ -170,7 +185,8 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
             {
                 "chunk_rows": int(chunk_rows),
                 "full_feature_rows": int(full_feature_rows),
-                "full_feature_mem_mib": float(full_feature_rows) * float(source_dim) * 4.0 / float(1024 * 1024),
+                "full_feature_mem_mib": float(full_feature_rows) * float(source_dim) * float(feature_itemsize) / float(1024 * 1024),
+                "compute_precision": str(compute_precision),
             }
         )
     total_stats = torch.zeros((5,), dtype=torch.float64, device=device)
@@ -178,7 +194,11 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
 
     for chunk_start in range(0, n_stream, chunk_rows):
         chunk_end = min(n_stream, chunk_start + chunk_rows)
-        stream_feat = _cuda_float32_tensor(_row_slice(stream_feat_data, chunk_start, chunk_end), device)
+        stream_feat = _cuda_feature_tensor(
+            _row_slice(stream_feat_data, chunk_start, chunk_end),
+            device,
+            compute_precision=compute_precision,
+        )
         stream_cost = _cuda_float64_tensor(_row_slice(stream_cost_data, chunk_start, chunk_end), device).view(-1)
         stream_dual = _cuda_float64_tensor(_row_slice(stream_dual_data, chunk_start, chunk_end), device).view(-1)
         stats = ext.raw_lowrank_stats_only(
@@ -228,6 +248,7 @@ def lowrank_dual_feasibility_infeasibility(
     gpu_id: int | None = None,
     diagnostics: Dict[str, Any] | None = None,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Any:
     """
     CN: 用 CUDA C++ 精确扫描 lowrank 完整问题，计算 L2-style 相对 dual feasibility 违反量。
@@ -245,6 +266,7 @@ def lowrank_dual_feasibility_infeasibility(
         gpu_id=gpu_id,
         diagnostics=diagnostics,
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
     )
 
 

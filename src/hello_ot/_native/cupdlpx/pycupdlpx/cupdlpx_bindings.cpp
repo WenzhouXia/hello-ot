@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <chrono>
+#include <memory>
 
 #include <cuda_runtime.h>
 
@@ -265,6 +266,40 @@ static void copy_to_host(double *h_dst, const double *src, size_t n)
     // 当作 Host 指针
     std::memcpy(h_dst, src, n * sizeof(double));
   }
+}
+
+// CN: 输出由 PyTorch 拥有；复制设备数据后可立即释放 native solver state。
+// EN: PyTorch owns exports, allowing the native solver state to be freed immediately.
+static py::object export_device_buffer(const double *src, int n, const double *scale, double alpha)
+{
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, src) != cudaSuccess)
+    throw std::runtime_error("Cannot determine solution CUDA device");
+  py::object torch = py::module_::import("torch");
+  py::object output = torch.attr("empty")(n, py::arg("dtype") = torch.attr("float64"),
+                                        py::arg("device") = "cuda:" + std::to_string(attr.device));
+  auto ptr = reinterpret_cast<double *>(output.attr("data_ptr")().cast<std::uintptr_t>());
+  // CN: 在调用者的 PyTorch stream 上复制，避免非默认 stream 的 allocator 复用竞争。
+  // EN: Copy on the caller's PyTorch stream to respect allocator reuse on non-default streams.
+  auto stream = reinterpret_cast<cudaStream_t>(torch.attr("cuda").attr("current_stream")(attr.device)
+      .attr("cuda_stream").cast<std::uintptr_t>());
+  int previous_device = 0;
+  cudaGetDevice(&previous_device);
+  cudaSetDevice(attr.device);
+  cudaError_t copied = cudaMemcpyAsync(ptr, src, size_t(n) * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+  if (copied == cudaSuccess) copied = cudaStreamSynchronize(stream);
+  cudaSetDevice(previous_device);
+  if (copied != cudaSuccess)
+    throw std::runtime_error("CUDA solution export failed");
+  if (scale != nullptr) {
+    py::object divisor = export_device_buffer(scale, n, nullptr, 1.0);
+    divisor.attr("masked_fill_")(divisor.attr("eq")(0), 1.0);
+    divisor.attr("mul_")(alpha);
+    output.attr("div_")(divisor);
+  } else if (alpha != 1.0) {
+    output.attr("div_")(alpha);
+  }
+  return output;
 }
 
 static py::array_t<double> export_unscaled_primal_buffer(
@@ -1068,6 +1103,15 @@ public:
     bool return_x = true;       // NEW
     bool return_y = true;       // NEW
     bool do_unscale = true;     // NEW
+    const std::string return_device = user_params.contains("return_device") ? user_params["return_device"].cast<std::string>() : "cpu";
+    if (return_device != "cpu" && return_device != "cuda")
+      throw std::invalid_argument("return_device must be cpu or cuda");
+    const bool gpu_output = return_device == "cuda";
+    if (gpu_output && !device_problem_loaded_)
+      throw std::invalid_argument("CUDA output requires a device LP");
+    gpu_x_cache_ = py::none();
+    gpu_y_cache_ = py::none();
+    std::vector<py::object> continuation_owners;
 
     if (user_params.contains("print_summary"))
       print_summary = user_params["print_summary"].cast<bool>();
@@ -1174,6 +1218,16 @@ public:
       {
         if (!cont.contains(k) || cont[k].is_none())
           return;
+        if (is_torch_tensor(cont[k])) {
+          py::object owner;
+          const int dev = require_cuda_tensor(cont[k], k, owner, 1, "torch.float64", {expected_size});
+          if (!device_problem_loaded_ || dev != device_ordinal_)
+            throw std::invalid_argument("continuation tensors must match the device LP");
+          ptr_out = reinterpret_cast<const double *>(owner.attr("data_ptr")().cast<std::uintptr_t>());
+          continuation_owners.push_back(owner);
+          has_out = true;
+          return;
+        }
         py::array_t<double, py::array::c_style | py::array::forcecast> arr = cont[k].cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
         if ((int)arr.size() != expected_size)
         {
@@ -1228,7 +1282,16 @@ public:
       {
         params.initial_dual_unscaled = static_cast<const double *>(y0_buf_.data());
       }
+      if (!x0_device_.is_none())
+        params.initial_primal_unscaled = reinterpret_cast<const double *>(x0_device_.attr("data_ptr")().cast<std::uintptr_t>());
+      if (!y0_device_.is_none())
+        params.initial_dual_unscaled = reinterpret_cast<const double *>(y0_device_.attr("data_ptr")().cast<std::uintptr_t>());
     }
+
+    if (gpu_output && params.trace_enabled)
+      throw std::invalid_argument("GPU output does not support host iterate snapshots");
+    if (gpu_output || !x0_device_.is_none() || !y0_device_.is_none() || !continuation_owners.empty())
+      py::module_::import("torch").attr("cuda").attr("synchronize")(device_ordinal_);
 
     // ---- 求解 ----
     auto t_opt0 = clk::now();
@@ -1261,6 +1324,11 @@ public:
     if (!state)
       throw std::runtime_error("cuPDLPx optimize() failed.");
 
+    // CN: GPU 导出异常时也释放工作区；CPU 兼容路径保留既有生命周期。
+    // EN: Free workspace even if GPU export throws; preserve the existing CPU lifecycle.
+    auto gpu_state_guard = std::unique_ptr<pdhg_solver_state_t, decltype(&pdhg_solver_state_free)>(
+        gpu_output ? state : nullptr, &pdhg_solver_state_free);
+
     // ---- 可选打印（避免把大打印算进 Python 的 solve 计时）----
     auto t_prn0 = clk::now();
     if (print_summary)
@@ -1271,17 +1339,17 @@ public:
 
     // ---- D→H：拷到缓存（只拷贝一次）----
     auto t_d2h0 = clk::now();
-    x_cache_.assign((size_t)n_, 0.0);
-    y_cache_.assign((size_t)m_, 0.0);
+    x_cache_.assign(gpu_output ? 0 : (size_t)n_, 0.0);
+    y_cache_.assign(gpu_output ? 0 : (size_t)m_, 0.0);
 
-    if (return_x)
+    if (return_x && !gpu_output)
       copy_to_host(x_cache_.data(), state->pdhg_primal_solution, (size_t)n_);
-    if (return_y)
+    if (return_y && !gpu_output)
       copy_to_host(y_cache_.data(), state->pdhg_dual_solution, (size_t)m_);
 
     std::vector<double> svar, scon;
     double alpha_x = 1.0, alpha_y = 1.0;
-    if (do_unscale)
+    if (do_unscale && !gpu_output)
     {
       if (return_x)
       {
@@ -1304,7 +1372,7 @@ public:
 
     // ---- 原地 unscale（避免再复制一遍）----
     auto t_uns0 = clk::now();
-    if (do_unscale)
+    if (do_unscale && !gpu_output)
     {
       if (return_x)
       {
@@ -1363,10 +1431,21 @@ public:
     continuation_state["enabled"] = true;
     continuation_state["reuse_step_size"] = true;
     continuation_state["apply_restart_on_entry"] = true;
-    continuation_state["anchor_primal_unscaled"] = export_unscaled_primal_buffer(state, state->initial_primal_solution);
-    continuation_state["anchor_dual_unscaled"] = export_unscaled_dual_buffer(state, state->initial_dual_solution);
-    continuation_state["current_primal_unscaled"] = export_unscaled_primal_buffer(state, state->pdhg_primal_solution);
-    continuation_state["current_dual_unscaled"] = export_unscaled_dual_buffer(state, state->pdhg_dual_solution);
+    if (gpu_output) {
+      const double ax = state->constraint_bound_rescaling == 0.0 ? 1.0 : state->constraint_bound_rescaling;
+      const double ay = state->objective_vector_rescaling == 0.0 ? 1.0 : state->objective_vector_rescaling;
+      continuation_state["anchor_primal_unscaled"] = export_device_buffer(state->initial_primal_solution, n_, state->variable_rescaling, ax);
+      continuation_state["anchor_dual_unscaled"] = export_device_buffer(state->initial_dual_solution, m_, state->constraint_rescaling, ay);
+      continuation_state["current_primal_unscaled"] = export_device_buffer(state->pdhg_primal_solution, n_, state->variable_rescaling, ax);
+      continuation_state["current_dual_unscaled"] = export_device_buffer(state->pdhg_dual_solution, m_, state->constraint_rescaling, ay);
+      if (return_x) gpu_x_cache_ = do_unscale ? py::reinterpret_borrow<py::object>(continuation_state["current_primal_unscaled"]) : export_device_buffer(state->pdhg_primal_solution, n_, nullptr, 1.0);
+      if (return_y) gpu_y_cache_ = do_unscale ? py::reinterpret_borrow<py::object>(continuation_state["current_dual_unscaled"]) : export_device_buffer(state->pdhg_dual_solution, m_, nullptr, 1.0);
+    } else {
+      continuation_state["anchor_primal_unscaled"] = export_unscaled_primal_buffer(state, state->initial_primal_solution);
+      continuation_state["anchor_dual_unscaled"] = export_unscaled_dual_buffer(state, state->initial_dual_solution);
+      continuation_state["current_primal_unscaled"] = export_unscaled_primal_buffer(state, state->pdhg_primal_solution);
+      continuation_state["current_dual_unscaled"] = export_unscaled_dual_buffer(state, state->pdhg_dual_solution);
+    }
     continuation_state["step_size"] = state->step_size;
     continuation_state["primal_weight"] = state->primal_weight;
     continuation_state["primal_weight_error_sum"] = state->primal_weight_error_sum;
@@ -1387,7 +1466,9 @@ public:
 
     // ---- 零拷贝包装 numpy（直接引用 x_cache_/y_cache_）----
     auto t_wrap0 = clk::now();
-    if (return_x)
+    if (gpu_output) {
+      out["x"] = gpu_x_cache_;
+    } else if (return_x)
     {
       // shape=(n_,), strides=(sizeof(double),)
       py::array_t<double> x({(py::ssize_t)n_}, {(py::ssize_t)sizeof(double)}, x_cache_.data(), py::none());
@@ -1399,7 +1480,9 @@ public:
       x_cache_.clear();
       x_cache_.shrink_to_fit();
     }
-    if (return_y)
+    if (gpu_output) {
+      out["y"] = gpu_y_cache_;
+    } else if (return_y)
     {
       py::array_t<double> y({(py::ssize_t)m_}, {(py::ssize_t)sizeof(double)}, y_cache_.data(), py::none());
       out["y"] = std::move(y);
@@ -1472,7 +1555,10 @@ public:
     dual_step_cache_ = 0.0;
     last_restart_iter_cache_ = -1;
 
-    if (g_free_mode == 0 || g_free_mode == 1)
+    if (gpu_output) {
+      gpu_state_guard.reset();
+      state = nullptr;
+    } else if (g_free_mode == 0 || g_free_mode == 1)
     {
       if (state)
         pdhg_solver_state_free(state);
@@ -1540,6 +1626,12 @@ public:
     d["DualStep"] = dual_step_cache_;                // 0.0 仅占位，不做推断
     d["Beta"] = beta_cache_;                         // 直接来自 params.reflection_coefficient
 
+    if (!gpu_x_cache_.is_none() || !gpu_y_cache_.is_none()) {
+      d["x"] = gpu_x_cache_;
+      d["y"] = gpu_y_cache_;
+      return d;
+    }
+
     // 返回最近一次解向量（如果没有求解过则返回 None）
     // ---------- x: always return a 1D numpy array ----------
     {
@@ -1582,9 +1674,15 @@ public:
 
     x0_buf_ = py::array_t<double>();
     y0_buf_ = py::array_t<double>();
+    x0_device_ = py::none();
+    y0_device_ = py::none();
     has_init_iterate_ = false;
 
-    if (!x0_obj.is_none())
+    if (is_torch_tensor(x0_obj)) {
+      const int dev = require_cuda_tensor(x0_obj, "x0", x0_device_, 1, "torch.float64", {n_});
+      if (!device_problem_loaded_ || dev != device_ordinal_) throw std::invalid_argument("x0 must match the device LP");
+      has_init_iterate_ = true;
+    } else if (!x0_obj.is_none())
     {
       auto x0 = x0_obj.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
       if ((int)x0.size() != n_)
@@ -1594,7 +1692,11 @@ public:
       x0_buf_ = x0; // 保存以保证生命周期贯穿 solve()
       has_init_iterate_ = true;
     }
-    if (!y0_obj.is_none())
+    if (is_torch_tensor(y0_obj)) {
+      const int dev = require_cuda_tensor(y0_obj, "y0", y0_device_, 1, "torch.float64", {m_});
+      if (!device_problem_loaded_ || dev != device_ordinal_) throw std::invalid_argument("y0 must match the device LP");
+      has_init_iterate_ = true;
+    } else if (!y0_obj.is_none())
     {
       auto y0 = y0_obj.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
       if ((int)y0.size() != m_)
@@ -1647,6 +1749,8 @@ private:
   py::array_t<double> x0_buf_;
   py::array_t<double> y0_buf_;
   bool has_init_iterate_ = false;
+  py::object x0_device_ = py::none(), y0_device_ = py::none();
+  py::object gpu_x_cache_ = py::none(), gpu_y_cache_ = py::none();
   py::object d_row_ptr_owner_ = py::none();
   py::object d_col_idx_owner_ = py::none();
   py::object d_val_owner_ = py::none();
@@ -1964,6 +2068,7 @@ static void set_free_mode(int mode)
 // ====== PYBIND11 ======
 PYBIND11_MODULE(pycupdlpx, m)
 {
+  m.attr("GPU_ARRAY_IO_VERSION") = 1;
   m.doc() = "Python bindings for cuPDLPx (direct CSC input, safe device->host copy, unscale)";
 
   py::class_<CupdlpxHolder>(m, "cupdlpx")

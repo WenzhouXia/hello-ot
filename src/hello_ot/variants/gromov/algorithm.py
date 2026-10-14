@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -12,6 +12,7 @@ from hello_ot.variants._balanced import (
     inherited_dual_from_state,
     solve_bilinear_subproblem,
 )
+from hello_ot.variants._validation import matrix, probability_mass
 
 from .initialization import build_lower_bound_sparse_init_coupling
 from .moments import (
@@ -19,36 +20,10 @@ from .moments import (
     compute_sqeuclidean_gw_static_terms,
     linearized_sqeuclidean_gw_factors,
 )
-from .types import GromovResult
+from .types import GromovIterationRecord, GromovResult
 
 
-ProgressCallback = Callable[[Mapping[str, Any]], None]
-
-
-def _matrix(value: Any, *, name: str) -> np.ndarray:
-    array = np.asarray(value, dtype=np.float32)
-    if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] < 1:
-        raise ValueError(f"{name} must be a non-empty 2D array")
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must contain only finite values")
-    return np.ascontiguousarray(array, dtype=np.float32)
-
-
-def _probability_mass(value: Any | None, *, size: int, name: str) -> np.ndarray:
-    """
-    CN: 校验概率测度；必须为非负、和为 1 的归一化分布，不静默修改。
-    EN: Validate probability mass; must be nonnegative and sum to 1, no silent modification.
-    """
-    if value is None:
-        return np.full(int(size), 1.0 / float(size), dtype=np.float64)
-    mass = np.ascontiguousarray(np.asarray(value, dtype=np.float64).reshape(-1))
-    if mass.size != int(size):
-        raise ValueError(f"{name} must have length {size}")
-    if np.any(mass < 0.0) or not np.all(np.isfinite(mass)):
-        raise ValueError(f"{name} must be finite and nonnegative")
-    if not np.isclose(float(mass.sum()), 1.0, rtol=1e-7, atol=1e-10):
-        raise ValueError(f"{name} must sum to 1; HELLO does not silently normalize input masses")
-    return mass
+ProgressCallback = Callable[[GromovIterationRecord], None]
 
 
 def solve_gromov(
@@ -70,13 +45,13 @@ def solve_gromov(
 
     # CN: 1. 严格输入校验
     # EN: 1. Strict input validation
-    src_pts = _matrix(source_points, name="source_points")
-    tgt_pts = _matrix(target_points, name="target_points")
+    src_pts = matrix(source_points, name="source_points")
+    tgt_pts = matrix(target_points, name="target_points")
     n_source = int(src_pts.shape[0])
     n_target = int(tgt_pts.shape[0])
 
-    src_mass = _probability_mass(source_mass, size=n_source, name="source_mass")
-    tgt_mass = _probability_mass(target_mass, size=n_target, name="target_mass")
+    src_mass = probability_mass(source_mass, size=n_source, name="source_mass")
+    tgt_mass = probability_mass(target_mass, size=n_target, name="target_mass")
 
     if int(max_iterations) < 1:
         raise ValueError("max_iterations must be at least 1")
@@ -92,7 +67,7 @@ def solve_gromov(
     current_obj = compute_sqeuclidean_gw_objective(static_terms, src_mass, tgt_mass, current_coupling)
 
     backend_warm_start = None
-    records = []
+    records: list[GromovIterationRecord] = []
     converged = False
     iterations_run = 0
     last_subproblem = None
@@ -143,13 +118,13 @@ def solve_gromov(
         current_coupling = next_coupling
         current_obj = next_obj
 
-        rec = {
-            "iteration": int(outer_iter + 1),
-            "wall_time": float(time.perf_counter() - t_iter),
-            "objective": float(current_obj),
-            "relative_objective_change": rel_change,
-            "sparse_nnz": int(current_coupling.nnz),
-        }
+        rec = GromovIterationRecord(
+            iteration=int(outer_iter + 1),
+            wall_time=float(time.perf_counter() - t_iter),
+            objective=float(current_obj),
+            relative_objective_change=rel_change,
+            sparse_nnz=int(current_coupling.nnz),
+        )
         records.append(rec)
         if progress_callback is not None:
             progress_callback(rec)

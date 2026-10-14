@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from ..core.hierarchical_solver import HierarchicalOTSolver
+    from ..core.solver import HierarchicalOTSolver
 
 
 @dataclass

@@ -9,6 +9,7 @@ import numpy as np
 from hello_ot.config import SolverOptions
 from hello_ot.types import DualPotentials
 from hello_ot.variants._balanced import algorithm_config, solve_bilinear_subproblem
+from hello_ot.variants._validation import matrix, probability_mass
 
 from .distributions import (
     CudaStandardNormalWorkspace,
@@ -18,32 +19,10 @@ from .distributions import (
     resolve_sampler,
     standard_normal,
 )
-from .types import SemiDiscreteResult
+from .types import SemiDiscreteIterationRecord, SemiDiscreteResult
 
 
 ProgressCallback = Callable[[Mapping[str, Any]], None]
-
-
-def _matrix(value: Any, *, name: str) -> np.ndarray:
-    array = np.asarray(value, dtype=np.float32)
-    if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] < 1:
-        raise ValueError(f"{name} must be a non-empty 2D array")
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must contain only finite values")
-    return np.ascontiguousarray(array, dtype=np.float32)
-
-
-def _probability_mass(value: Any | None, *, size: int, name: str) -> np.ndarray:
-    if value is None:
-        return np.full(int(size), 1.0 / float(size), dtype=np.float64)
-    mass = np.ascontiguousarray(np.asarray(value, dtype=np.float64).reshape(-1))
-    if mass.size != int(size):
-        raise ValueError(f"{name} must have length {size}")
-    if np.any(mass < 0.0) or not np.all(np.isfinite(mass)):
-        raise ValueError(f"{name} must be finite and nonnegative")
-    if not np.isclose(float(mass.sum()), 1.0, rtol=1e-7, atol=1e-10):
-        raise ValueError(f"{name} must sum to 1; HELLO does not normalize explicit masses")
-    return mass
 
 
 def _center_dual(value: Any) -> np.ndarray:
@@ -53,7 +32,7 @@ def _center_dual(value: Any) -> np.ndarray:
 
 
 def _sqeuclidean_factors(points: Any) -> tuple[np.ndarray, np.ndarray]:
-    array = _matrix(points, name="source sample")
+    array = matrix(points, name="source sample")
     factors = np.empty_like(array)
     np.multiply(array, np.float32(math.sqrt(2.0)), out=factors)
     offsets = np.einsum("ij,ij->i", array, array, dtype=np.float32, optimize=False)
@@ -84,7 +63,7 @@ def solve_semidiscrete(
     CN: source_distribution 默认为维数匹配 target 的单位高斯分布。
     EN: source_distribution defaults to a standard Gaussian matching the target dimension.
     """
-    target = _matrix(target_points, name="target_points")
+    target = matrix(target_points, name="target_points")
     n_target, dimension = map(int, target.shape)
     repeats = int(num_repeats)
     if repeats < 1:
@@ -107,8 +86,8 @@ def solve_semidiscrete(
     if source_distribution is not None and sampling_backend == "cuda":
         raise ValueError("CUDA sampling currently supports only the default standard Gaussian")
 
-    target_weights = _probability_mass(target_mass, size=n_target, name="target_mass")
-    source_weights = _probability_mass(source_mass, size=sample_count, name="source_mass")
+    target_weights = probability_mass(target_mass, size=n_target, name="target_mass")
+    source_weights = probability_mass(source_mass, size=sample_count, name="source_mass")
     target_factors, target_offsets = _sqeuclidean_factors(target)
     sampler = resolve_sampler(source_distribution)
     default_gaussian = source_distribution is None
@@ -131,7 +110,7 @@ def solve_semidiscrete(
 
     average: np.ndarray | None = None
     stored_duals: list[np.ndarray] | None = [] if store_sample_duals else None
-    records: list[Mapping[str, Any]] = []
+    records: list[SemiDiscreteIterationRecord] = []
 
     for repeat_index, seed in enumerate(seeds):
         rng = np.random.default_rng(int(seed))
@@ -140,7 +119,7 @@ def solve_semidiscrete(
         elif host_buffer is not None:
             source_factors, source_offsets = fill_standard_normal_lowrank(rng, host_buffer)
         else:
-            sample = _matrix(sampler(rng, sample_count, dimension), name="source_distribution sample")
+            sample = matrix(sampler(rng, sample_count, dimension), name="source_distribution sample")
             if sample.shape != (sample_count, dimension):
                 raise ValueError(
                     "source_distribution must return shape "
@@ -172,21 +151,21 @@ def solve_semidiscrete(
         )
         if stored_duals is not None:
             stored_duals.append(current.copy())
-        record = {
-            "repeat_index": int(repeat_index),
-            "source_seed": int(seed),
-            "mode": "cold" if repeat_index == 0 else "target_dual_warm_start",
-            "wall_time": float(time.perf_counter() - started),
-            "objective": float(subproblem.objective),
-            "peak_active_support_size": int(subproblem.diagnostics["peak_active_support_size"]),
-        }
+        record = SemiDiscreteIterationRecord(
+            repeat_index=int(repeat_index),
+            source_seed=int(seed),
+            mode="cold" if repeat_index == 0 else "target_dual_warm_start",
+            wall_time=float(time.perf_counter() - started),
+            objective=float(subproblem.objective),
+            peak_active_support_size=int(subproblem.diagnostics["peak_active_support_size"]),
+        )
         records.append(record)
         if progress_callback is not None:
             progress_callback(
                 {
                     "repeat_index": int(repeat_index),
                     "num_repeats": repeats,
-                    "record": dict(record),
+                    "record": record,
                     "target_dual": _center_dual(average),
                     "sample_dual": current.copy(),
                 }

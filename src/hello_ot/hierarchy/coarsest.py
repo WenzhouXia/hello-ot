@@ -11,11 +11,6 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from hello_ot._internal.core.solver import (
-    HierarchicalOTSolver,
-    _northwest_corner_numba,
-    _prepare_level_cost_cache_lowrank,
-)
 from hello_ot._internal.instrumentation.costs import (
     _compute_lowrank_cost_vec_from_pairs_chunked,
     _extract_level_shape_from_cache,
@@ -174,6 +169,7 @@ def _build_leaf_costs_pad_batch_gemm(
     tracer: Optional[_ChromeTraceCollector] = None,
     depth_level: Optional[int] = None,
     dot_scale: float = 1.0,
+    compute_precision: Literal["fp32", "fp64"] = "fp32",
 ) -> Dict[int, Dict[str, Any]]:
     """
     CN: 将不同尺寸 leaf padding 到同一矩形 batch，用一次 Torch bmm 构造 cost 后再裁回原尺寸。
@@ -183,6 +179,7 @@ def _build_leaf_costs_pad_batch_gemm(
     if not leaf_inputs:
         return outputs
     device = _leaf_cost_build_device()
+    compute_dtype = torch.float64 if compute_precision == "fp64" else torch.float32
     max_n_source = max(int(item["n_source"]) for item in leaf_inputs)
     max_n_target = max(int(item["n_target"]) for item in leaf_inputs)
     feat_dim = int(leaf_inputs[0]["source_f"].shape[1])
@@ -201,15 +198,15 @@ def _build_leaf_costs_pad_batch_gemm(
         with (tracer.span("leaf.batch_cost_build.prepare_tensors", "leaf", args=trace_args) if tracer is not None else nullcontext()):
             # CN: padding 区域的 cost 后续会被裁掉，因此这里仅需要保证真实区域写入正确。
             # EN: Padded cost entries are cropped later, so only real regions need to be filled correctly.
-            source_f_batch = torch.zeros((batch_size, max_n_source, feat_dim), dtype=torch.float32, device=device)
-            target_g_batch = torch.zeros((batch_size, max_n_target, feat_dim), dtype=torch.float32, device=device)
+            source_f_batch = torch.zeros((batch_size, max_n_source, feat_dim), dtype=compute_dtype, device=device)
+            target_g_batch = torch.zeros((batch_size, max_n_target, feat_dim), dtype=compute_dtype, device=device)
             source_cost_batch = torch.zeros((batch_size, max_n_source), dtype=torch.float64, device=device)
             target_cost_batch = torch.zeros((batch_size, max_n_target), dtype=torch.float64, device=device)
             for idx, item in enumerate(leaf_inputs):
                 ns = int(item["n_source"])
                 nt = int(item["n_target"])
-                source_f_batch[idx, :ns, :] = torch.as_tensor(item["source_f"], dtype=torch.float32, device=device)
-                target_g_batch[idx, :nt, :] = torch.as_tensor(item["target_g"], dtype=torch.float32, device=device)
+                source_f_batch[idx, :ns, :] = torch.as_tensor(item["source_f"], dtype=compute_dtype, device=device)
+                target_g_batch[idx, :nt, :] = torch.as_tensor(item["target_g"], dtype=compute_dtype, device=device)
                 source_cost_batch[idx, :ns] = torch.as_tensor(item["source_cost"], dtype=torch.float64, device=device)
                 target_cost_batch[idx, :nt] = torch.as_tensor(item["target_cost"], dtype=torch.float64, device=device)
         with (tracer.span("leaf.batch_cost_build.gemm", "leaf", args=trace_args) if tracer is not None else nullcontext()):
@@ -320,6 +317,7 @@ def _solve_bilinear_coarsest_problem(
             tracer=tracer,
             depth_level=int(depth_level),
             dot_scale=float(dot_scale),
+            compute_precision=str(getattr(config, "cost_precision", "fp32")),
         )[0]
         sub_result = _solve_lowrank_leaf_with_pot_from_precomputed_cost(
             cost=prebuilt["cost"],

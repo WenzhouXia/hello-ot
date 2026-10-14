@@ -5,6 +5,12 @@ EN: HELLO unbalanced optimal transport (KL-UOT with Fully-Corrective Frank-Wolfe
 
 from .algorithm import solve_unbalanced
 from .dual_atoms import DualAtomMixture
-from .types import UnbalancedResult
+from .types import UOTConvergenceBounds, UOTIterationRecord, UnbalancedResult
 
-__all__ = ["DualAtomMixture", "UnbalancedResult", "solve_unbalanced"]
+__all__ = [
+    "DualAtomMixture",
+    "UOTConvergenceBounds",
+    "UOTIterationRecord",
+    "UnbalancedResult",
+    "solve_unbalanced",
+]

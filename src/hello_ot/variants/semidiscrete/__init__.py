@@ -2,6 +2,11 @@
 
 from .algorithm import solve_semidiscrete
 from .distributions import SourceDistribution
-from .types import SemiDiscreteResult
+from .types import SemiDiscreteIterationRecord, SemiDiscreteResult
 
-__all__ = ["SemiDiscreteResult", "SourceDistribution", "solve_semidiscrete"]
+__all__ = [
+    "SemiDiscreteIterationRecord",
+    "SemiDiscreteResult",
+    "SourceDistribution",
+    "solve_semidiscrete",
+]

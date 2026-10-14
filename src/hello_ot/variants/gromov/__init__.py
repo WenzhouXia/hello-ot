@@ -4,6 +4,6 @@ EN: HELLO Gromov-Wasserstein (low-rank squared-Euclidean structure with full-ste
 """
 
 from .algorithm import solve_gromov
-from .types import GromovResult
+from .types import GromovIterationRecord, GromovResult
 
-__all__ = ["GromovResult", "solve_gromov"]
+__all__ = ["GromovIterationRecord", "GromovResult", "solve_gromov"]

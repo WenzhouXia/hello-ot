@@ -11,9 +11,9 @@ import torch
 
 from hello_ot._internal.core.solver import (
     HierarchicalOTSolver,
-    _northwest_corner_numba,
-    _prepare_level_cost_cache_lowrank,
 )
+from hello_ot._internal.support_kernels import _northwest_corner_numba
+from hello_ot.costs.pairs import _prepare_level_cost_cache_lowrank
 from hello_ot._internal.instrumentation.costs import _compute_lowrank_cost_vec_from_pairs_chunked
 from hello_ot._internal.trace import _ChromeTraceCollector, _trace_device_synchronize
 from hello_ot.restricted_ot.active_support import ActiveSupport
@@ -59,6 +59,7 @@ def _get_or_prepare_shared_lowrank_level_cache(
         tuple(np.asarray(lvl_s.cost_vec).shape),
         tuple(np.asarray(lvl_t.cost_vec).shape),
         float(getattr(solver, "_cost_dot_scale", 1.0)),
+        str(getattr(solver, "_cost_precision", "fp32")),
     )
     if level_cache_holder is not None:
         cached = level_cache_holder.get("level_cache")
@@ -72,6 +73,7 @@ def _get_or_prepare_shared_lowrank_level_cache(
         lvl_s.cost_vec,
         lvl_t.cost_vec,
         dot_scale=float(getattr(solver, "_cost_dot_scale", 1.0)),
+        compute_precision=str(getattr(solver, "_cost_precision", "fp32")),
     )
     if level_cache_holder is not None:
         level_cache_holder["level_cache"] = level_cache
@@ -167,50 +169,15 @@ def _augment_active_support_with_northwest_corner(
             northwest_holder["keys"] = nw_keys
     if nw_rows.size == 0:
         return 0
-    if getattr(solver.active_support, "is_torch_backend", False):
-        device = solver.active_support.device
-        nw_keys_t = torch.as_tensor(nw_keys, dtype=torch.int64, device=device)
-        active_keys_t = solver.active_support.keys.to(dtype=torch.int64)
-        if (
-            bool(getattr(solver.active_support, "track_creation", False))
-            and solver.active_support.creation_iteration is not None
-            and int(active_keys_t.numel()) > 0
-        ):
-            existing_nw_mask_t = torch.isin(active_keys_t, nw_keys_t)
-            if bool(torch.any(existing_nw_mask_t).item()):
-                solver.active_support.creation_iteration[existing_nw_mask_t] = -1
-        if int(solver.active_support.keys.numel()) == 0:
-            missing_keys_t = nw_keys_t
-        else:
-            missing_mask_t = ~torch.isin(nw_keys_t, active_keys_t)
-            missing_keys_t = nw_keys_t[missing_mask_t]
-        if int(missing_keys_t.numel()) == 0:
-            return 0
-        rows_add_t = torch.div(missing_keys_t, int(n_target), rounding_mode="floor").to(dtype=torch.int32)
-        cols_add_t = torch.remainder(missing_keys_t, int(n_target)).to(dtype=torch.int32)
-        if bool(placeholder_costs):
-            solver.active_support.add_pairs_placeholder(rows_add_t, cols_add_t, iter_idx=-1)
-        else:
-            solver._append_new_pairs_arrays(rows_add_t, cols_add_t, -1)
-        return int(rows_add_t.numel())
-    if (
-        bool(getattr(solver.active_support, "track_creation", False))
-        and solver.active_support.creation_iteration is not None
-        and np.asarray(solver.active_support.keys).size > 0
-    ):
-        existing_nw_mask = np.isin(np.asarray(solver.active_support.keys, dtype=np.int64), nw_keys, assume_unique=False)
-        if np.any(existing_nw_mask):
-            solver.active_support.creation_iteration[existing_nw_mask] = -1
-    missing_keys = np.setdiff1d(nw_keys, solver.active_support.keys, assume_unique=False)
-    if missing_keys.size == 0:
+    rows_add, cols_add = solver.active_support.missing_structural_pairs(nw_keys)
+    count = len(rows_add)
+    if count == 0:
         return 0
-    rows_add = (missing_keys // n_target).astype(np.int32)
-    cols_add = (missing_keys % n_target).astype(np.int32)
-    if bool(placeholder_costs):
+    if placeholder_costs:
         solver.active_support.add_pairs_placeholder(rows_add, cols_add, iter_idx=-1)
     else:
         solver._append_new_pairs_arrays(rows_add, cols_add, -1)
-    return int(rows_add.size)
+    return count
 
 
 def _mark_existing_northwest_positions(
@@ -221,36 +188,7 @@ def _mark_existing_northwest_positions(
     CN: 用已知位置把 active support 中已有的 NW skeleton 边标为 protected。
     EN: Mark existing NW skeleton edges in active support as protected using known positions.
     """
-    if northwest_positions is None:
-        return False
-    active_support = solver.active_support
-    if not (
-        bool(getattr(active_support, "track_creation", False))
-        and active_support.creation_iteration is not None
-    ):
-        return True
-    if getattr(active_support, "is_torch_backend", False):
-        if torch is None:
-            return False
-        if torch.is_tensor(northwest_positions):
-            pos_t = northwest_positions.to(device=active_support.device, dtype=torch.long)
-        else:
-            pos_t = torch.as_tensor(northwest_positions, dtype=torch.long, device=active_support.device)
-        pos_t = pos_t.reshape(-1)
-        if int(pos_t.numel()) == 0:
-            return True
-        valid_t = (pos_t >= 0) & (pos_t < int(active_support.creation_iteration.numel()))
-        if not bool(torch.all(valid_t).item()):
-            return False
-        active_support.creation_iteration[pos_t] = -1
-        return True
-    pos_np = np.asarray(northwest_positions, dtype=np.int64).reshape(-1)
-    if int(pos_np.size) == 0:
-        return True
-    if np.any(pos_np < 0) or np.any(pos_np >= int(np.asarray(active_support.creation_iteration).size)):
-        return False
-    active_support.creation_iteration[pos_np] = -1
-    return True
+    return solver.active_support.mark_structural_positions(northwest_positions)
 
 
 def _gpu_warm_start_support_bytes(warm_start: OTWarmStartGPUState) -> int:

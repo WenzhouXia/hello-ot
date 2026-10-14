@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -14,6 +14,7 @@ from hello_ot.variants._balanced import (
 
 from .dual_atoms import DualAtomMixture, canonicalize_atom
 from .objective import compute_translated_dual_state, evaluate_primal_certificate
+from .types import _UOTIterationSnapshot
 
 
 def _run_ott_sinkhorn_marginals(
@@ -107,7 +108,7 @@ def _run_pot_sinkhorn_marginals(
         target_mass,
         M,
         reg=float(reg),
-        reg_m=float(rho_source),
+        reg_m=(float(rho_source), float(rho_target)),
         method="sinkhorn",
         numItermax=2000,
     )
@@ -130,7 +131,7 @@ def initialize_unbalanced_fcfw(
     config: _AlgorithmConfig,
     *,
     initialization: Optional[str] = "ott_sinkhorn",
-) -> Tuple[DualAtomMixture, Dict[str, Any], BalancedOTResult]:
+) -> Tuple[DualAtomMixture, Optional[_UOTIterationSnapshot], Optional[BalancedOTResult]]:
     """
     CN: 构建首个可行 HELLO dual atom，建立 DualAtomMixture 并评估初始 primal certificate。
     EN: Construct initial feasible HELLO dual atom, create DualAtomMixture, and evaluate initial primal certificate.
@@ -223,9 +224,12 @@ def initialize_unbalanced_fcfw(
         rho_source,
         rho_target,
     )
-    cert0["dual_objective"] = state0["dual_objective"]
-
-    return mixture, cert0, subproblem
+    snapshot0 = _UOTIterationSnapshot.from_state_and_certificate(
+        iteration=0,
+        state=state0,
+        certificate=cert0,
+    )
+    return mixture, snapshot0, subproblem
 
 
 __all__ = ["initialize_unbalanced_fcfw"]

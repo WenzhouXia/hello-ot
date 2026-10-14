@@ -44,6 +44,7 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
         "scripts/install_jax_gpu.sh",
         "scripts/build_native_wheel.sh",
         "scripts/validate_release.py",
+        "tests/hello_gpu_resident_test.py",
         "tests/torch_scan_test.py",
         "tests/hello_inplace_feature_layout_test.py",
         ".github/workflows/ci.yml",
@@ -53,6 +54,12 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
         "third_party/README.md",
     }
     assert all((destination / relative).is_file() for relative in required)
+    terminology = (destination / "TERMINOLOGY.md").read_text(encoding="utf-8")
+    assert "## GPU-resident execution" in terminology
+    assert "## Cost perturbation" in terminology
+    assert "Hierarchical KL-UOT" not in terminology
+    assert "RDM" not in terminology
+    assert "Online Laguerre-weighted coreset" not in terminology
     assert not (destination / "experiments").exists()
     # CN: 只使用导出目录的源码，验证公开入口不依赖内部工作区。
     # EN: Use only exported sources to verify public entry points are independent of the internal workspace.

@@ -12,6 +12,8 @@ import torch
 from scipy.sparse import csc_matrix
 
 from hello_ot._internal.core.result_utils import build_objective_history_by_level
+from hello_ot._internal.cost_types import normalize_cost_type_name
+from hello_ot._internal.instrumentation.reporting import _print_profile_init_level
 from hello_ot._internal.lp.torch_restricted_ot import TorchRestrictedOTPDLP
 from hello_ot.kernels.torch_scan import resolve_torch_device
 from hello_ot._internal.types.base import BaseHierarchy, HierarchyLevel
@@ -95,10 +97,7 @@ def _pricing_and_pruning(
 ) -> Tuple[Any, DualGapCleaning]:
     del pricing_index_pool
     strategy = _CompositeScanOnlyStrategy()
-    pruning = DualGapCleaning(
-        threshold_factor=float(config.cleaning_threshold_factor),
-        primal_tol=float(config.cleaning_primal_tol),
-    )
+    pruning = DualGapCleaning(threshold_factor=float(config.cleaning_threshold_factor))
     return strategy, pruning
 
 
@@ -129,6 +128,7 @@ def _finish_restricted_solver(
     solver._cost_type = str(cost_type)
     solver._metric_cost_perturbation = config.metric_cost_perturbation
     solver._cost_dot_scale = float(config.dot_scale)
+    solver._cost_precision = str(config.cost_precision)
     # CN: HELLO 的正式计时使用 API/阶段直接 wall-time；禁止同步式 RuntimeProfiler 进入求解热路径。
     # EN: Formal HELLO timing uses direct API/stage wall time; the synchronizing RuntimeProfiler is excluded from the hot path.
     solver._runtime_logging = config.normalized_runtime_logging()
@@ -144,6 +144,9 @@ def _finish_restricted_solver(
         else str(resolve_torch_device(config.torch_device))
     )
     solver._backend = str(config.backend)
+    solver._pricing_topk = int(config.pricing_topk)
+    solver._support_budget_factor = float(config.cleaning_threshold_factor)
+    solver._verbosity = str(config.verbosity)
     solver._use_gpu_active_support = bool(torch.device(active_device).type == "cuda")
     solver._active_support_device = str(active_device)
     lp_kwargs = dict(getattr(solver, "_lp_solver_kwargs", {}) or {})
@@ -517,7 +520,7 @@ def initialize_level(
     init_components["refine_solution"] = time.perf_counter() - t0
     logger.debug("  [Level %s] Init: primal nnz=%s", level_idx, primal_curr.nnz)
 
-    cost_type = solver._normalize_cost_type_name(cost_type)
+    cost_type = normalize_cost_type_name(cost_type)
     t0 = time.perf_counter()
     with trace_span(trace_collector, trace_prefix, "build_level_cache", args={"level": int(level_idx)}):
         if cost_type == "lowrank":
@@ -527,6 +530,7 @@ def initialize_level(
                 fine_lvl_s.cost_vec,
                 fine_lvl_t.cost_vec,
                 dot_scale=float(getattr(solver, "_cost_dot_scale", 1.0)),
+                compute_precision=str(getattr(solver, "_cost_precision", "fp32")),
             )
         elif cost_type == "l1":
             level_cache = solver._prepare_level_cost_cache_l1(fine_lvl_s.points, fine_lvl_t.points)
@@ -611,7 +615,8 @@ def initialize_level(
         solver.active_support.set_x_prev(x_prev_filled)
     init_components["warm_start_fill"] = time.perf_counter() - t0
 
-    solver._print_profile_init_level(
+    _print_profile_init_level(
+        solver,
         level_idx,
         init_components,
         primal_nnz=primal_curr.nnz,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-# CN: 本模块包含 HELLO 私有双线性 cost runtime 的 fused-scan 与调度原语。
-# EN: This module contains fused-scan and dispatch primitives for HELLO's private bilinear cost runtime.
+# CN: 组织双线性 cost 的 coarsest solve 与 dual assignment。
+# EN: Coordinate coarsest solves and dual assignment for bilinear costs.
 
 from typing import Any, Dict, Literal, Optional, Tuple
 
@@ -74,6 +74,7 @@ def augment_topk_lowrank(
     tracer: Optional[_ChromeTraceCollector],
     trace_args: Dict[str, Any],
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Tuple[DualAssignmentState, Dict[str, Any], Dict[str, Any], Any]:
     known_cost_vec = target_cost_vec if str(known_side) == "target" else source_cost_vec
     return _assign_state_from_known_dual_directional_scan(
@@ -89,6 +90,7 @@ def augment_topk_lowrank(
         tracer=tracer,
         trace_args=trace_args,
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
     )
 
 
@@ -104,6 +106,7 @@ def scan_topk_lowrank_candidates(
     tracer: Optional[_ChromeTraceCollector],
     trace_args: Dict[str, Any],
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Tuple[
     DualAssignmentState,
     Dict[str, Any],
@@ -130,6 +133,7 @@ def scan_topk_lowrank_candidates(
         tracer=tracer,
         trace_args=trace_args,
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
     )
     return result
 
@@ -166,6 +170,7 @@ def complete_dual_lowrank(
     trace_args: Dict[str, Any],
     trace_prefix: str,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> Tuple[DualAssignmentState, Dict[str, Any]]:
     if completion_candidate is not None:
         return _complete_dual_from_candidate(
@@ -191,4 +196,5 @@ def complete_dual_lowrank(
         trace_args=trace_args,
         trace_prefix=str(trace_prefix),
         dot_scale=float(dot_scale),
+        compute_precision=str(compute_precision),
     )

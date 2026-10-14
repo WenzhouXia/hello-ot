@@ -121,8 +121,10 @@ void check_raw_lowrank_inputs(
     TORCH_CHECK(db_cost.is_cuda(), "db_cost must be a CUDA tensor");
     TORCH_CHECK(query_dual.is_cuda(), "query_dual must be a CUDA tensor");
     TORCH_CHECK(db_dual.is_cuda(), "db_dual must be a CUDA tensor");
-    TORCH_CHECK(query_feat.scalar_type() == torch::kFloat32, "query_feat must be float32");
-    TORCH_CHECK(db_feat.scalar_type() == torch::kFloat32, "db_feat must be float32");
+    TORCH_CHECK(
+            query_feat.scalar_type() == torch::kFloat32 || query_feat.scalar_type() == torch::kFloat64,
+            "query_feat must be float32 or float64");
+    TORCH_CHECK(db_feat.scalar_type() == query_feat.scalar_type(), "query/db feature dtypes must match");
     TORCH_CHECK(query_cost.scalar_type() == torch::kFloat64, "query_cost must be float64");
     TORCH_CHECK(db_cost.scalar_type() == torch::kFloat64, "db_cost must be float64");
     TORCH_CHECK(query_dual.scalar_type() == torch::kFloat64, "query_dual must be float64");
@@ -184,8 +186,10 @@ void check_raw_bidir_inputs(
     TORCH_CHECK(db_cost.is_cuda(), "db_cost must be a CUDA tensor");
     TORCH_CHECK(query_bias.is_cuda(), "query_bias must be a CUDA tensor");
     TORCH_CHECK(db_bias.is_cuda(), "db_bias must be a CUDA tensor");
-    TORCH_CHECK(query_feat.scalar_type() == torch::kFloat32, "query_feat must be float32");
-    TORCH_CHECK(db_feat.scalar_type() == torch::kFloat32, "db_feat must be float32");
+    TORCH_CHECK(
+            query_feat.scalar_type() == torch::kFloat32 || query_feat.scalar_type() == torch::kFloat64,
+            "query_feat must be float32 or float64");
+    TORCH_CHECK(db_feat.scalar_type() == query_feat.scalar_type(), "query/db feature dtypes must match");
     TORCH_CHECK(query_cost.scalar_type() == torch::kFloat64, "query_cost must be float64");
     TORCH_CHECK(db_cost.scalar_type() == torch::kFloat64, "db_cost must be float64");
     TORCH_CHECK(query_bias.scalar_type() == torch::kFloat64, "query_bias must be float64");
@@ -225,8 +229,10 @@ void check_raw_directional_inputs(
     TORCH_CHECK(db_feat.is_cuda(), "db_feat must be a CUDA tensor");
     TORCH_CHECK(query_bias.is_cuda(), "query_bias must be a CUDA tensor");
     TORCH_CHECK(db_bias.is_cuda(), "db_bias must be a CUDA tensor");
-    TORCH_CHECK(query_feat.scalar_type() == torch::kFloat32, "query_feat must be float32");
-    TORCH_CHECK(db_feat.scalar_type() == torch::kFloat32, "db_feat must be float32");
+    TORCH_CHECK(
+            query_feat.scalar_type() == torch::kFloat32 || query_feat.scalar_type() == torch::kFloat64,
+            "query_feat must be float32 or float64");
+    TORCH_CHECK(db_feat.scalar_type() == query_feat.scalar_type(), "query/db feature dtypes must match");
     TORCH_CHECK(query_bias.scalar_type() == torch::kFloat64, "query_bias must be float64");
     TORCH_CHECK(db_bias.scalar_type() == torch::kFloat64, "db_bias must be float64");
     TORCH_CHECK(query_feat.is_contiguous(), "query_feat must be contiguous");

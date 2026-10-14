@@ -55,6 +55,45 @@ Array inputs use uniform marginals and squared Euclidean cost by default. Non-un
 
 Advanced options are configured through `hello_ot.SolverOptions` (e.g., `backend="native"`, `backend="torch"`).
 
+### Optional GPU-resident pipeline
+
+`hello_ot.solve` accepts NumPy arrays and PyTorch tensors. By default, CUDA
+inputs are copied to CPU and use the existing streamed solver and NumPy results.
+Existing experiment settings and their memory strategy are unchanged.
+
+For contiguous FP32 tensors already on the same CUDA device, explicitly enable:
+
+```python
+result = hello_ot.solve(
+    source_cuda, target_cuda,
+    options=hello_ot.SolverOptions(
+        gpu_resident=True,
+        consume_input_features=True,
+    ),
+)
+plan = result.solution.to_sparse_matrix()
+f, g = result.solution.source_dual, result.solution.target_dual
+cpu_solution = result.solution.to_cpu()
+```
+
+This requires rebuilding the native extensions from this source revision; older
+prebuilt wheels do not include CuPDLPx GPU array I/O. This option currently covers
+balanced `hello_ot.solve`. Both clouds, active support, LP state and result arrays
+stay on GPU. Leaf POT `emd` and triggered support sparsification are explicit CPU
+exceptions, recorded in `result.metadata["transfers"]` by calls, bytes and seconds.
+Python control flow and scalar diagnostics still run on CPU.
+
+With `consume_input_features=True`, HELLO temporarily reorders the inputs in place
+using bounded scratch and restores their values/order on return or an ordinary
+exception. The caller must give HELLO exclusive access during the call and build
+any feature-gradient graph **after** it returns: restoration does not reset
+PyTorch's tensor version counters. Solver outputs are detached. With this option
+false, HELLO creates reordered GPU copies instead. GPU OOM raises an error without
+a CPU fallback; a fatal CUDA error may prevent restoration.
+
+Run `python3 scripts/validate_gpu_release.py` from a native CUDA checkout to
+validate the GPU-resident path together with the other GPU release checks.
+
 > **Tip**: A complete verification script is bundled in the repository:
 > ```bash
 > python3 examples/quickstart.py

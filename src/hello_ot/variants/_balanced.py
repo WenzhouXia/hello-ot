@@ -8,7 +8,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from hello_ot.api import _require_cuda_runtime, _runtime_config, _solution, _solve, _stage_result
-from hello_ot.config import SolverOptions, _AlgorithmConfig, finest_stopping_norm
+from hello_ot.config import SolverOptions, _AlgorithmConfig, finest_stopping_norm, level_cost_precision
 from hello_ot.cost import HelloCostContext, _PreparedOTProblem, _prepare_bilinear_problem
 from hello_ot.initialization.dual_assignment import (
     DualAssignmentProblem,
@@ -61,6 +61,8 @@ def algorithm_config(
     resolved = SolverOptions(verbose="off") if options is None else options
     if not isinstance(resolved, SolverOptions):
         raise TypeError("inner_options must be SolverOptions or None")
+    if resolved.gpu_resident:
+        raise ValueError("gpu_resident currently supports hello_ot.solve only")
     config = resolved._to_internal_config(
         max_iterations=int(max_iterations),
         random_seed=int(random_seed),
@@ -120,13 +122,16 @@ def result_record(result: BalancedOTResult) -> Dict[str, Any]:
     }
 
 
-def _dual_assignment_problem(problem: _PreparedOTProblem) -> DualAssignmentProblem:
+def _dual_assignment_problem(
+    problem: _PreparedOTProblem, *, compute_precision: str = "fp32"
+) -> DualAssignmentProblem:
     runtime = problem.runtime
     return DualAssignmentProblem(
         cost_context=HelloCostContext(
             score_family="inner_product",
             cost_type="lowrank",
             dot_scale=float(runtime.dot_scale),
+            compute_precision=compute_precision,
         ),
         source_representation=runtime.source_points,
         target_representation=runtime.target_points,
@@ -159,7 +164,10 @@ def _solve_from_dual(
     if proposal.shape != problem.shape:
         raise ValueError("support-proposal and target problems must have the same shape")
     warm_start, initialization_profile = build_warm_start_from_dual(
-        _dual_assignment_problem(proposal),
+        _dual_assignment_problem(
+            proposal,
+            compute_precision=level_cost_precision(config.cost_precision, level_index=0),
+        ),
         dual,
         preparation=preparation,
         assignment="nodewise_bidirectional",
@@ -167,6 +175,9 @@ def _solve_from_dual(
     )
     runtime = problem.runtime
     runtime_config = _runtime_config(config, cost_type="lowrank", dot_scale=float(runtime.dot_scale))
+    runtime_config.cost_precision = level_cost_precision(
+        config.cost_precision, level_index=0
+    )
     started = time.perf_counter()
     raw = _refine_lowrank_from_warm_start(
         source_F=runtime.source_points,

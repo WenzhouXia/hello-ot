@@ -120,9 +120,11 @@ def _problem_tensors(
     source_offset: Any,
     target_offset: Any,
     device: torch.device,
+    compute_precision: Literal["fp32", "fp64"],
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    source = _tensor(source_points, dtype=torch.float64, device=device)
-    target = _tensor(target_points, dtype=torch.float64, device=device)
+    dtype = torch.float64 if compute_precision == "fp64" else torch.float32
+    source = _tensor(source_points, dtype=dtype, device=device)
+    target = _tensor(target_points, dtype=dtype, device=device)
     source_bias = None if source_offset is None else _tensor(source_offset, dtype=torch.float64, device=device).view(-1)
     target_bias = None if target_offset is None else _tensor(target_offset, dtype=torch.float64, device=device).view(-1)
     return source, target, source_bias, target_bias
@@ -175,6 +177,7 @@ def directional_assignment(
     device: str | torch.device,
     max_tile_bytes: int = 64 * 1024 * 1024,
     perturbation: Optional[dict[str, Any]] = None,
+    compute_precision: Literal["fp32", "fp64"] = "fp32",
 ) -> tuple[GPUWarmStartState, dict[str, Any], dict[str, Any], TorchCompletionCandidate]:
     """
     CN: 用共享 blockwise dual-score primitive 执行一个方向的 dual assignment。
@@ -188,6 +191,7 @@ def directional_assignment(
         source_offset=source_offset,
         target_offset=target_offset,
         device=dev,
+        compute_precision=compute_precision,
     )
     _rows, _cols, _values, dual = _state_tensors(state, device=dev)
     n_source, n_target = int(source.shape[0]), int(target.shape[0])
@@ -347,6 +351,7 @@ def bidirectional_violation_scan(
     collect_linf_diagnostics: bool = True,
     max_tile_bytes: int = 64 * 1024 * 1024,
     perturbation: Optional[dict[str, Any]] = None,
+    compute_precision: Literal["fp32", "fp64"] = "fp32",
 ) -> TorchViolationScan:
     """
     CN: 一次 blockwise traversal 同时计算双向违例候选和 full dual-feasibility certificate。
@@ -360,6 +365,7 @@ def bidirectional_violation_scan(
         source_offset=source_offset,
         target_offset=target_offset,
         device=dev,
+        compute_precision=compute_precision,
     )
     source_dual_t = _tensor(source_dual, dtype=torch.float64, device=dev).view(-1)
     target_dual_t = _tensor(target_dual, dtype=torch.float64, device=dev).view(-1)
@@ -485,7 +491,7 @@ def _perturb_tile(cost: torch.Tensor, perturbation: dict, source_start: int, tar
     CN: 在当前有界 tile 上生成全局边噪声，与稀疏边成本共用定义。
     EN: Generate global-edge noise for this bounded tile using the sparse-cost definition.
     """
-    from .norm_cost_scan import _apply_metric_pair_perturbation
+    from hello_ot.costs.metric_perturbation import _apply_metric_pair_perturbation
 
     perturbation = {**perturbation,
                     "source_global_index": perturbation["source_global_index"][source_start:source_start + cost.shape[0]],

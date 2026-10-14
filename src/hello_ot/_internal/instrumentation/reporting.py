@@ -1,17 +1,18 @@
 """
-CN: 仅供 HELLO 之前的 cluster 实现使用的旧报告辅助函数。
-EN: Legacy reporting helpers used only by the pre-HELLO cluster implementation.
+CN: HELLO 运行时 profiling 的统一报告辅助函数。
+EN: Canonical reporting helpers for HELLO runtime profiling.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
 from typing import Any as ConfigType
 
-from ..core.solver import HierarchicalOTSolver
+if TYPE_CHECKING:
+    from ..core.solver import HierarchicalOTSolver
 
 
 def _runtime_log(
@@ -207,6 +208,40 @@ def _print_warm_start_init_profile(
         f"{_format_profile_components(summary_components, max_items=3, base_total=base)}",
     )
     _runtime_log(solver, "warm_start", "---")
+
+
+def _print_profile_init_level(
+    solver: HierarchicalOTSolver,
+    level_idx: int,
+    components: Dict[str, float],
+    *,
+    primal_nnz: int,
+    active_size: int,
+    bfs_added: int = 0,
+) -> None:
+    """
+    CN: 输出层级初始化的统一 profiling 摘要。
+    EN: Emit the canonical profiling summary for hierarchy-level initialization.
+    """
+    if not bool(getattr(solver, "_profiling_enabled", False)):
+        return
+    if hasattr(solver, "_runtime_log_enabled") and not solver._runtime_log_enabled("profile_level"):
+        return
+    total = sum(float(value) for value in components.values() if float(value) > 0.0)
+    base = max(total, 1e-12)
+    _runtime_log(
+        solver,
+        "profile_level",
+        f"[Profile][L{level_idx}][Init] total={total:.2f}s "
+        f"primal_nnz={int(primal_nnz):,} active={int(active_size):,} bfs_added={int(bfs_added):,}",
+    )
+    _runtime_log(
+        solver,
+        "profile_level",
+        f"[Profile][L{level_idx}][Init][components] "
+        f"{_format_profile_components(components, max_items=6, base_total=base)}",
+    )
+    _runtime_log(solver, "profile_level", "---")
 
 
 def _print_warm_start_iter_profile(

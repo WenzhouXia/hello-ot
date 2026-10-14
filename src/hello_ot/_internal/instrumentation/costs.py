@@ -10,7 +10,7 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
 from ..trace import _ChromeTraceCollector
-from ..core.solver import _cost_pairs_lowrank_batched
+from hello_ot.costs.pairs import _cost_pairs_lowrank_batched
 
 
 def _extract_level_shape_from_cache(level_cache: Dict[str, Any]) -> Tuple[int, int, int]:

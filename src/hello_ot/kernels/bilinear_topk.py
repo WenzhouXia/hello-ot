@@ -141,10 +141,11 @@ def _to_device_1d(array: Any, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(np.ascontiguousarray(array, dtype=np.float64), dtype=torch.float64, device=device).contiguous().view(-1)
 
 
-def _to_device_2d(array: Any, device: torch.device) -> torch.Tensor:
+def _to_device_2d(array: Any, device: torch.device, *, dtype: torch.dtype) -> torch.Tensor:
     if torch.is_tensor(array):
-        return array.detach().to(device=device, dtype=torch.float32).contiguous()
-    return torch.as_tensor(np.ascontiguousarray(array, dtype=np.float32), dtype=torch.float32, device=device).contiguous()
+        return array.detach().to(device=device, dtype=dtype).contiguous()
+    np_dtype = np.float64 if dtype == torch.float64 else np.float32
+    return torch.as_tensor(np.ascontiguousarray(array, dtype=np_dtype), dtype=dtype, device=device).contiguous()
 
 
 def _merge_topk(old_vals: torch.Tensor, old_idx: torch.Tensor, new_vals: torch.Tensor, new_idx: torch.Tensor, *, topk: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -164,14 +165,15 @@ def _raw_memory_estimate_mib(
     stream_chunk: int,
     query_tile: int,
     db_tile: int,
+    feature_itemsize: int = 4,
 ) -> Dict[str, float]:
     stream_chunk_eff = max(1, min(int(stream_chunk), int(n_stream)))
     query_tile_eff = max(1, min(int(query_tile), stream_chunk_eff))
     db_tile_eff = max(1, min(int(db_tile), int(n_resident)))
     mib = float(1024 * 1024)
-    resident_mib = float(n_resident) * float(d + 2) * 4.0 / mib
-    stream_chunk_mib = float(stream_chunk_eff) * float(d + 2) * 4.0 / mib
-    score_tile_mib = float(query_tile_eff) * float(db_tile_eff) * 4.0 / mib
+    resident_mib = float(n_resident) * (float(d * feature_itemsize) + 2.0 * 8.0) / mib
+    stream_chunk_mib = float(stream_chunk_eff) * (float(d * feature_itemsize) + 2.0 * 8.0) / mib
+    score_tile_mib = float(query_tile_eff) * float(db_tile_eff) * float(feature_itemsize) / mib
     partial_resident_mib = float(math.ceil(float(stream_chunk_eff) / float(query_tile_eff))) * float(n_resident) * float(topk) * 8.0 / mib
     final_outputs_mib = float(n_resident + stream_chunk_eff) * float(topk) * 8.0 / mib
     est_peak_mib = resident_mib + stream_chunk_mib + score_tile_mib + partial_resident_mib + final_outputs_mib
@@ -194,6 +196,7 @@ def _select_tiles(
     memory_floor_mib: float,
     resident_multiplier: float,
     max_budget_mib: float,
+    feature_itemsize: int = 4,
 ) -> Dict[str, Any]:
     resident_mib = _raw_memory_estimate_mib(
         n_stream=int(n_stream),
@@ -203,6 +206,7 @@ def _select_tiles(
         stream_chunk=1,
         query_tile=1,
         db_tile=1,
+        feature_itemsize=int(feature_itemsize),
     )["resident_feature_mib"]
     target_budget_mib = min(
         float(max_budget_mib),
@@ -230,6 +234,7 @@ def _select_tiles(
                     stream_chunk=int(stream_chunk),
                     query_tile=int(query_tile),
                     db_tile=int(db_tile),
+                    feature_itemsize=int(feature_itemsize),
                 )
                 row: Dict[str, Any] = {
                     "source_chunk": int(stream_chunk),
@@ -322,6 +327,7 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
     collect_timing: bool = False,
     collect_linf_diagnostics: bool = False,
     dot_scale: float = 1.0,
+    compute_precision: str = "fp32",
 ) -> LowrankBidirScanResult:
     """
     CN: 执行 raw lowrank 双向 top-k scan，同时计算 dual feasibility。
@@ -335,6 +341,10 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         raise RuntimeError("fused lowrank feasibility pricing requires CUDA")
     ext = _load_extension()
     device = torch.device(f"cuda:{int(gpu_id)}")
+    if str(compute_precision) not in {"fp32", "fp64"}:
+        raise ValueError("compute_precision must be one of: fp32, fp64")
+    feature_dtype = torch.float64 if str(compute_precision) == "fp64" else torch.float32
+    feature_itemsize = 8 if feature_dtype == torch.float64 else 4
 
     # CN: 读取问题规模并检查 source/target 的 lowrank feature 维度一致。
     # EN: Read problem sizes and ensure source/target lowrank feature dimensions match.
@@ -351,7 +361,7 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         memory_plan = plan_resident_side(
             source_count=int(n_source),
             target_count=int(n_target),
-            feature_dim=int(d),
+            feature_dim=int(d * feature_itemsize // 4),
             topk_bucket=int(kernel_k),
             available_bytes=int(available_bytes),
             driver_free_bytes=int(driver_free_bytes),
@@ -361,14 +371,14 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         # EN: The planner selects one side that fully fits and streams the other side.
         resident_is_source = memory_plan.resident_side == "source"
         if resident_is_source:
-            resident_feat = _to_device_2d(source_feat, device)
+            resident_feat = _to_device_2d(source_feat, device, dtype=feature_dtype)
             resident_cost = _to_device_1d(source_cost, device)
             resident_dual = _to_device_1d(source_dual, device)
             stream_feat_source = target_feat
             stream_cost_source = target_cost
             stream_dual_source = target_dual
         else:
-            resident_feat = _to_device_2d(target_feat, device)
+            resident_feat = _to_device_2d(target_feat, device, dtype=feature_dtype)
             resident_cost = _to_device_1d(target_cost, device)
             resident_dual = _to_device_1d(target_dual, device)
             stream_feat_source = source_feat
@@ -387,6 +397,7 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
             memory_floor_mib=float(memory_floor_mib),
             resident_multiplier=float(resident_multiplier),
             max_budget_mib=float(memory_plan.usable_bytes) / float(1024 * 1024),
+            feature_itemsize=int(feature_itemsize),
         )
         source_chunk = int(tile["source_chunk"])
         query_tile = int(tile["query_tile"])
@@ -395,7 +406,7 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         # CN: 双缓冲允许 CPU 准备下一块时上一块仍在 GPU 计算；总 pinned 内存固定为 O(chunk*d)。
         # EN: Double buffering lets the CPU prepare the next chunk while the previous chunk runs on GPU; pinned memory stays O(chunk*d).
         feature_staging = [
-            _empty_cpu_staging((staging_rows, d), dtype=torch.float32)
+            _empty_cpu_staging((staging_rows, d), dtype=feature_dtype)
             for _ in range(2)
         ]
         cost_staging = [
@@ -466,7 +477,7 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
             )
             # CN: 当前 chunk 的 feature/cost/dual 会临时驻留 GPU，是该循环内主要的 PyTorch 分配之一。
             # EN: The current chunk's feature/cost/dual temporarily live on GPU and are one main PyTorch allocation in this loop.
-            query_feat = query_feat_cpu.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+            query_feat = query_feat_cpu.to(device=device, dtype=feature_dtype, non_blocking=True).contiguous()
             query_cost = query_cost_cpu.to(device=device, dtype=torch.float64, non_blocking=True).contiguous()
             query_dual = query_dual_cpu.to(device=device, dtype=torch.float64, non_blocking=True).contiguous()
             copy_complete = torch.cuda.Event()
@@ -526,8 +537,8 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
                     int(col_kernel_id),
                     float(dot_scale),
                 )
-            # CN: query 侧 top-k 立即筛出正 reduced-cost 候选边并转回 CPU 保存。
-            # EN: Query-side top-k candidates are filtered for positive reduced cost and copied back to CPU immediately.
+            # CN: query 侧 top-k 立即筛出正 dual-score 候选边并转回 CPU 保存。
+            # EN: Query-side top-k candidates are filtered for positive dual score and copied back to CPU immediately.
             q_vals = q_vals[:, : int(k)].contiguous()
             q_idx = q_idx[:, : int(k)].contiguous()
             r_vals = r_vals[:, : int(k)].contiguous()
@@ -614,8 +625,9 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
             "host_staging_buffer_count": 2,
             "host_staging_pinned": bool(all(buffer.is_pinned() for buffer in feature_staging)),
             "host_staging_bytes": int(
-                2 * int(staging_rows) * (int(d) * 4 + 2 * 8)
+                2 * int(staging_rows) * (int(d) * int(feature_itemsize) + 2 * 8)
             ),
+            "cost_compute_precision": str(compute_precision),
         }
         if cost_linf is not None:
             diagnostics.update(
