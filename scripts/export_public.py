@@ -21,6 +21,8 @@ FILES = (
 )
 DIRECTORIES = (
     "src/hello_ot",
+    "packaging/cpp",
+    "packaging/native",
     "docs/figures",
     "export_experiments/main_scaling",
     "export_experiments/accuracy_runtime_pareto",
@@ -65,6 +67,12 @@ EXTRA_FILES = (
     "paper_experiments/common/feasible_rounding.py",
     "tests/public_pareto_test.py",
     "scripts/build_native_wheel.sh",
+    "scripts/build_cpp_wheel.sh",
+    "scripts/build_extension.py",
+    "scripts/install_backend.py",
+    "scripts/install_cpp.sh",
+    "tests/cpp_backend_test.py",
+    "tests/backend_packaging_test.py",
     "scripts/create_hello_ot_env.sh",
     "scripts/install_native.sh",
     "scripts/install_jax_gpu.sh",
@@ -118,8 +126,38 @@ def main() -> None:
         shutil.copy2(source, target)
     for relative in DIRECTORIES:
         shutil.copytree(root / relative, destination / relative, ignore=IGNORE)
+    _export_terminology(root, destination)
+    (destination / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n*.so\n*.egg-info/\n*.whl\n/build/\n/dist/\n"
+        ".venv/\n.pytest_cache/\n/examples/outputs/\n/results/\n",
+        encoding="utf-8",
+    )
     _write_manifest(destination)
     print(destination)
+
+
+def _export_terminology(root: Path, destination: Path) -> None:
+    """
+    CN: 术语按公开算法章节白名单导出，不携带开发工作区的探索性词条。
+    EN: Export terminology by public algorithm section allowlist, excluding exploratory workspace entries.
+    """
+    allowed = {"HELLO", "GPU-resident execution", "BuildHierarchy", "Dual propagation",
+               "Dual assignment", "Initial active support", "Restricted OT / SolveLP",
+               "CPU C++ backend", "Dual score and reduced cost", "Full optimality check",
+               "Dual-violation insertion", "Budgeted pruning", "Active support",
+               "HELLO costs", "Cost perturbation"}
+    source = (root / "TERMINOLOGY.md").read_text(encoding="utf-8")
+    sections = source.split("\n## ")
+    selected = []
+    for section in sections[1:]:
+        heading = section.splitlines()[0]
+        if heading not in allowed:
+            continue
+        if heading == "Full optimality check":
+            section = section.split("\nFor experimental free-support WB", 1)[0].rstrip() + "\n"
+        selected.append("\n## " + section)
+    text = sections[0] + "".join(selected)
+    (destination / "TERMINOLOGY.md").write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":

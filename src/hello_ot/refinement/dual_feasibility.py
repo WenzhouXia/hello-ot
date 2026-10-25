@@ -106,8 +106,11 @@ def run_lowrank_dual_feasibility_scan(
         "use_fused_lowrank_feasibility_pricing": bool(use_fused),
     }
 
-    if str(getattr(config, "backend", "native")) == "torch":
-        from hello_ot.kernels.torch_scan import bidirectional_violation_scan
+    if str(getattr(config, "backend", "native")) in {"torch", "cpp"}:
+        if config.backend == "cpp":
+            from hello_ot.kernels.cpp_scan import cpp_violation_scan as bidirectional_violation_scan
+        else:
+            from hello_ot.kernels.torch_scan import bidirectional_violation_scan
 
         scan = bidirectional_violation_scan(
             source_points=lvl_s.points,

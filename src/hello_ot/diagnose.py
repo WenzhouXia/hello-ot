@@ -14,10 +14,10 @@ from hello_ot._native_compat import native_runtime_compatibility
 
 
 _NATIVE_MODULES = {
-    "inner_product_scan": "hello_ot._native.inner_product_scan.hierot_inner_product_scan_ext",
-    "norm_cost_scan": "hello_ot._native.norm_cost_scan.hierot_norm_cost_scan_ext",
-    "support_sparsifier": "hello_ot._native.support_sparsifier._support_sparsifier_ext",
-    "cupdlpx": "hello_ot._native.pycupdlpx",
+    "inner_product_scan": "hello_ot_native.hierot_inner_product_scan_ext",
+    "norm_cost_scan": "hello_ot_native.hierot_norm_cost_scan_ext",
+    "support_sparsifier": "hello_ot_native._support_sparsifier_ext",
+    "cupdlpx": "hello_ot_native.pycupdlpx",
 }
 
 
@@ -99,7 +99,25 @@ def collect_diagnostics() -> dict[str, Any]:
         "native_runtime_compatibility": native_compatibility_detail,
         "devices": devices,
         "native_extensions": _native_status(),
+        "cpp_extensions": _cpp_status(),
     }
+
+
+def _cpp_status() -> dict[str, Any]:
+    """
+    CN: 单独检查 CPU 扩展，结果不依赖 CUDA 是否可用。
+    EN: Check CPU extensions independently of CUDA availability.
+    """
+    from hello_ot._cpp_backend import load_cpp_extension
+
+    result = {}
+    for kind in ("lp", "scan"):
+        try:
+            module = load_cpp_extension(kind)
+            result[kind] = dict(available=True, path=str(module.__file__))
+        except (RuntimeError, ImportError, OSError) as exc:
+            result[kind] = dict(available=False, error=str(exc))
+    return result
 
 
 def _print_human(report: dict[str, Any]) -> None:
@@ -125,11 +143,14 @@ def _print_human(report: dict[str, Any]) -> None:
             print(f"native.{name}: available")
         else:
             print(f"native.{name}: unavailable ({item['error_type']}: {item['error']})")
+    for name, item in report["cpp_extensions"].items():
+        print(f"cpp.{name}: {'available' if item['available'] else item['error']}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Diagnose the HELLO-OT runtime and native extensions.")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument("--require-cpp", action="store_true", help="require both C++ CPU extensions")
     parser.add_argument(
         "--require-native",
         action="store_true",
@@ -142,6 +163,8 @@ def main() -> None:
     else:
         _print_human(report)
     native_ok = all(item["available"] for item in report["native_extensions"].values())
+    if args.require_cpp and not all(item["available"] for item in report["cpp_extensions"].values()):
+        raise SystemExit(1)
     if args.require_native and (
         not report["cuda_available"] or not report["native_runtime_compatible"] or not native_ok
     ):

@@ -18,7 +18,7 @@ from hello_ot.kernels.scan_contract import (
 
 _EXT_MODULE: Any = None
 _EXT_LOAD_ERROR: str | None = None
-_EXT_MODULE_NAME = "hello_ot._native.inner_product_scan.hierot_inner_product_scan_ext"
+_EXT_MODULE_NAME = "hello_ot_native.hierot_inner_product_scan_ext"
 
 
 @dataclass
@@ -45,13 +45,13 @@ def _load_extension() -> Any:
     except Exception as exc:  # noqa: BLE001
         _EXT_LOAD_ERROR = (
             f"Failed to import installed lowrank scan CUDA extension {_EXT_MODULE_NAME!r}. "
-            f"Reinstall hello-ot so the extension is built. Original error: {exc!r}"
+            f"Run bash scripts/install_native.sh ENV_NAME to install hello-ot-native. Original error: {exc!r}"
         )
         raise RuntimeError(_EXT_LOAD_ERROR) from exc
     if not hasattr(module, "fused_bidir_topk_stats_raw"):
         _EXT_LOAD_ERROR = (
             f"Installed CUDA extension {_EXT_MODULE_NAME!r} does not expose "
-            "fused_bidir_topk_stats_raw. Reinstall hello-ot."
+            "fused_bidir_topk_stats_raw. Reinstall the matching hello-ot-native release."
         )
         raise RuntimeError(_EXT_LOAD_ERROR)
     _EXT_MODULE = module
@@ -437,12 +437,11 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         cols_parts: List[np.ndarray] = []
         max_violation = 0.0
         start_time = time.perf_counter()
-        # CN: K=16/32 的通用 column reduction 目前慢于三次 custom directional/certificate scan。
-        #     在专用大 K reduction 完成前，使用仍满足单侧常驻契约的三次 custom traversal。
-        # EN: The generic K=16/32 column reduction is currently slower than three custom
-        #     directional/certificate scans. Until a specialized large-K reduction exists,
-        #     use three custom traversals while preserving the one-resident-side contract.
-        use_decomposed_large_k = int(kernel_k) >= 16
+        # CN: 当前支持的 K<=32 均使用一次 fused 双向 traversal；旧的三遍 large-K
+        #     fallback 保留给未来更大的 bucket。
+        # EN: All currently supported K<=32 use one fused bidirectional traversal;
+        #     retain the three-pass large-K fallback for future larger buckets.
+        use_decomposed_large_k = int(kernel_k) > 32
         certificate_indices = (
             torch.tensor([0, 1, 2, 4], dtype=torch.int64, device=device)
             if use_decomposed_large_k

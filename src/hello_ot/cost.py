@@ -308,8 +308,11 @@ def _directional_assignment_by_cost(
     backend: str = "native",
     torch_device: str = "auto",
 ) -> Tuple[DualAssignmentState, Dict[str, Any], Dict[str, Any], Any]:
-    if str(backend) == "torch":
-        from .kernels.torch_scan import directional_assignment
+    if str(backend) in {"torch", "cpp"}:
+        if str(backend) == "cpp":
+            from .kernels.cpp_scan import cpp_directional_assignment as directional_assignment
+        else:
+            from .kernels.torch_scan import directional_assignment
 
         return directional_assignment(
             state=state,
@@ -453,7 +456,7 @@ def complete_dual(
     backend: str = "native",
     torch_device: str = "auto",
 ) -> Tuple[DualAssignmentState, Dict[str, Any]]:
-    if str(backend) == "torch":
+    if str(backend) in {"torch", "cpp"}:
         from .kernels.torch_scan import TorchCompletionCandidate, complete_from_candidate
 
         if not isinstance(completion_candidate, TorchCompletionCandidate):
@@ -765,7 +768,7 @@ def finalize_refinement_by_cost(
     result["warm_start_init"] = dict(prepared.initialized.initialization.statistics)
     normalized_state = (
         state
-        if prepared.backend == "torch"
+        if prepared.backend in {"torch", "cpp"}
         else _normalize_dual_assignment_state(state, pipeline="gpu")
     )
     result["warm_start_state"] = normalized_state

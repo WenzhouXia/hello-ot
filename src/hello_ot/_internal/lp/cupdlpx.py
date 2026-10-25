@@ -15,7 +15,7 @@ from ..instrumentation.memory_accounting import current_memory_recorder
 from .wrapper import LPSolver, SolverResult
 
 try:
-    from hello_ot._native import pycupdlpx
+    from hello_ot_native import pycupdlpx
 
     CUPDLPX_AVAILABLE = True
 except ImportError:

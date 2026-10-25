@@ -17,7 +17,7 @@ def cuda():
         pytest.skip("CUDA required")
     from hello_ot._native_compat import require_native_runtime_compatibility
     require_native_runtime_compatibility()
-    from hello_ot._native import pycupdlpx
+    from hello_ot_native import pycupdlpx
     assert pycupdlpx.GPU_ARRAY_IO_VERSION >= 1, "rebuild native extensions"
     return torch.device("cuda", torch.cuda.current_device())
 

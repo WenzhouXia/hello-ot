@@ -61,6 +61,8 @@ def algorithm_config(
     resolved = SolverOptions(verbose="off") if options is None else options
     if not isinstance(resolved, SolverOptions):
         raise TypeError("inner_options must be SolverOptions or None")
+    if resolved.backend == "cpp":
+        raise ValueError("backend='cpp' currently supports balanced point-cloud OT only")
     if resolved.gpu_resident:
         raise ValueError("gpu_resident currently supports hello_ot.solve only")
     config = resolved._to_internal_config(

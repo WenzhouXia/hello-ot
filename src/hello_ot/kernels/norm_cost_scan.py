@@ -8,7 +8,7 @@ from hello_ot.kernels.scan_contract import (_TOPK_SLOT_BYTES, DualFeasibilityCer
 from hello_ot.costs.metric_perturbation import _fused_perturb_arguments
 
 MetricCostType = Literal["l1", "linf", "l2"]
-_NORM_COST_SCAN_EXT_MODULE = "hello_ot._native.norm_cost_scan.hierot_norm_cost_scan_ext"
+_NORM_COST_SCAN_EXT_MODULE = "hello_ot_native.hierot_norm_cost_scan_ext"
 _FUSED_TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
 _COST_TYPE_IDS = {"l1": 0, "linf": 1, "l2": 2}
 _COMPUTE_PRECISION_IDS = {"fp32": 0, "fp64": 1}
@@ -32,8 +32,9 @@ def _require_norm_cost_scan_ext() -> Any:
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
             "norm-cost hello requires the custom scan CUDA extension "
-            f"({_NORM_COST_SCAN_EXT_MODULE}); rebuild with `HELLO_OT_BUILD_NATIVE=1 pip install -e .` on a "
-            "CUDA-capable machine. There is no KeOps fallback in the metric chain."
+            f"({_NORM_COST_SCAN_EXT_MODULE}); run `bash scripts/install_native.sh ENV_NAME`, "
+            "or build with `bash scripts/build_native_wheel.sh dist` and install the resulting "
+            "hello-ot-native wheel. There is no KeOps fallback in the metric chain."
         ) from exc
 
 

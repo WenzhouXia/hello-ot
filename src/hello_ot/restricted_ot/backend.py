@@ -28,7 +28,7 @@ from hello_ot._internal.instrumentation.driver_memory import DriverMemoryTracker
 from hello_ot._internal.instrumentation.memory_accounting import current_solve_memory_tracker
 from hello_ot._internal.lp.device_pre_rescale import maybe_pre_rescale_device_csr_payload, should_direct_pre_rescale_values
 from hello_ot._internal.lp.dispatch import solve_lp as dispatch_lp_solve
-from hello_ot._internal.lp.torch_restricted_ot import TorchRestrictedOTPDLP
+from hello_ot._internal.lp.restricted_ot_pdlp import RestrictedOTPDLP
 from hello_ot._internal.cost_types import normalize_cost_type_name as _normalize_cost_type_name
 
 
@@ -338,7 +338,7 @@ def _resolve_backend_options(solver: Any) -> _LPBackendOptions:
     if (
         matrix_value_mode != "explicit"
         and not use_gpu_pipeline
-        and not isinstance(solver.lp_solver, TorchRestrictedOTPDLP)
+        and not isinstance(solver.lp_solver, RestrictedOTPDLP)
     ):
         raise ValueError("implicit matrix_value_mode requires GPU device-CSR LP pipeline.")
     vector_sum_mode = str(kwargs.get("vector_sum_mode", "resident_ones")).strip().lower()
@@ -863,7 +863,7 @@ def solve_lp(
         options.cupdlpx_python_pre_rescale
     )
 
-    if isinstance(solver.lp_solver, TorchRestrictedOTPDLP):
+    if isinstance(solver.lp_solver, RestrictedOTPDLP):
         result = _dispatch_torch_backend(
             solver,
             lvl_s,

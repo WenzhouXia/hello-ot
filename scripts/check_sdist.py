@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+import tomllib
 
 
 def check_sdist(archive):
@@ -32,6 +33,10 @@ def check_sdist(archive):
                     raise ValueError(f"Build artifact in sdist: {member.name}")
             tar.extractall(workspace)
         source = workspace / roots.pop()
+        project_name = tomllib.loads((source / "pyproject.toml").read_text())["project"]["name"]
+        if project_name in {"hello-ot-cpp", "hello-ot-native"}:
+            _check_extension_sdist(source, workspace, project_name)
+            return
         for required in ("setup.py", "pyproject.toml", "src/hello_ot/__init__.py",
                          "src/hello_ot/_native/cupdlpx/pycupdlpx/cupdlpx_bindings.cpp"):
             if not (source / required).is_file():
@@ -69,6 +74,38 @@ def check_sdist(archive):
         )
         subprocess.run([sys.executable, "-c", code], cwd=workspace, env=environment, check=True)
         print(f"sdist boundary and wheel build/install passed: {archive}")
+
+
+def _check_extension_sdist(source, workspace, name):
+    """
+    CN: 从独立扩展源码包构建并安装，确认只拥有自身的模块文件。
+    EN: Build and install an extension source archive, verifying exclusive ownership of its modules.
+    """
+    kind = "cpp" if name == "hello-ot-cpp" else "native"
+    expected = source / "native_src" / ("solver.cpp" if kind == "cpp" else "cupdlpx/pycupdlpx/cupdlpx_bindings.cpp")
+    if not expected.is_file():
+        raise ValueError(f"Missing extension build source: {expected}")
+    wheels = workspace / "wheels"
+    wheels.mkdir()
+    subprocess.run([sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--no-build-isolation",
+                    "--wheel-dir", str(wheels)], cwd=source, check=True)
+    wheel, = wheels.glob("*.whl")
+    namespace = f"hello_ot_{kind}"
+    with zipfile.ZipFile(wheel) as archive:
+        files = archive.namelist()
+        if any(not path.startswith((namespace + "/", namespace + "-")) for path in files):
+            raise ValueError("Extension wheel owns files outside its namespace")
+        if not any(path.startswith(namespace + "/") and path.endswith(".so") for path in files):
+            raise ValueError("Extension wheel contains no compiled modules")
+    installed = workspace / "installed"
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--target",
+                    str(installed), str(wheel)], check=True)
+    environment = dict(os.environ, PYTHONPATH=str(installed))
+    code = f"import importlib, torch; m=importlib.import_module('{namespace}'); assert m.API_VERSION == 1; "
+    for module in (["_lp", "_scan"] if kind == "cpp" else ["pycupdlpx", "hierot_inner_product_scan_ext", "hierot_norm_cost_scan_ext", "_support_sparsifier_ext"]):
+        code += f"importlib.import_module('{namespace}.{module}'); "
+    subprocess.run([sys.executable, "-c", code], cwd=workspace, env=environment, check=True)
+    print(f"Independent extension sdist build/install passed: {name}")
 
 
 if __name__ == "__main__":

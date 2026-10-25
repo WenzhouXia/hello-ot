@@ -7,7 +7,7 @@ HELLO is a high-performance solver for large-scale, unregularized discrete optim
 - **Million-Scale on a Single GPU**: Memory complexity scales as $\mathcal{O}(m+n)$—"store points, solve transport." A single GPU solves $m=n=1.28\times10^6, d=8192$ using only $41.6\text{ GiB}$ peak GPU memory;
 - **Efficiency Across Dimensions**: Maintains high convergence efficiency across feature dimensions from single digits to thousands;
 - **General Pairwise Costs**: Supports not only $\ell_2^2$ (squared Euclidean), but also $\ell_1$, $\ell_2$, $\ell_\infty$, and general pairwise cost functions;
-- **Backend Design**: Provides a pure PyTorch backend (out-of-the-box, cross-platform) alongside a native CUDA backend (extreme performance);
+- **Backend Design**: Provides a portable PyTorch backend, an optional native CUDA backend, and an optional C++ CPU backend for balanced OT;
 - **Beyond Standard OT**: Out-of-the-box support for semi-discrete OT, Gromov–Wasserstein (GW), and unbalanced OT (UOT).
 
 <table style="width: 100%;">
@@ -138,8 +138,8 @@ After creating the environment above, install and verify the native wheel:
 bash scripts/install_native.sh hello_ot
 ```
 
-This replaces the portable distribution with the matching native wheel while
-retaining both `backend="torch"` and `backend="native"`.
+The script installs the core `hello-ot` and the separate `hello-ot-native`
+extension in the existing environment. It does not install the C++ CPU extension.
 
 #### Option B: Build from Source
 
@@ -150,10 +150,68 @@ CCCL headers, a compatible C++ compiler, Ninja, and pybind11:
 conda install -c nvidia cuda-nvcc=11.8 cuda-cccl=11.8.89
 python3 -m pip install '.[native-build]'
 scripts/build_native_wheel.sh dist
-python3 -m pip install dist/*.whl
+python3 -m pip install dist/hello_ot_native-*.whl
 ```
 
-### 3. GPU JAX and Paper Reproduction
+Source builds retain the documented Python/PyTorch/CUDA/ABI requirements;
+they are not a way to bypass an incompatible environment. The installer
+reports expected and actual versions before changing packages.
+
+### 3. C++ CPU (`backend="cpp"`)
+
+`HELLO (C++)` is the official CPU implementation for researchers comparing HELLO
+with CPU methods. It shares the hierarchy and refinement algorithm and retains
+Python control, PyTorch/BLAS, and POT for the coarsest solve. It is not a standalone
+C++ library. This backend supports balanced point-cloud OT with `l2^2`, `l1`,
+`l2`, and `linf` costs, all three cost precision policies, and cost perturbation.
+GW, UOT, SDOT, GPU-resident execution, and `finest_linf` stopping are not supported
+by this backend.
+
+The first prebuilt extensions target Linux x86-64 (glibc >= 2.29) and Python 3.12,
+with the system C++ and GNU OpenMP runtimes (`libstdc++` and `libgomp`) available.
+Use an existing
+Conda/Micromamba environment containing PyTorch (CPU or CUDA) and the numerical
+dependencies. The CPU extension does not link LibTorch and does not require CUDA.
+
+```bash
+bash scripts/install_cpp.sh hello_ot
+```
+
+The script downloads `hello-ot-cpp`, installs the matching core, checks the
+extensions, and runs the C++ quickstart. Neither installer creates an environment
+or replaces the existing CPU/CUDA PyTorch flavor. The `hello-ot-native` and
+`hello-ot-cpp` packages own disjoint files and survive core reinstalls. Either
+installer accepts `--wheel /absolute/path/to/the.whl` for a locally built artifact.
+
+For a source build, activate the Python 3.12 Linux x86-64 environment and provide
+`g++` with C++17/OpenMP support:
+
+```bash
+python3 -m pip install '.[cpp-build]'
+bash scripts/build_cpp_wheel.sh dist/cpp
+python3 -m pip install dist/cpp/hello_ot_cpp-*.whl
+python3 -m hello_ot.diagnose --require-cpp
+python3 examples/quickstart.py --backend cpp --num-threads 16
+```
+
+Compilation occurs while building wheels, never during `solve` or `prewarm`.
+Missing extensions produce installation instructions instead of a silent backend
+fallback. Migrate an old combined v0.1.0 native installation once with the new
+CUDA installer before adding C++; this preserves CUDA support during the split.
+Existing v0.1.0 release artifacts remain unchanged.
+
+```python
+options = hello_ot.SolverOptions(backend="cpp", num_threads=16)
+result = hello_ot.solve(source, target, options=options)
+```
+
+The default is 16 threads; use another positive integer, or `None` to inherit
+the environment. Explicit limits temporarily cover Torch/BLAS/OpenMP and are
+restored on exit. These settings are process-wide: use separate processes for
+concurrent solves requiring independent thread budgets. Existing PyTorch/native
+thread policies are unchanged.
+
+### 4. GPU JAX and Paper Reproduction
 
 Public reproduction scripts for the core paper experiments (large-scale scaling, Pareto curves, exactness verification, and parameter sensitivity) are organized under [`export_experiments/`](export_experiments/).
 

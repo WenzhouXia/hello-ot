@@ -234,7 +234,7 @@ def solve(problem, config):
     if config.stopping_norm == "finest_linf" and problem.cost_type != "l2^2":
         raise ValueError("finest_linf currently requires l2^2")
     require_native_runtime_compatibility()
-    from hello_ot._native import pycupdlpx
+    from hello_ot_native import pycupdlpx
     if getattr(pycupdlpx, "GPU_ARRAY_IO_VERSION", 0) < 1:
         raise RuntimeError("GPU pipeline requires rebuilt CuPDLPx extensions with GPU array I/O")
     device = x.device

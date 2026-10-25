@@ -22,12 +22,19 @@ from .variants import (
 
 def prewarm(*args: Any, **kwargs: Any) -> PrewarmStats:
     """
-    CN: 预热 HELLO 使用的 CUDA kernels。
-    EN: Prewarm the CUDA kernels used by HELLO.
+    CN: 预热选定 HELLO 后端使用的内核和求解器。
+    EN: Prewarm the kernels and solvers used by the selected HELLO backend.
     """
-    from .prewarm import prewarm as implementation
+    try:
+        from .prewarm import prewarm as implementation
+        return implementation(*args, **kwargs)
+    finally:
+        # CN: 子模块首次导入会覆盖同名包属性，恢复公开的可调用入口。
+        # EN: Initial submodule import replaces the package attribute; restore the public callable.
+        globals()["prewarm"] = _prewarm_dispatch
 
-    return implementation(*args, **kwargs)
+
+_prewarm_dispatch = prewarm
 
 
 def solve(

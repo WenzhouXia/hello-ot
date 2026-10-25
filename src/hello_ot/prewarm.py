@@ -26,6 +26,14 @@ def _prewarm_torch_backend(problem: Problem, config: _AlgorithmConfig) -> tuple[
     from hello_ot._internal.lp.torch_restricted_ot import TorchRestrictedOTPDLP
     from hello_ot.kernels.torch_scan import bidirectional_violation_scan, resolve_torch_device
 
+    if config.backend == "cpp":
+        from hello_ot._internal.lp.cpp_restricted_ot import CppRestrictedOTPDLP
+        from hello_ot.kernels.cpp_scan import cpp_violation_scan as bidirectional_violation_scan
+
+        solver_type = CppRestrictedOTPDLP
+    else:
+        solver_type = TorchRestrictedOTPDLP
+
     device = resolve_torch_device(config.torch_device)
     source = np.ascontiguousarray(problem.source_points[:8], dtype=np.float64)
     target = np.ascontiguousarray(problem.target_points[:8], dtype=np.float64)
@@ -54,7 +62,8 @@ def _prewarm_torch_backend(problem: Problem, config: _AlgorithmConfig) -> tuple[
         max_tile_bytes=4096,
         compute_precision=level_cost_precision(config.cost_precision, level_index=0),
     )
-    lp_solver = TorchRestrictedOTPDLP(
+    lp_solver = solver_type(
+        **({"num_threads": config.num_threads} if config.backend == "cpp" else {}),
         device=device,
         evaluation_frequency=20,
         iteration_limit=2000,
@@ -75,7 +84,7 @@ def _prewarm_torch_backend(problem: Problem, config: _AlgorithmConfig) -> tuple[
         raise RuntimeError(f"POT prewarm failed: {pot.get('error')}")
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    return (f"torch_scan:{device}", f"torch_restricted_lp:{device}", "pot_coarsest")
+    return (f"{config.backend}_scan:{device}", f"{config.backend}_restricted_lp:{device}", "pot_coarsest")
 
 
 def _prewarm_norm_cost(problem: Problem, config: _AlgorithmConfig) -> tuple[str, ...]:
@@ -165,6 +174,12 @@ def prewarm(problem: Problem, options: SolverOptions | None = None) -> PrewarmSt
     started = time.perf_counter()
     if bool(config.consume_input_features):
         _prewarm_inplace_feature_reorder()
+    if config.backend == "cpp":
+        from ._cpp_backend import cpp_runtime
+
+        with cpp_runtime(config.num_threads):
+            operations = _prewarm_torch_backend(problem, config)
+        return PrewarmStats(wall_time=float(time.perf_counter() - started), operations=operations)
     if config.backend == "torch":
         operations = _prewarm_torch_backend(problem, config)
         if bool(config.consume_input_features):

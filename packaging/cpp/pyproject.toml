@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "pybind11>=2.12,<3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hello-ot-cpp"
+version = "0.2.0"
+description = "Optional cpp extensions for HELLO"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["hello-ot==0.2.0", "threadpoolctl>=3,<4"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -64,7 +64,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("native", "torch"),
+        choices=("native", "torch", "cpp"),
         default="torch",
         help="solver backend (default: torch)",
     )
@@ -74,6 +74,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="fp32",
         help="cost arithmetic policy (default: fp32)",
     )
+    parser.add_argument("--num-threads", type=_positive_int, default=16,
+                        help="C++ CPU thread count (default: 16)")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args(argv)
 
 
@@ -136,7 +139,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     options = hello_ot.SolverOptions(
         backend=backend,
-        torch_device="auto",
+        torch_device=args.device,
+        num_threads=args.num_threads,
         coarsest_size_threshold=1024,
         cost_perturbation="auto",
         verbose="compact",

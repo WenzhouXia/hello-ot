@@ -20,6 +20,11 @@ jobs:
           python3 -m pip install --upgrade pip build 'setuptools>=69' wheel
           python3 -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
           python3 -m pip install '.[test]'
+      - name: Build and install the C++ CPU extension
+        run: |
+          python3 -m pip install '.[cpp-build]'
+          bash scripts/build_cpp_wheel.sh dist/cpp
+          python3 -m pip install --no-deps dist/cpp/*.whl
       - name: Verify exported files
         run: |
           if test -f PUBLIC_MANIFEST.sha256; then sha256sum --check PUBLIC_MANIFEST.sha256; fi
@@ -38,6 +43,8 @@ jobs:
             tests/torch_backend_end_to_end_test.py \
             tests/torch_packaging_test.py \
             tests/torch_prewarm_test.py \
+            tests/cpp_backend_test.py \
+            tests/backend_packaging_test.py \
             tests/torch_restricted_ot_pdlp_test.py \
             tests/torch_scan_test.py \
             tests/hello_inplace_feature_layout_test.py
@@ -46,4 +53,6 @@ jobs:
       - name: Validate the source distribution independently
         run: python3 scripts/check_sdist.py dist/*.tar.gz
       - name: Run quickstart from the installed package
-        run: python3 examples/quickstart.py
+        run: |
+          python3 examples/quickstart.py
+          python3 examples/quickstart.py --backend cpp

@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from hello_ot.diagnose import collect_diagnostics
 from hello_ot._native_compat import native_runtime_compatibility
 
@@ -43,6 +45,11 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
         "scripts/install_native.sh",
         "scripts/install_jax_gpu.sh",
         "scripts/build_native_wheel.sh",
+        "scripts/build_cpp_wheel.sh",
+        "scripts/install_cpp.sh",
+        "scripts/install_backend.py",
+        "packaging/cpp/setup.py",
+        "packaging/native/setup.py",
         "scripts/validate_release.py",
         "tests/hello_gpu_resident_test.py",
         "tests/torch_scan_test.py",
@@ -60,6 +67,9 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
     assert "Hierarchical KL-UOT" not in terminology
     assert "RDM" not in terminology
     assert "Online Laguerre-weighted coreset" not in terminology
+    assert "hier_wb" not in terminology
+    assert "restricted-WB" not in terminology
+    assert "barycenter" not in (destination / ".gitignore").read_text()
     assert not (destination / "experiments").exists()
     # CN: 只使用导出目录的源码，验证公开入口不依赖内部工作区。
     # EN: Use only exported sources to verify public entry points are independent of the internal workspace.
@@ -105,6 +115,17 @@ def test_native_build_script_has_explicit_release_architectures() -> None:
     assert "_GLIBCXX_USE_CXX11_ABI" in text
 
 
+def test_release_uploads_validated_persistent_artifacts() -> None:
+    # CN: push 阶段必须上传 build 已校验的持久化产物，不能引用未填充的临时目录。
+    # EN: Push must upload build-validated persistent artifacts, not an unpopulated temporary directory.
+    release_script = ROOT / "export_hello_ot.sh"
+    if not release_script.is_file():
+        pytest.skip("publication orchestration is internal and excluded from public snapshots")
+    text = release_script.read_text(encoding="utf-8")
+    assert 'local artifacts="$ARTIFACT_DIR"' in text
+    assert 'local artifacts="$STAGING_ROOT/artifacts"' not in text
+
+
 def test_layered_environment_installers_pin_compatible_stacks() -> None:
     # CN: 三层安装必须共享 Python/PyTorch 数值栈，并隔离 JAX 的 cuDNN 8。
     # EN: The three installers must share one Python/PyTorch stack and isolate JAX cuDNN 8.
@@ -112,8 +133,10 @@ def test_layered_environment_installers_pin_compatible_stacks() -> None:
     native = (ROOT / "scripts/install_native.sh").read_text(encoding="utf-8")
     jax = (ROOT / "scripts/install_jax_gpu.sh").read_text(encoding="utf-8")
     assert "numpy==1.26.4 scipy==1.15.3" in create
-    assert "hello_ot-0.1.0-cp312-cp312-linux_x86_64.whl" in native
-    assert "--no-cache-dir --no-deps --force-reinstall" in native
+    installer = (ROOT / "scripts/install_backend.py").read_text(encoding="utf-8")
+    assert 'install_backend.py" native' in native
+    assert '"--no-deps", "--force-reinstall"' in installer
+    assert "hello_ot_{args.backend}" in installer
     assert "jaxlib==0.4.25+cuda11.cudnn86" in jax
     assert "nvidia-cudnn-cu11==8.9.6.50" in jax
     assert 'ACTIVATE_DIR="$ENV_PREFIX/etc/conda/activate.d"' in jax

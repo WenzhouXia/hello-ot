@@ -40,7 +40,7 @@ def test_torch_cpu_runs_non_leaf_hello_without_native(monkeypatch, capsys) -> No
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if str(name).startswith("hello_ot._native"):
+        if str(name).startswith(("hello_ot._native", "hello_ot_native")):
             raise AssertionError(f"Torch backend imported native module: {name}")
         return original_import(name, *args, **kwargs)
 

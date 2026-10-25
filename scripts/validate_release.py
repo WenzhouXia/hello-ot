@@ -60,7 +60,7 @@ def _run_backend(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate an installed HELLO-OT release.")
-    parser.add_argument("--backend", choices=("native", "torch", "both"), default="both")
+    parser.add_argument("--backend", choices=("native", "torch", "cpp", "both"), default="both")
     parser.add_argument("--output", type=Path, default=Path("hello_ot_validation.json"))
     parser.add_argument("--torch-device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument(

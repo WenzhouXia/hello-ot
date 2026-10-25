@@ -53,7 +53,7 @@ f, g = result.solution.source_dual, result.solution.target_dual
 
 数组调用默认使用均匀质量与平方欧氏代价，也可以直接传入 `source_mass`、`target_mass`，并用 `cost="l1"`、`"l2"` 或 `"linf"` 选择其他代价函数。
 
-高级选项集中在 `hello_ot.SolverOptions` 中（如 `backend="native", "torch"`）。
+高级选项集中在 `hello_ot.SolverOptions` 中（如 `backend="native", "torch", "cpp"`）。
 
 > **提示**：仓库内提供完整的验证脚本：
 > ```bash
@@ -99,8 +99,8 @@ quickstart。脚本优先使用 Conda，找不到时使用 Micromamba，并在�
 bash scripts/install_native.sh hello_ot
 ```
 
-该命令会用匹配的 native wheel 覆盖 portable 发行包，同时保留
-`backend="torch"` 和 `backend="native"`。
+该命令在已有环境中安装核心包 `hello-ot` 和独立的 `hello-ot-native` 扩展包，
+不会安装 C++ CPU 扩展。
 
 #### 方式 B：从源码编译构建
 
@@ -111,10 +111,53 @@ CCCL 头文件、兼容的 C++ 编译器、Ninja 和 pybind11：
 conda install -c nvidia cuda-nvcc=11.8 cuda-cccl=11.8.89
 python3 -m pip install '.[native-build]'
 scripts/build_native_wheel.sh dist
-python3 -m pip install dist/*.whl
+python3 -m pip install dist/hello_ot_native-*.whl
 ```
 
-### 3. GPU JAX 与论文实验复现
+源码编译同样要求上述 Python/PyTorch/CUDA/ABI 组合，不能用于绕过环境不兼容。
+安装脚本会在修改包之前显示期望和实际环境信息。
+
+### 3. C++ CPU（`backend="cpp"`）
+
+`HELLO (C++)` 为其他研究者提供官方 CPU 实现，方便与 CPU 算法进行对比。
+它共用分层和 refinement 算法，使用 C++/OpenMP restricted OT 与扫描内核，
+同时保留 Python 控制、PyTorch/BLAS 和最粗层的 POT 求解，不是独立 C++ 库。
+首轮支持 balanced 点云 OT 的 `l2^2`、`l1`、`l2`、`linf` 成本、三种成本精度策略和
+成本扰动；暂不支持此后端上的 GW/UOT/SDOT、GPU-resident 或 `finest_linf`。
+
+首批预编译 wheel 面向 Linux x86-64、Python 3.12。在已有 Conda/Micromamba
+环境中安装，PyTorch 可以是 CPU 或 CUDA 版本；C++ 扩展不链接 LibTorch，也不要求 CUDA。
+预编译包要求 glibc >= 2.29，以及可用的系统 C++ 和 GNU OpenMP 运行库（`libstdc++`、`libgomp`）：
+
+```bash
+bash scripts/install_cpp.sh hello_ot
+```
+
+脚本下载独立的 `hello-ot-cpp` wheel、安装匹配的核心、检查扩展并运行 quickstart。
+两个后端安装脚本都不会创建环境或替换已有 PyTorch 的 CPU/CUDA 类型。
+`hello-ot-native` 与 `hello-ot-cpp` 安装文件互不重叠，重新安装核心不会删除扩展。
+两个脚本均接受 `--wheel /绝对路径/文件.whl` 来安装本地构建产物。
+
+源码编译时，激活上述 Python 3.12 环境，并准备支持 C++17/OpenMP 的 `g++`：
+
+```bash
+python3 -m pip install '.[cpp-build]'
+bash scripts/build_cpp_wheel.sh dist/cpp
+python3 -m pip install dist/cpp/hello_ot_cpp-*.whl
+python3 -m hello_ot.diagnose --require-cpp
+python3 examples/quickstart.py --backend cpp --num-threads 16
+```
+
+编译只发生在构建 wheel 时，`solve` 和 `prewarm` 不触发编译。缺少扩展会明确提示
+安装方法。旧 v0.1.0 整包 native 用户先运行新 CUDA 安装脚本完成一次迁移，再添加 C++，
+避免拆包时丢失 CUDA 支持。已有 v0.1.0 公开产物保持原状。
+
+API 使用 `SolverOptions(backend="cpp", num_threads=16)`，默认 16 线程；可改为其他
+正整数，或传 `None` 沿用环境设置。显式设置临时控制 Torch/BLAS/OpenMP 并在退出时恢复。
+这些线程控制是进程级的，需要独立线程预算的并发求解应放在不同进程中。
+已有 PyTorch/native 的线程策略不变。
+
+### 4. GPU JAX 与论文实验复现
 
 论文核心实验（大规模扩展性、Pareto 曲线、精确度验证与参数敏感性分析）的复现脚本整理在 [`export_experiments/`](export_experiments/) 目录下。将 GPU JAX、OTT-JAX 和其余复现依赖加入同一个环境：
 

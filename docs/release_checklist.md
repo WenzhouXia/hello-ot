@@ -14,6 +14,24 @@ The library API retains its default auto policy.
 
 ## CPU checks
 
+The 0.2 release separates `hello-ot`, `hello-ot-native`, and `hello-ot-cpp`.
+The two extension distributions must have disjoint wheel file ownership from
+each other and from the core. Test reinstalling the core and either extension
+without losing the other. Keep the existing 0.1 release artifacts intact.
+
+The C++ public scope is balanced point-cloud OT, with four costs, the existing
+precision and perturbation policies, and L2 stopping. Validate with CPU-only
+PyTorch in a clean environment, including `prewarm`, quickstart, marginal
+feasibility, exact POT objectives, and thread restoration. Export only runtime
+kernels, build/install tools, and correctness tests: CPU profiling, benchmark
+scripts, candidate implementations, and performance measurements stay internal.
+
+Build all three wheels and their source archives from the exported snapshot.
+Validate independent extension source archives, not just repository builds.
+Native builds retain the existing supported Torch/CUDA/ABI stack. Do not
+silently compile or fall back at solve time. The installers use existing
+environments, with local `--wheel` overrides for pre-publication validation.
+
 GitHub Actions runs portable API, perturbation, explicit algorithm structure,
 variant interface, public experiment and export tests on Python 3.12 with PyTorch 2.7.1.
 GPU-only tests are skipped there. Build a portable wheel from the sdist to check

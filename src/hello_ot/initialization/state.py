@@ -46,7 +46,7 @@ _DUAL_ASSIGNMENT_GROUPED_TOPK_BLOCK_D = 32
 _DUAL_ASSIGNMENT_ENABLE_GROUPED_TRITON_TOPK = False
 _DUAL_ASSIGNMENT_STREAM_TOPK_QUERY_CHUNK_ROWS = 8192
 _FUSED_MIPS_TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
-_FUSED_MIPS_EXT_MODULE = "hello_ot._native.inner_product_scan.hierot_inner_product_scan_ext"
+_FUSED_MIPS_EXT_MODULE = "hello_ot_native.hierot_inner_product_scan_ext"
 
 _fused_mips_ext: Any = None
 _fused_mips_ext_error: Optional[str] = None

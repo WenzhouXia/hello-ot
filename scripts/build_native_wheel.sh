@@ -74,5 +74,6 @@ PY
 
 echo "building with $(command -v nvcc)"
 
-python3 -m pip wheel . --no-deps --no-build-isolation --wheel-dir "${output_directory}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 "$REPO_ROOT/scripts/build_extension.py" native --output "${output_directory}"
 sha256sum "${output_directory}"/*.whl

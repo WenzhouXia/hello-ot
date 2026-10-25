@@ -216,6 +216,19 @@ def _solve_raw(
 
 
 def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> Result:
+    """
+    CN: 仅为 C++ CPU 路径应用可恢复的线程设置。
+    EN: Apply restorable thread settings only for the C++ CPU path.
+    """
+    if config.backend == "cpp":
+        from ._cpp_backend import cpp_runtime
+
+        with cpp_runtime(config.num_threads):
+            return _solve_impl_unscoped(problem, config)
+    return _solve_impl_unscoped(problem, config)
+
+
+def _solve_impl_unscoped(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig) -> Result:
     if config.backend == "native":
         from hello_ot._native_compat import require_native_runtime_compatibility
 
@@ -279,8 +292,8 @@ def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig)
         "cost_type": _reported_cost_type(problem),
         "assignment_mode": "nodewise_bidirectional",
         "assignment_topk": int(config.assignment_topk),
-        "feature_precision": "fp64" if config.backend == "torch" else "fp32",
-        "score_precision": "fp64" if config.backend == "torch" else "fp32_dimension_fp64_scalar",
+        "feature_precision": "fp64" if config.backend in {"torch", "cpp"} else "fp32",
+        "score_precision": "fp64" if config.backend in {"torch", "cpp"} else "fp32_dimension_fp64_scalar",
         "cost_precision": str(config.cost_precision),
         "input_feature_precision": "fp32",
         "intermediate_cost_precision": level_cost_precision(
@@ -290,6 +303,7 @@ def _solve_impl(problem: Problem | _PreparedOTProblem, config: _AlgorithmConfig)
             config.cost_precision, level_index=0
         ),
         "backend": str(config.backend),
+        "num_threads": torch.get_num_threads() if config.backend == "cpp" else None,
         "device": str(solve_device),
         "coarsest_solver": "pot",
         "consume_input_features": bool(config.consume_input_features),

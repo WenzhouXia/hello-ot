@@ -41,6 +41,13 @@ The union of dual-assigned candidates and a northwest-corner feasible basis. Use
 
 The transport LP restricted to the current active support. The production backend is the bundled CuPDLPx implementation. `solve_lp` is an internal operation, not a second public solver API.
 
+## CPU C++ backend
+
+The optional `backend="cpp"` is the official CPU implementation of balanced
+point-cloud HELLO, displayed as `HELLO (C++)`. It shares the hierarchy and
+refinement algorithm, uses the independently installed `hello-ot-cpp` kernels,
+and defaults to `num_threads=16`. The `torch` and `native` backends remain available.
+
 ## Dual score and reduced cost
 
 The paper uses the dual score $\sigma_{ij}=f_i+g_j-c_{ij}$. Code may compute the reduced cost $r_{ij}=c_{ij}-u_i-v_j=-\sigma_{ij}$. A dual violation means $\sigma_{ij}>0$, equivalently $r_{ij}<0$.
@@ -63,6 +70,8 @@ Controls active-support size while protecting the feasible basis, current primal
 
 ## Active support
 
+The paper notation is $\mathcal{N}$, consistent with HELLO; use it also in restricted operators and hierarchy-level support indices.
+
 The sparse set of edges on which the restricted OT problem is solved. Prefer `active support`; avoid `active set` and `working set` in documentation.
 
 ## HELLO costs
@@ -78,7 +87,3 @@ After `auto` activates at a hierarchy level, the first perturbed-cost LP certifi
 Cost-stage names have one contract in both execution paths: `off` and `auto` without activation return `original`; `on` returns `perturbed`, `original_final`; activated `auto` returns `original`, `perturbed`, `original_final`.
 
 For norm costs, index hash uses a shared FP32 approximate-remainder rule in NumPy, Torch, and native CUDA, with fixed operation order and FP64 amplitude multiplication. It is not an exact integer-modulo hash; boundary values may slightly exceed one and are not clipped.
-
-## Active-support re-entry
-
-An edge added by dual-violation insertion that was removed by budgeted pruning in the immediately preceding round. In `auto`, any such re-entry starts one LP observation period. If the next full optimality check still fails, cost perturbation is activated at the current level and retained at finer levels before final original-cost refinement. This is a heuristic trigger, not a proof of cycling. History is reset between levels and never accumulated across rounds.

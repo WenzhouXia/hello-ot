@@ -87,6 +87,10 @@ def build_lp_backend(config: SolverRuntimeConfig) -> Any:
         )
     if config.solver_engine == "torch_pdlp":
         return TorchRestrictedOTPDLP(device=resolve_torch_device(config.torch_device))
+    if config.solver_engine == "cpp_pdlp":
+        from hello_ot._internal.lp.cpp_restricted_ot import CppRestrictedOTPDLP
+
+        return CppRestrictedOTPDLP(num_threads=config.num_threads)
     raise ValueError(f"unsupported HELLO LP backend: {config.solver_engine}")
 
 

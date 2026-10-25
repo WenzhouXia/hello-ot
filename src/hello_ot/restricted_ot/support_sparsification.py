@@ -39,7 +39,7 @@ def _load_extension() -> Any:
     EN: Lazily load the formal C++ extension so unrelated solver paths remain unaffected.
     """
     try:
-        from hello_ot._native.support_sparsifier import _support_sparsifier_ext
+        from hello_ot_native import _support_sparsifier_ext
     except ImportError as error:  # pragma: no cover - depends on the local extension build
         raise RuntimeError(
             "The restricted-OT support sparsifier extension is not built. "

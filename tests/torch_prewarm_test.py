@@ -14,7 +14,7 @@ def test_torch_cpu_prewarm_does_not_import_native(monkeypatch) -> None:
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if str(name).startswith("hello_ot._native"):
+        if str(name).startswith(("hello_ot._native", "hello_ot_native")):
             raise AssertionError(f"Torch prewarm imported native module: {name}")
         return original_import(name, *args, **kwargs)
 

@@ -17,7 +17,7 @@ from hello_ot.kernels.scan_contract import (
 _CUDA_CPP_DUAL_FEASIBILITY_EXT: Any = None
 _CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR: str | None = None
 _CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE = (
-    "hello_ot._native.inner_product_scan.hierot_inner_product_scan_ext"
+    "hello_ot_native.hierot_inner_product_scan_ext"
 )
 _STREAMING_RAW_QUERY_TILE = 1024
 _STREAMING_RAW_DB_TILE = 8192
@@ -35,7 +35,8 @@ def _load_cuda_cpp_dual_feasibility_extension() -> Any:
     except Exception as exc:  # noqa: BLE001
         _CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR = (
             f"Failed to import installed CUDA C++ dual feasibility extension "
-            f"{_CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE!r}. Reinstall hello-ot so the extension is built. "
+            f"{_CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE!r}. Install the matching hello-ot-native release "
+            "with bash scripts/install_native.sh ENV_NAME. "
             f"Original error: {exc!r}"
         )
         raise RuntimeError(_CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR) from exc

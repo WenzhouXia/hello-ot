@@ -614,8 +614,11 @@ def run_metric_dual_feasibility_scan(
         "use_fused_metric_feasibility_pricing": True,
         "metric_cost_type": cost_type,
     }
-    if str(getattr(config, "backend", "native")) == "torch":
-        from hello_ot.kernels.torch_scan import bidirectional_violation_scan
+    if str(getattr(config, "backend", "native")) in {"torch", "cpp"}:
+        if config.backend == "cpp":
+            from hello_ot.kernels.cpp_scan import cpp_violation_scan as bidirectional_violation_scan
+        else:
+            from hello_ot.kernels.torch_scan import bidirectional_violation_scan
 
         source_np = np.asarray(lvl_s.points, dtype=np.float32, order="C")
         target_np = np.asarray(lvl_t.points, dtype=np.float32, order="C")

@@ -10,7 +10,7 @@ from hello_ot.refinement.support_budget import (
 )
 
 StoppingNormPolicy = Literal["l2", "finest_linf"]
-BackendName = Literal["native", "torch"]
+BackendName = Literal["native", "torch", "cpp"]
 TorchDeviceName = Literal["auto", "cpu", "cuda"]
 VerboseMode = Literal["off", "compact", "detailed"]
 CostPrecision = Literal["fp32", "fp64", "finest_fp64"]
@@ -70,6 +70,7 @@ class SolverOptions:
     cost_perturbation_relative_scale: float = 0.01
     cost_precision: CostPrecision = "fp32"
     gpu_resident: bool = False
+    num_threads: Optional[int] = 16
 
     def __post_init__(self) -> None:
         if not isinstance(self.gpu_resident, bool):
@@ -101,8 +102,12 @@ class SolverOptions:
         object.__setattr__(self, "support_budget_factor", support_budget_factor)
         if self.fused_scan_memory_floor_mib <= 0.0:
             raise ValueError("fused_scan_memory_floor_mib must be > 0")
-        if self.backend not in {"native", "torch"}:
-            raise ValueError("backend must be one of: native, torch")
+        if self.backend not in {"native", "torch", "cpp"}:
+            raise ValueError("backend must be one of: native, torch, cpp")
+        if self.num_threads is not None and (isinstance(self.num_threads, bool) or not isinstance(self.num_threads, int) or self.num_threads < 1):
+            raise ValueError("num_threads must be a positive integer or None")
+        if self.backend == "cpp" and self.torch_device == "cuda":
+            raise ValueError("backend='cpp' supports CPU only")
         if self.torch_device not in {"auto", "cpu", "cuda"}:
             raise ValueError("torch_device must be one of: auto, cpu, cuda")
 
@@ -127,7 +132,8 @@ class SolverOptions:
             consume_input_features=self.consume_input_features,
             gpu_resident=self.gpu_resident,
             backend=self.backend,
-            torch_device=self.torch_device,
+            torch_device="cpu" if self.backend == "cpp" else self.torch_device,
+            num_threads=self.num_threads,
             cost_perturbation=self.cost_perturbation,
             cost_perturbation_relative_scale=self.cost_perturbation_relative_scale,
             cost_precision=self.cost_precision,
@@ -156,6 +162,7 @@ class _AlgorithmConfig:
     backend: BackendName
     torch_device: TorchDeviceName
     cost_perturbation: str = "off"
+    num_threads: Optional[int] = 16
     cost_perturbation_relative_scale: float = 0.01
     cost_precision: CostPrecision = "fp32"
     dual_feasibility_tolerance: float = 1e-6
@@ -199,6 +206,7 @@ class SolverRuntimeConfig:
     cupdlpx_python_pre_rescale: bool
     backend: BackendName = "native"
     torch_device: str = "cuda"
+    num_threads: Optional[int] = 16
     dot_scale: float = 1.0
     pricing_strategy: str = "nodewise_full"
     pricing_direction: str = "both"
@@ -250,7 +258,7 @@ class SolverRuntimeConfig:
         }
         runtime = cls(
             cost_type=str(cost_type),
-            solver_engine="cupdlpx" if config.backend == "native" else "torch_pdlp",
+            solver_engine={"native": "cupdlpx", "torch": "torch_pdlp", "cpp": "cpp_pdlp"}[config.backend],
             tolerance=float(config.lp_tolerance),
             max_inner_iter=int(config.max_iterations),
             dual_feasibility_tol=float(config.dual_feasibility_tolerance),
@@ -267,6 +275,7 @@ class SolverRuntimeConfig:
             bound_objective_rescaling=config.bound_objective_rescaling,
             cupdlpx_python_pre_rescale=bool(config.cupdlpx_python_pre_rescale),
             backend=config.backend,
+            num_threads=config.num_threads,
             torch_device=str(config.torch_device),
             record_dual_linf_diagnostics=(config.backend == "native" and str(cost_type) == "lowrank"),
             runtime_logging=dict(printing),
@@ -293,8 +302,8 @@ class SolverRuntimeConfig:
             raise ValueError("verbosity must be one of: off, compact, detailed")
         if float(self.dot_scale) not in {1.0, 2.0}:
             raise ValueError("dot_scale must be exactly 1 or 2")
-        if self.solver_engine not in {"cupdlpx", "torch_pdlp"}:
-            raise ValueError("HELLO solver_engine must be cupdlpx or torch_pdlp")
+        if self.solver_engine not in {"cupdlpx", "torch_pdlp", "cpp_pdlp"}:
+            raise ValueError("HELLO solver_engine must be cupdlpx, torch_pdlp or cpp_pdlp")
         if self.max_inner_iter < 1:
             raise ValueError("max_inner_iter must be >= 1")
         if self.tolerance <= 0.0 or self.dual_feasibility_tol < 0.0:
