@@ -55,13 +55,13 @@ f, g = result.solution.source_dual, result.solution.target_dual
 
 数组调用默认使用均匀质量与平方欧氏代价，也可以直接传入 `source_mass`、`target_mass`，并用 `cost="l1"`、`"l2"` 或 `"linf"` 选择其他代价函数。
 
-高级选项集中在 `hello_ot.SolverOptions` 中（如 `backend="native", "torch", "cpp"`）。
+通过 `hello_ot.SolverOptions` 选择后端：`backend="torch"`（PyTorch）、`backend="native"`（CUDA）或 `backend="cpp"`（C++ CPU）。
 
-> **提示**：仓库内提供完整的验证脚本：
-> ```bash
-> python3 examples/quickstart.py
-> ```
-> 脚本会自动完成端到端求解，并输出原始可行性、对偶可行性与 Brenier 解析真值误差。
+运行 quickstart，求解测试问题并与解析解对比：
+
+```bash
+python3 examples/quickstart.py
+```
 
 ## 安装指南
 
@@ -80,16 +80,12 @@ python3 -m pip install .
 bash scripts/create_hello_ot_env.sh hello_ot
 ```
 
-脚本会安装 Python 3.12、带 CUDA 11.8 runtime 的 PyTorch 2.7.1、
-NumPy 1.26.4、SciPy 1.15.3 和 portable HELLO-OT，然后运行 torch backend
-quickstart。脚本优先使用 Conda，找不到时使用 Micromamba，并在完成后打印
-对应的激活命令。将最后一个参数改成 `hello_ot_test`，即可创建另一个测试环境。
+脚本会创建 Python 3.12、PyTorch 2.7.1/CUDA 11.8 环境并安装 HELLO-OT。
 
 ---
 
 ### 2. CUDA：极致性能（`backend="native"`）
 
-包含高性能 CUDA 流式扫描算子与 CUDA 原生 LP 求解器
 - **支持架构**：NVIDIA GPU（算力 `sm_80`、`sm_86`、`sm_89`、`sm_90`，覆盖 A100、RTX 3080 Ti/3090、RTX 4060 Ti/4090、H100 等）；
 - **目标环境**：Linux x86-64（glibc ≥ 2.29）、Python 3.12、PyTorch 2.7.1+cu118。
 
@@ -100,9 +96,6 @@ quickstart。脚本优先使用 Conda，找不到时使用 Micromamba，并在�
 ```bash
 bash scripts/install_native.sh hello_ot
 ```
-
-该命令在已有环境中安装核心包 `hello-ot` 和独立的 `hello-ot-native` 扩展包，
-不会安装 C++ CPU 扩展。
 
 #### 方式 B：从源码编译构建
 
@@ -116,26 +109,24 @@ scripts/build_native_wheel.sh dist
 python3 -m pip install dist/hello_ot_native-*.whl
 ```
 
-源码编译同样要求上述 Python/PyTorch/CUDA/ABI 组合，不能用于绕过环境不兼容。
-安装脚本会在修改包之前显示期望和实际环境信息。
+源码编译同样要求上述 Python/PyTorch/CUDA 版本。
 
 ### 3. C++ CPU（`backend="cpp"`）
 
 `HELLO (C++)` 为其他研究者提供官方 CPU 实现，方便与 CPU 算法进行对比。
 
-- **支持问题**：平衡点云 OT，支持 `l2^2`、`l1`、`l2`、`linf` 成本。此后端暂不支持 GW/UOT/SDOT、GPU-resident 或 `finest_linf`。
+- **支持问题**：平衡点云 OT，支持 `l2^2`、`l1`、`l2`、`linf` 成本。
 - **目标环境**：Linux x86-64（glibc ≥ 2.29）、Python 3.12、PyTorch（CPU 或 CUDA 版本），以及 `libstdc++` / `libgomp` 运行库。无需 CUDA。
 
 #### 方式 A：安装预编译 Wheel（推荐，无需本地编译）
+
+如果已安装 v0.1.0 CUDA 版本，请先运行 `bash scripts/install_native.sh hello_ot`，再安装 C++ 后端。
 
 在已有环境中安装，并自动运行检查和 quickstart：
 
 ```bash
 bash scripts/install_cpp.sh hello_ot
 ```
-
-脚本安装核心包 `hello-ot` 和独立的 `hello-ot-cpp` 扩展包。
-旧 v0.1.0 整包 native 用户需先运行一次新的 CUDA 安装脚本完成迁移。
 
 #### 方式 B：从源码编译构建
 
@@ -153,8 +144,7 @@ python3 -m pip install dist/cpp/hello_ot_cpp-*.whl
 python3 examples/quickstart.py --backend cpp --num-threads 16
 ```
 
-Python API 使用 `SolverOptions(backend="cpp", num_threads=16)`；`None` 沿用环境设置。
-线程限制为进程级设置，调用结束后恢复；需要不同线程预算的并发求解应使用独立进程。
+Python API 使用 `SolverOptions(backend="cpp", num_threads=16)`，修改 `num_threads` 即可调整线程数。
 
 ### 4. GPU JAX 与论文实验复现
 
@@ -165,8 +155,6 @@ bash scripts/install_jax_gpu.sh hello_ot
 conda activate hello_ot
 ```
 
-安装脚本会保留 PyTorch 使用的 cuDNN 9，并把 CUDA 11 JAX 需要的 cuDNN 8
-放在独立目录中。激活环境时会自动选择正确的 CUDA 11.8 工具和动态库。
 Micromamba 环境使用 `micromamba activate hello_ot`。
 
 各实验的具体说明与运行指南请参阅 [export_experiments/README.md](export_experiments/README.md)。

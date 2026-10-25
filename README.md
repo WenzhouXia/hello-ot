@@ -2,7 +2,7 @@
 
 **English** | [**简体中文**](README.zh-CN.md)
 
-HELLO is a high-performance solver for large-scale, unregularized discrete optimal transport (OT) between point clouds. By combining a dual-guided hierarchy with efficient GPU parallelization, it computes exact sparse transport plans with low memory, fast runtime, and high accuracy. On a single A100 or H100 GPU, HELLO solves instances with millions of points across thousands of feature dimensions.
+HELLO is a high-performance solver for large-scale, unregularized discrete optimal transport (OT) between point clouds. By combining a dual-guided hierarchy with efficient GPU parallelization, it computes high-accuracy sparse transport plans with low memory and fast runtime. On a single A100 or H100 GPU, HELLO solves instances with millions of points across thousands of feature dimensions.
 
 ### Why Choose HELLO?
 - **High-Accuracy Sparse Solutions**: Solves unregularized discrete OT to a prescribed full-space relative KKT tolerance (alongside corresponding dual potentials);
@@ -53,54 +53,15 @@ x = result.solution.to_sparse_matrix()
 f, g = result.solution.source_dual, result.solution.target_dual
 ```
 
-Array inputs use uniform marginals and squared Euclidean cost by default. Non-uniform masses can be specified via `source_mass` and `target_mass`, and alternative ground costs selected via `cost="l1"`, `"l2"`, or `"linf"`.
+Inputs use uniform masses and squared Euclidean cost by default. Use `source_mass` and `target_mass` for non-uniform masses, and `cost="l1"`, `"l2"`, or `"linf"` for other supported costs.
 
-Advanced options are configured through `hello_ot.SolverOptions` (e.g., `backend="native"`, `backend="torch"`).
+Select a backend through `hello_ot.SolverOptions`: `backend="torch"` (PyTorch), `backend="native"` (CUDA), or `backend="cpp"` (C++ CPU).
 
-### Optional GPU-resident pipeline
+Run the quickstart to solve a test problem and check the result against its analytical solution:
 
-`hello_ot.solve` accepts NumPy arrays and PyTorch tensors. By default, CUDA
-inputs are copied to CPU and use the existing streamed solver and NumPy results.
-Existing experiment settings and their memory strategy are unchanged.
-
-For contiguous FP32 tensors already on the same CUDA device, explicitly enable:
-
-```python
-result = hello_ot.solve(
-    source_cuda, target_cuda,
-    options=hello_ot.SolverOptions(
-        gpu_resident=True,
-        consume_input_features=True,
-    ),
-)
-plan = result.solution.to_sparse_matrix()
-f, g = result.solution.source_dual, result.solution.target_dual
-cpu_solution = result.solution.to_cpu()
+```bash
+python3 examples/quickstart.py
 ```
-
-This requires rebuilding the native extensions from this source revision; older
-prebuilt wheels do not include CuPDLPx GPU array I/O. This option currently covers
-balanced `hello_ot.solve`. Both clouds, active support, LP state and result arrays
-stay on GPU. Leaf POT `emd` and triggered support sparsification are explicit CPU
-exceptions, recorded in `result.metadata["transfers"]` by calls, bytes and seconds.
-Python control flow and scalar diagnostics still run on CPU.
-
-With `consume_input_features=True`, HELLO temporarily reorders the inputs in place
-using bounded scratch and restores their values/order on return or an ordinary
-exception. The caller must give HELLO exclusive access during the call and build
-any feature-gradient graph **after** it returns: restoration does not reset
-PyTorch's tensor version counters. Solver outputs are detached. With this option
-false, HELLO creates reordered GPU copies instead. GPU OOM raises an error without
-a CPU fallback; a fatal CUDA error may prevent restoration.
-
-Run `python3 scripts/validate_gpu_release.py` from a native CUDA checkout to
-validate the GPU-resident path together with the other GPU release checks.
-
-> **Tip**: A complete verification script is bundled in the repository:
-> ```bash
-> python3 examples/quickstart.py
-> ```
-> The script solves the problem end-to-end and verifies primal feasibility, dual feasibility, and objective error against the analytical Brenier ground truth.
 
 ## Installation Guide
 
@@ -119,16 +80,12 @@ the paper reproduction, create the recommended `hello_ot` environment:
 bash scripts/create_hello_ot_env.sh hello_ot
 ```
 
-The script installs Python 3.12, PyTorch 2.7.1 with the CUDA 11.8 runtime,
-NumPy 1.26.4, SciPy 1.15.3, and the portable HELLO-OT package. It prefers
-Conda and falls back to Micromamba. Replace the final argument with another
-name, such as `hello_ot_test`, to create a separate environment.
+The script creates an environment with Python 3.12 and PyTorch 2.7.1/CUDA 11.8, and installs HELLO-OT.
 
 ---
 
 ### 2. CUDA: Extreme Performance (`backend="native"`)
 
-Includes resident-streamed CUDA scan kernels and a CUDA-native LP solver:
 - **Supported Architectures**: NVIDIA GPUs with compute capabilities `sm_80`, `sm_86`, `sm_89`, `sm_90` (A100, RTX 3080 Ti/3090, RTX 4060 Ti/4090, H100, etc.);
 - **Target Environment**: Linux x86-64 (glibc ≥ 2.29), Python 3.12, PyTorch 2.7.1+cu118.
 
@@ -139,9 +96,6 @@ After creating the environment above, install and verify the native wheel:
 ```bash
 bash scripts/install_native.sh hello_ot
 ```
-
-The script installs the core `hello-ot` and the separate `hello-ot-native`
-extension in the existing environment. It does not install the C++ CPU extension.
 
 #### Option B: Build from Source
 
@@ -155,28 +109,25 @@ scripts/build_native_wheel.sh dist
 python3 -m pip install dist/hello_ot_native-*.whl
 ```
 
-Source builds retain the documented Python/PyTorch/CUDA/ABI requirements;
-they are not a way to bypass an incompatible environment. The installer
-reports expected and actual versions before changing packages.
+Source builds require the same Python/PyTorch/CUDA versions listed above.
 
 ### 3. C++ CPU (`backend="cpp"`)
 
 `HELLO (C++)` is the official CPU implementation for researchers comparing HELLO
 with CPU methods.
 
-- **Supported problems**: Balanced point-cloud OT with `l2^2`, `l1`, `l2`, and `linf` costs. GW/UOT/SDOT, GPU-resident execution, and `finest_linf` are not supported by this backend.
+- **Supported problems**: Balanced point-cloud OT with `l2^2`, `l1`, `l2`, and `linf` costs.
 - **Target environment**: Linux x86-64 (glibc ≥ 2.29), Python 3.12, PyTorch (CPU or CUDA), and the `libstdc++`/`libgomp` runtimes. CUDA is not required.
 
 #### Option A: Install Prebuilt Wheel (Recommended, No Local Compilation)
+
+If you have the v0.1.0 CUDA package installed, run `bash scripts/install_native.sh hello_ot` before installing the C++ backend.
 
 Install into the existing environment and run the built-in checks and quickstart:
 
 ```bash
 bash scripts/install_cpp.sh hello_ot
 ```
-
-The script installs `hello-ot` and the independent `hello-ot-cpp` extension.
-For an old combined v0.1.0 native installation, run the new CUDA installer once first.
 
 #### Option B: Build from Source
 
@@ -194,9 +145,7 @@ Run with 16 threads (the default):
 python3 examples/quickstart.py --backend cpp --num-threads 16
 ```
 
-In Python, use `SolverOptions(backend="cpp", num_threads=16)`; `None` inherits
-the environment. Thread limits are process-wide and restored after each call;
-use separate processes for concurrent solves with different thread budgets.
+In Python, use `SolverOptions(backend="cpp", num_threads=16)` and adjust `num_threads` to set the thread count.
 
 ### 4. GPU JAX and Paper Reproduction
 
@@ -210,9 +159,6 @@ bash scripts/install_jax_gpu.sh hello_ot
 conda activate hello_ot
 ```
 
-The installer keeps PyTorch on cuDNN 9 and places the CUDA 11 JAX requirement
-on cuDNN 8 in an isolated sidecar. The environment activation hook selects the
-correct CUDA 11.8 tools and libraries automatically. Micromamba environments
-use `micromamba activate hello_ot` instead.
+For Micromamba environments, use `micromamba activate hello_ot` instead.
 
 For detailed execution instructions, please refer to [export_experiments/README.md](export_experiments/README.md).
