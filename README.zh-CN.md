@@ -1,5 +1,7 @@
 # HELLO
 
+[**English**](README.md) | **简体中文**
+
 HELLO 是一个面向大规模点云间无正则离散最优传输（OT）的高性能求解器，通过对偶引导的多层级结构与 GPU 高效并行，以低显存、低耗时、高精度给出稀疏解，单卡 A100/H100 上能求解百万规模、上万维度的 OT 问题。
 
 ### 为什么选择 HELLO？
@@ -7,7 +9,7 @@ HELLO 是一个面向大规模点云间无正则离散最优传输（OT）的高
 - **百万级单卡求解**：显存占用保持 $\mathcal{O}(n+m)$，**“能存点云就能算”**，单卡峰值显存仅 $41.6\text{ GiB}$ 即可求解 $n=m=1.28\times10^6, d=8192$ 规模问题；
 - **高维也能算**：从低维到高维（$d>10^3$），算法均保持高效；
 - **适用于不同 cost**：不仅是 $\ell_2^2$，还支持 $\ell_1, \ell_2, \ell_\infty$ 等一般的代价函数（cost）；
-- **双后端开箱即用**：提供纯 PyTorch 后端（保证开箱即用）与 CUDA 原生后端（极致性能）；
+- **多后端支持**：提供 PyTorch 后端、CUDA 原生后端，以及用于平衡 OT 的 C++ CPU 后端；
 - **更多 OT 变体**：开箱支持半离散 OT（Semi-discrete OT）、Gromov-Wasserstein（GW）、非平衡 OT（UOT）。
 
 <table style="width: 100%;">
@@ -120,42 +122,39 @@ python3 -m pip install dist/hello_ot_native-*.whl
 ### 3. C++ CPU（`backend="cpp"`）
 
 `HELLO (C++)` 为其他研究者提供官方 CPU 实现，方便与 CPU 算法进行对比。
-它共用分层和 refinement 算法，使用 C++/OpenMP restricted OT 与扫描内核，
-同时保留 Python 控制、PyTorch/BLAS 和最粗层的 POT 求解，不是独立 C++ 库。
-首轮支持 balanced 点云 OT 的 `l2^2`、`l1`、`l2`、`linf` 成本、三种成本精度策略和
-成本扰动；暂不支持此后端上的 GW/UOT/SDOT、GPU-resident 或 `finest_linf`。
 
-首批预编译 wheel 面向 Linux x86-64、Python 3.12。在已有 Conda/Micromamba
-环境中安装，PyTorch 可以是 CPU 或 CUDA 版本；C++ 扩展不链接 LibTorch，也不要求 CUDA。
-预编译包要求 glibc >= 2.29，以及可用的系统 C++ 和 GNU OpenMP 运行库（`libstdc++`、`libgomp`）：
+- **支持问题**：平衡点云 OT，支持 `l2^2`、`l1`、`l2`、`linf` 成本。此后端暂不支持 GW/UOT/SDOT、GPU-resident 或 `finest_linf`。
+- **目标环境**：Linux x86-64（glibc ≥ 2.29）、Python 3.12、PyTorch（CPU 或 CUDA 版本），以及 `libstdc++` / `libgomp` 运行库。无需 CUDA。
+
+#### 方式 A：安装预编译 Wheel（推荐，无需本地编译）
+
+在已有环境中安装，并自动运行检查和 quickstart：
 
 ```bash
 bash scripts/install_cpp.sh hello_ot
 ```
 
-脚本下载独立的 `hello-ot-cpp` wheel、安装匹配的核心、检查扩展并运行 quickstart。
-两个后端安装脚本都不会创建环境或替换已有 PyTorch 的 CPU/CUDA 类型。
-`hello-ot-native` 与 `hello-ot-cpp` 安装文件互不重叠，重新安装核心不会删除扩展。
-两个脚本均接受 `--wheel /绝对路径/文件.whl` 来安装本地构建产物。
+脚本安装核心包 `hello-ot` 和独立的 `hello-ot-cpp` 扩展包。
+旧 v0.1.0 整包 native 用户需先运行一次新的 CUDA 安装脚本完成迁移。
 
-源码编译时，激活上述 Python 3.12 环境，并准备支持 C++17/OpenMP 的 `g++`：
+#### 方式 B：从源码编译构建
+
+激活上述环境，并准备支持 C++17/OpenMP 的 `g++`：
 
 ```bash
 python3 -m pip install '.[cpp-build]'
 bash scripts/build_cpp_wheel.sh dist/cpp
 python3 -m pip install dist/cpp/hello_ot_cpp-*.whl
-python3 -m hello_ot.diagnose --require-cpp
+```
+
+使用 16 线程（默认值）运行：
+
+```bash
 python3 examples/quickstart.py --backend cpp --num-threads 16
 ```
 
-编译只发生在构建 wheel 时，`solve` 和 `prewarm` 不触发编译。缺少扩展会明确提示
-安装方法。旧 v0.1.0 整包 native 用户先运行新 CUDA 安装脚本完成一次迁移，再添加 C++，
-避免拆包时丢失 CUDA 支持。已有 v0.1.0 公开产物保持原状。
-
-API 使用 `SolverOptions(backend="cpp", num_threads=16)`，默认 16 线程；可改为其他
-正整数，或传 `None` 沿用环境设置。显式设置临时控制 Torch/BLAS/OpenMP 并在退出时恢复。
-这些线程控制是进程级的，需要独立线程预算的并发求解应放在不同进程中。
-已有 PyTorch/native 的线程策略不变。
+Python API 使用 `SolverOptions(backend="cpp", num_threads=16)`；`None` 沿用环境设置。
+线程限制为进程级设置，调用结束后恢复；需要不同线程预算的并发求解应使用独立进程。
 
 ### 4. GPU JAX 与论文实验复现
 

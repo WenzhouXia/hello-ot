@@ -1,5 +1,7 @@
 # HELLO
 
+**English** | [**简体中文**](README.zh-CN.md)
+
 HELLO is a high-performance solver for large-scale, unregularized discrete optimal transport (OT) between point clouds. By combining a dual-guided hierarchy with efficient GPU parallelization, it computes exact sparse transport plans with low memory, fast runtime, and high accuracy. On a single A100 or H100 GPU, HELLO solves instances with millions of points across thousands of feature dimensions.
 
 ### Why Choose HELLO?
@@ -160,56 +162,41 @@ reports expected and actual versions before changing packages.
 ### 3. C++ CPU (`backend="cpp"`)
 
 `HELLO (C++)` is the official CPU implementation for researchers comparing HELLO
-with CPU methods. It shares the hierarchy and refinement algorithm and retains
-Python control, PyTorch/BLAS, and POT for the coarsest solve. It is not a standalone
-C++ library. This backend supports balanced point-cloud OT with `l2^2`, `l1`,
-`l2`, and `linf` costs, all three cost precision policies, and cost perturbation.
-GW, UOT, SDOT, GPU-resident execution, and `finest_linf` stopping are not supported
-by this backend.
+with CPU methods.
 
-The first prebuilt extensions target Linux x86-64 (glibc >= 2.29) and Python 3.12,
-with the system C++ and GNU OpenMP runtimes (`libstdc++` and `libgomp`) available.
-Use an existing
-Conda/Micromamba environment containing PyTorch (CPU or CUDA) and the numerical
-dependencies. The CPU extension does not link LibTorch and does not require CUDA.
+- **Supported problems**: Balanced point-cloud OT with `l2^2`, `l1`, `l2`, and `linf` costs. GW/UOT/SDOT, GPU-resident execution, and `finest_linf` are not supported by this backend.
+- **Target environment**: Linux x86-64 (glibc ≥ 2.29), Python 3.12, PyTorch (CPU or CUDA), and the `libstdc++`/`libgomp` runtimes. CUDA is not required.
+
+#### Option A: Install Prebuilt Wheel (Recommended, No Local Compilation)
+
+Install into the existing environment and run the built-in checks and quickstart:
 
 ```bash
 bash scripts/install_cpp.sh hello_ot
 ```
 
-The script downloads `hello-ot-cpp`, installs the matching core, checks the
-extensions, and runs the C++ quickstart. Neither installer creates an environment
-or replaces the existing CPU/CUDA PyTorch flavor. The `hello-ot-native` and
-`hello-ot-cpp` packages own disjoint files and survive core reinstalls. Either
-installer accepts `--wheel /absolute/path/to/the.whl` for a locally built artifact.
+The script installs `hello-ot` and the independent `hello-ot-cpp` extension.
+For an old combined v0.1.0 native installation, run the new CUDA installer once first.
 
-For a source build, activate the Python 3.12 Linux x86-64 environment and provide
-`g++` with C++17/OpenMP support:
+#### Option B: Build from Source
+
+Activate the environment above and provide `g++` with C++17/OpenMP support:
 
 ```bash
 python3 -m pip install '.[cpp-build]'
 bash scripts/build_cpp_wheel.sh dist/cpp
 python3 -m pip install dist/cpp/hello_ot_cpp-*.whl
-python3 -m hello_ot.diagnose --require-cpp
+```
+
+Run with 16 threads (the default):
+
+```bash
 python3 examples/quickstart.py --backend cpp --num-threads 16
 ```
 
-Compilation occurs while building wheels, never during `solve` or `prewarm`.
-Missing extensions produce installation instructions instead of a silent backend
-fallback. Migrate an old combined v0.1.0 native installation once with the new
-CUDA installer before adding C++; this preserves CUDA support during the split.
-Existing v0.1.0 release artifacts remain unchanged.
-
-```python
-options = hello_ot.SolverOptions(backend="cpp", num_threads=16)
-result = hello_ot.solve(source, target, options=options)
-```
-
-The default is 16 threads; use another positive integer, or `None` to inherit
-the environment. Explicit limits temporarily cover Torch/BLAS/OpenMP and are
-restored on exit. These settings are process-wide: use separate processes for
-concurrent solves requiring independent thread budgets. Existing PyTorch/native
-thread policies are unchanged.
+In Python, use `SolverOptions(backend="cpp", num_threads=16)`; `None` inherits
+the environment. Thread limits are process-wide and restored after each call;
+use separate processes for concurrent solves with different thread budgets.
 
 ### 4. GPU JAX and Paper Reproduction
 
