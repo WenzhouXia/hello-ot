@@ -92,7 +92,24 @@ def pair_costs_metric(
     batch_size: int = 65536,
     perturbation: Optional[Dict[str, Any]] = None,
     compute_precision: str = "fp32",
+    cached_points: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Any:
+    if (compute_precision == "fp64" and torch.is_tensor(rows) and rows.is_cuda
+            and np.asarray(source_points).dtype == np.float32 and np.asarray(target_points).dtype == np.float32):
+        from hello_ot.kernels.norm_cost_scan import _require_norm_cost_scan_ext, _fused_cost_type_id
+        from hello_ot.costs.metric_perturbation import _fused_perturb_arguments
+        ext = _require_norm_cost_scan_ext()
+        if hasattr(ext, "fused_gcost_pairs"):
+            device = rows.device
+            source, target = cached_points if cached_points is not None else (
+                torch.as_tensor(source_points, device=device, dtype=torch.float32).contiguous(),
+                torch.as_tensor(target_points, device=device, dtype=torch.float32).contiguous())
+            rr = rows.to(device=device, dtype=torch.int64).contiguous()
+            cc = torch.as_tensor(cols, device=device, dtype=torch.int64).contiguous()
+            sigma, seed, mode, si, ti, coeffs = _fused_perturb_arguments(perturbation=perturbation,
+                query_global_index=None if perturbation is None else perturbation["source_global_index"],
+                database_global_index=None if perturbation is None else perturbation["target_global_index"], device=device)
+            return ext.fused_gcost_pairs(source, target, rr, cc, _fused_cost_type_id(cost_type), si, ti, sigma, seed, mode, coeffs)
     if compute_precision == "fp64":
         rows_is_torch = torch.is_tensor(rows)
         if rows_is_torch:
@@ -246,6 +263,7 @@ def augment_topk_metric(
     trace_args: Dict[str, Any],
     perturbation: Optional[Dict[str, Any]] = None,
     compute_precision: str = "fp32",
+    cost_statistics: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DualAssignmentState, Dict[str, Any], Dict[str, Any], DualCompletionCandidate]:
     if str(known_side) not in {"source", "target"}:
         raise ValueError("known_side must be either 'source' or 'target'.")
@@ -280,6 +298,7 @@ def augment_topk_metric(
             database_global_index=None if perturbation is None else perturbation["target_global_index" if query_is_source else "source_global_index"][part_idx],
             perturbation=perturbation,
             compute_precision=compute_precision,
+            cost_statistics=cost_statistics,
         )
         topk_time += float(time.perf_counter() - t_topk)
         part_t = torch.as_tensor(part_idx, dtype=torch.int64, device=local_idx_t.device)

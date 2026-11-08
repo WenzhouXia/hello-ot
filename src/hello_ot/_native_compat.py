@@ -16,6 +16,10 @@ def native_runtime_compatibility() -> tuple[bool, str]:
     torch_version = str(torch.__version__).split("+", 1)[0]
     cuda_runtime = torch.version.cuda
     cxx11_abi = bool(torch._C._GLIBCXX_USE_CXX11_ABI)
+    from hello_ot._source_build import source_mode
+
+    if source_mode():
+        return True, "source build: binary compatibility follows the active toolchain"
     compatible = (
         torch_version == NATIVE_TORCH_VERSION
         and cuda_runtime == NATIVE_CUDA_RUNTIME

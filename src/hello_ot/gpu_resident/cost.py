@@ -101,88 +101,61 @@ def offsets(value):
     return out
 
 
-def _merge(values, indices, incoming, ids, k):
-    merged = torch.cat((values, incoming), 1)
-    keys = torch.cat((indices, ids), 1)
-    best, order = merged.topk(k, dim=1, sorted=True)
-    return best, keys.gather(1, order)
-
-
-def scan(cost, dual, k, *, certificate=False):
+def scan(cost, dual, k, *, certificate=False, direction=None):
     """
-    CN: 双向 top-k 和完整对偶证书，只返回 GPU 数组与少量标量。
-    EN: Bidirectional top-k and full dual certificates returning GPU arrays and scalar diagnostics only.
+    CN: 统一扫描覆盖全部成本、精度和扰动，支持按方向初始化。
+    EN: Cover all costs, precisions and perturbations with unified scans and directional initialization.
     """
+    from hello_ot.kernels import generic_scan as unified
+    from hello_ot.kernels.scan_contract import custom_topk_bucket
+
+    if direction not in (None, "source", "target") or (certificate and direction is not None):
+        raise ValueError("direction must be source/target or None; certificates require both directions")
     n, m = len(cost.source), len(cost.target)
-    device = cost.source.device
-    kx, ky = min(k, m), min(k, n)
-    xv = torch.full((n, kx), -torch.inf, device=device, dtype=torch.float64)
-    yv = torch.full((m, ky), -torch.inf, device=device, dtype=torch.float64)
-    xi = torch.zeros((n, kx), device=device, dtype=torch.int64)
-    yi = torch.zeros((m, ky), device=device, dtype=torch.int64)
-    numerator = torch.zeros((), device=device, dtype=torch.float64)
-    denominator = numerator.clone()
-    vmax, cmax = numerator.clone(), numerator.clone()
-    positive_count = torch.zeros((), device=device, dtype=torch.int64)
-    # CN: 原生平方距离扫描直接借用连续输入，不经过 host staging。
-    # EN: Native squared-distance scans borrow contiguous inputs without host staging.
-    if cost.kind == "l2^2" and not cost.sigma and cost.precision == "fp32":
-        from hello_ot.kernels.bilinear_topk import _load_extension
-        from hello_ot.kernels.scan_contract import custom_topk_bucket
-        ext = _load_extension()
-        bucket = custom_topk_bucket(k, score_family="inner_product")
-        chunk = max(1, min(n, 4096))
-        db_tile = max(1, min(m, 2048, cost.workspace_bytes // (max(1, chunk) * 32)))
-        u, v = dual[:n], dual[n:]
-        for start in range(0, n, chunk):
-            stop = min(n, start + chunk)
-            x, a = cost.source[start:stop], cost.source_offset[start:stop]
-            if certificate and bucket <= 8:
-                qv, qi, rv, ri, stats, _ = ext.fused_bidir_topk_stats_raw(
-                    x, cost.target, a, cost.target_offset, u[start:stop] - a,
-                    v - cost.target_offset, 128, db_tile, 256, bucket, True, True, False, 0, 2.)
-                numerator += stats[0]
-                denominator += stats[1]
-                positive_count += stats[2].long()
-                vmax = torch.maximum(vmax, qv.amax().clamp_min(0))
-                cmax = torch.maximum(cmax, stats[3])
-                xv[start:stop], xi[start:stop] = qv[:, :kx] - u[start:stop, None], qi[:, :kx]
-                yv, yi = _merge(yv, yi, rv[:, :ky] - v[:, None], ri[:, :ky].long() + start, ky)
-                continue
-            qv, qi = ext.fused_directional_topk_raw(x, cost.target, -a, v - cost.target_offset, 128, db_tile, bucket, 2.0)
-            rv, ri = ext.fused_directional_topk_raw(cost.target, x, -cost.target_offset, u[start:stop] - a, 128, min(chunk, 2048), bucket, 2.0)
-            xv[start:stop], xi[start:stop] = qv[:, :kx], qi[:, :kx]
-            yv, yi = _merge(yv, yi, rv[:, :ky], ri[:, :ky].long() + start, ky)
-            if certificate:
-                stats = ext.raw_lowrank_stats_only(x, cost.target, a, cost.target_offset, u[start:stop], v, 128, db_tile, 2.0)
-                numerator += stats[0]
-                denominator += stats[1]
-                vmax = torch.maximum(vmax, stats[3])
-                cmax = torch.maximum(cmax, stats[4])
-                positive_count += stats[2].long()
+    f, g = dual[:n], dual[n:]
+    bucket = custom_topk_bucket(k, score_family="inner_product")
+    precision = int(cost.precision == "fp64")
+    kwargs = dict(workspace_bytes=cost.workspace_bytes, compute_precision=precision)
+    if cost.kind == "l2^2":
+        kwargs.update(raw_costs=(cost.source_offset, cost.target_offset),
+                      raw_biases=(f-cost.source_offset, g-cost.target_offset))
+        if cost.sigma:
+            kwargs["raw_extras"] = (cost.source_extra, cost.target_extra, cost.sigma)
+        kind = 3
     else:
-        q = min(n, 128)
-        bytes_per_pair = 32 if cost.kind == "l2^2" else max(32, cost.source.shape[1] * 24)
-        b = max(1, min(m, 2048, cost.workspace_bytes // (q * bytes_per_pair)))
-        for i in range(0, n, q):
-            for j in range(0, m, b):
-                c = cost.tile(i, j, q, b)
-                qr, br = c.shape
-                sx = dual[n + j:n + j + br][None, :] - c
-                sy = (dual[i:i + qr, None] - c).T
-                xv[i:i + qr], xi[i:i + qr] = _merge(xv[i:i + qr], xi[i:i + qr], sx,
-                    torch.arange(j, j + br, device=device)[None, :].expand(qr, -1), kx)
-                yv[j:j + br], yi[j:j + br] = _merge(yv[j:j + br], yi[j:j + br], sy,
-                    torch.arange(i, i + qr, device=device)[None, :].expand(br, -1), ky)
-                if certificate:
-                    violation = (dual[i:i + qr, None] + sx).clamp_min(0)
-                    numerator += violation.square().sum()
-                    denominator += c.square().sum()
-                    vmax = torch.maximum(vmax, violation.amax())
-                    cmax = torch.maximum(cmax, c.abs().amax())
-                    positive_count += torch.count_nonzero(violation)
+        kind = {"l1": 0, "linf": 1, "l2": 2}[cost.kind]
+        if cost.sigma:
+            from hello_ot.costs.metric_perturbation import _index_hash_parameters
+            coefficients = torch.tensor(_index_hash_parameters(cost.seed), dtype=torch.int64).reshape(-1)
+            kwargs["perturbation"] = (cost.source_index, cost.target_index, cost.sigma,
+                                       cost.seed, 1, True, coefficients)
+    if direction is not None:
+        reverse = direction == "target"
+        x, y = (cost.target, cost.source) if reverse else (cost.source, cost.target)
+        bias = f if reverse else g
+        directional_kwargs = dict(workspace_bytes=cost.workspace_bytes, compute_precision=precision)
+        if kind == 3:
+            nx, ny = (cost.target_offset, cost.source_offset) if reverse else (cost.source_offset, cost.target_offset)
+            directional_kwargs["query_bias"] = -nx
+            bias = bias-ny
+            if cost.sigma:
+                ex, ey = (cost.target_extra, cost.source_extra) if reverse else (cost.source_extra, cost.target_extra)
+                directional_kwargs["raw_extras"] = (ex, ey, cost.sigma)
+        elif "perturbation" in kwargs:
+            p = kwargs["perturbation"]
+            directional_kwargs["perturbation"] = (p[1], p[0], *p[2:5], False, p[6]) if reverse else p
+        values, indices = unified.directional(x, y, bias, bucket, kind, **directional_kwargs)
+        values, indices = values[:, :min(k, len(y))], indices[:, :min(k, len(y))]
+        unified._ROUTES["gpu_resident_directional:generic"] += 1
+        return (None, None, values, indices, None) if reverse else (values, indices, None, None, None)
+    result = unified.bidirectional(cost.source, cost.target, f, g, bucket, kind, **kwargs)
+    unified._ROUTES["gpu_resident:generic"] += 1
     metrics = None
     if certificate:
-        metrics = {"l2": float(numerator.sqrt() / (1 + denominator.sqrt())),
-                   "linf": float(vmax / (1 + cmax)), "max": float(vmax), "count": int(positive_count)}
-    return xv, xi, yv, yi, metrics
+        numerator, denominator, maximum, cmax, count = result[4:]
+        metrics = {"l2": float(numerator.sqrt()/(1+denominator.sqrt())),
+                   "linf": float(maximum/(1+cmax)), "max": float(maximum), "count": int(count)}
+    # CN: pricing返回包含本行势的score，resident接口返回只含对侧势的候选值。
+    # EN: Pricing includes the row potential; the resident interface returns opposite-side potential minus cost.
+    return (result[0][:, :min(k, m)]-f[:, None], result[1][:, :min(k, m)],
+            result[2][:, :min(k, n)]-g[:, None], result[3][:, :min(k, n)], metrics)

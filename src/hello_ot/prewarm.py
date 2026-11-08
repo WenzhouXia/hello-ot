@@ -144,6 +144,8 @@ def _prewarm_native_lowrank_precision(
         raise ValueError("prewarm requires a non-empty problem")
     source_cost = np.einsum("ij,ij->i", source, source, dtype=np.float64)
     target_cost = np.einsum("ij,ij->i", target, target, dtype=np.float64)
+    # CN: 预热预算包含统一规划器的1 MiB固定预留及输入和候选空间。
+    # EN: Cover the unified planner's fixed 1 MiB reserve plus inputs and candidates during warmup.
     raw_lowrank_bidir_feasibility_pricing_scan(
         source,
         target,
@@ -153,7 +155,7 @@ def _prewarm_native_lowrank_precision(
         np.zeros(target.shape[0], dtype=np.float64),
         topk=1,
         gpu_id=int(torch.cuda.current_device()),
-        memory_floor_mib=1.0,
+        memory_floor_mib=4.0,
         dot_scale=2.0,
         compute_precision=level_cost_precision(config.cost_precision, level_index=0),
     )

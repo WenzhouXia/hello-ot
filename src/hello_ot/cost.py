@@ -207,6 +207,7 @@ class HelloCostContext:
     dot_scale: float = 1.0
     perturbation: Optional[Dict[str, Any]] = None
     compute_precision: Literal["fp32", "fp64"] = "fp32"
+    cost_statistics: Optional[Dict[str, Any]] = None
 
     def sliced(self, source_slice: slice, target_slice: slice) -> "HelloCostContext":
         """
@@ -214,12 +215,12 @@ class HelloCostContext:
         EN: Restrict the same perturbation to this level while preserving global edge identities.
         """
         if self.perturbation is None:
-            return self
+            return self if self.cost_statistics is None else replace(self, cost_statistics={})
         return replace(self, perturbation={
             **self.perturbation,
             "source_global_index": self.perturbation["source_global_index"][source_slice],
             "target_global_index": self.perturbation["target_global_index"][target_slice],
-        })
+        }, cost_statistics=None if self.cost_statistics is None else {})
 
     def __post_init__(self) -> None:
         if self.score_family == "inner_product" and self.cost_type != "lowrank":
@@ -355,6 +356,7 @@ def _directional_assignment_by_cost(
             trace_args=trace_args,
             perturbation=cost_context.perturbation,
             compute_precision=cost_context.compute_precision,
+            cost_statistics=cost_context.cost_statistics,
         )
     raise ValueError(f"unsupported score family={cost_context.score_family!r}")
 

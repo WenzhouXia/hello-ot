@@ -24,6 +24,21 @@ def installer():
     return module
 
 
+def test_distribution_versions_and_installer_are_aligned():
+    """
+    CN: 三个发行包及扩展的精确依赖必须与安装器读取的主包版本一致。
+    EN: All three distributions and exact extension dependencies must match the core version read by the installer.
+    """
+    module = installer()
+    assert module.VERSION == module.project_version(ROOT / "pyproject.toml")
+    for kind in ("native", "cpp"):
+        metadata = ROOT / "packaging" / kind / "pyproject.toml"
+        assert module.project_version(metadata) == module.VERSION
+        assert f'"hello-ot=={module.VERSION}"' in metadata.read_text()
+    result = subprocess.check_output([sys.executable, str(ROOT / "scripts/install_backend.py"), "--print-version"], text=True)
+    assert result.strip() == module.VERSION
+
+
 def test_native_mismatch_explains_actual_expected_and_build_path(monkeypatch, capsys):
     module = installer()
     calls = []

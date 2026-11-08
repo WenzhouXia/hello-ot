@@ -111,6 +111,9 @@ python3 -m pip install dist/hello_ot_native-*.whl
 
 Source builds require the same Python/PyTorch/CUDA versions listed above.
 
+The native CUDA path uses unified mixed-precision and FP64 scans.
+See [Unified CUDA scans](docs/generic_scan.md) for precision and workspace details.
+
 ### 3. C++ CPU (`backend="cpp"`)
 
 `HELLO (C++)` is the official CPU implementation for researchers comparing HELLO

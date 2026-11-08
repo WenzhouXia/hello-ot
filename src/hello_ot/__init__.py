@@ -52,8 +52,8 @@ def solve(
     CN: 求解平衡点云最优传输；数组调用默认使用平方欧氏代价和均匀质量。
     EN: Solve balanced point-cloud OT; array calls default to squared Euclidean cost and uniform masses.
 
-    CN: LP 与对偶可行性容差固定为论文设置 1e-6，不作为公开调参项。
-    EN: LP and dual-feasibility tolerances are fixed to the paper setting 1e-6 and are not public knobs.
+    CN: options.tolerance 同时控制 LP 和完整对偶可行性容差，默认保留论文设置 1e-6。
+    EN: options.tolerance controls LP and full dual-feasibility tolerances, retaining the paper default 1e-6.
     """
     if isinstance(source_points, Problem):
         if target_points is not None or source_mass is not None or target_mass is not None or cost is not None:

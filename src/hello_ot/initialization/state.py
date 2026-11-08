@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import logging
 import time
 from contextlib import nullcontext
@@ -46,39 +45,20 @@ _DUAL_ASSIGNMENT_GROUPED_TOPK_BLOCK_D = 32
 _DUAL_ASSIGNMENT_ENABLE_GROUPED_TRITON_TOPK = False
 _DUAL_ASSIGNMENT_STREAM_TOPK_QUERY_CHUNK_ROWS = 8192
 _FUSED_MIPS_TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
-_FUSED_MIPS_EXT_MODULE = "hello_ot_native.hierot_inner_product_scan_ext"
 
 _fused_mips_ext: Any = None
-_fused_mips_ext_error: Optional[str] = None
 
 
 def _fused_mips_topk_ext() -> Any:
     """
-    CN: 惰性加载 inner-product scan CUDA 扩展；失败时明确报错，不静默回退。
-    EN: Lazily load the inner-product scan CUDA extension; fail explicitly without a silent fallback.
+    CN: 初始化复用统一扫描入口，不加载旧内积扩展。
+    EN: Reuse unified scan entry points for initialization without loading retired inner-product extensions.
     """
-    global _fused_mips_ext, _fused_mips_ext_error
-    if _fused_mips_ext is not None:
-        return _fused_mips_ext
-    if _fused_mips_ext_error is not None:
-        raise RuntimeError(_fused_mips_ext_error)
-    try:
-        module = importlib.import_module(_FUSED_MIPS_EXT_MODULE)
-    except Exception as exc:  # pragma: no cover
-        _fused_mips_ext_error = (
-            f"Custom inner-product scan extension {_FUSED_MIPS_EXT_MODULE!r} is unavailable; "
-            "reinstall hello-ot to build it. "
-            f"Original error: {exc!r}"
-        )
-        raise RuntimeError(_fused_mips_ext_error) from exc
-    if not hasattr(module, "initialization_directional_topk_raw"):  # pragma: no cover
-        _fused_mips_ext_error = (
-            "Installed custom inner-product scan extension is outdated and does not expose "
-            "initialization_directional_topk_raw; reinstall hello-ot."
-        )
-        raise RuntimeError(_fused_mips_ext_error)
-    _fused_mips_ext = module
-    return module
+    global _fused_mips_ext
+    if _fused_mips_ext is None:
+        from hello_ot.kernels.bilinear_topk import _load_extension
+        _fused_mips_ext = _load_extension()
+    return _fused_mips_ext
 
 
 def _fused_mips_topk_supported(k: int, dim: Optional[int] = None) -> bool:
@@ -705,6 +685,7 @@ def _topk_ip_indices_streamed_cuda(
         profile["fused_mips_time"] = float(time.perf_counter() - t_fused)
     else:
         raise AssertionError(f"unreachable scan backend: {profile['backend']}")
+    profile["kernel_backend"] = custom_ext.last_backend
     profile["total_time"] = float(time.perf_counter() - t_total)
     return vals_all, idx_all, profile
 

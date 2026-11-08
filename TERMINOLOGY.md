@@ -1,7 +1,5 @@
 # HELLO terminology: paper ↔ code
 
-This glossary is the authority for names shared by the paper and implementation. Paper labels and code symbols are used instead of line numbers because line numbers drift.
-
 ## HELLO
 
 Dual-guided **H**ierarchical **E**dge **L**ocalization for **L**arge-scale **O**ptimal transport. The production implementation is `hello_ot`; the public entry point is `hello_ot.solve`.
@@ -54,7 +52,7 @@ The paper uses the dual score $\sigma_{ij}=f_i+g_j-c_{ij}$. Code may compute the
 
 ## Full optimality check
 
-Checks dual feasibility over the complete edge set after a restricted LP solve. The public tolerance is fixed to the paper value rather than exposed as a user option.
+Checks dual feasibility over the complete edge set after a restricted LP solve. `SolverOptions.tolerance` sets the relative tolerance for both restricted-LP stopping and the full optimality check; its default remains the paper value $10^{-6}$. The Pareto CLI exposes it as `--hello-tolerance`.
 
 `SolverOptions.stopping_norm` selects a hierarchy-wide stopping policy. `l2` uses L2 for restricted-LP stopping and the full optimality check at every refinement level. `finest_linf` uses L2 at coarser levels and L-infinity for both checks at the finest level, so the returned solution has an L-infinity certificate. The default is `l2`. `finest_linf` currently requires the native squared-L2 path. The native squared-L2 scan records both L2 and L-infinity diagnostics from the same scan regardless of which norm controls stopping.
 
@@ -69,6 +67,23 @@ Adds full-edge dual violators to the active support. This is the first part of t
 Controls active-support size while protecting the feasible basis, current primal support, and newly detected violating edges. `support_budget_factor` corresponds to the paper budget factor $\beta$.
 
 ## Active support
+
+The experimental `ugw_single` module uses a single coupling with ordinary marginal
+KL and coupling KL entropy. `gcc` is generalized conditional gradient with a
+line search and exact support unions; `proximal` is quadratic majorization with
+full replacement and an explicit active-support budget. Neither is the
+tensorized-KL two-coupling BCD implementation or OTT's factor-entropy low-rank
+model. Their stalled/rejected statuses are not full-space stationarity certificates.
+`full_step` is the ablation sharing proximal initialization and budgeted graph
+construction, but using zero proximal curvature and unconditional unit steps;
+its objective increases are retained explicitly.
+`gcc_retained` uses the budgeted candidate-graph policy but still accumulates
+line-search mixtures. `adaptive` checks budget-compressed line-search steps
+against the original objective. `exchange` first solves on the temporary union,
+selects a budgeted graph by mass, and reoptimizes on that graph; it shares the
+same objective safeguard and old-graph fallback. These are research variants,
+not full-space convergence guarantees. CUDA standard UOT oracles reuse native
+sparse Sinkhorn; only quadratic-proximal oracles need the separate CUDA dual.
 
 The paper notation is $\mathcal{N}$, consistent with HELLO; use it also in restricted operators and hierarchy-level support indices.
 
@@ -85,5 +100,14 @@ An auxiliary cost problem used to obtain dual potentials before final refinement
 After `auto` activates at a hierarchy level, the first perturbed-cost LP certificate is compared with the triggering original-cost certificate at the same level. The **dual-feasibility jump ratio** is `perturbed_first / original_last`. A ratio greater than or equal to 10, or a non-finite perturbed certificate, discards the transferred current-level state and restarts the complete perturbed hierarchy from its coarsest level. This safety restart reuses the same perturbation scale and seed; it does not resample the cost. The probe and restarted traversal belong to one `perturbed` cost stage.
 
 Cost-stage names have one contract in both execution paths: `off` and `auto` without activation return `original`; `on` returns `perturbed`, `original_final`; activated `auto` returns `original`, `perturbed`, `original_final`.
+
+`hier_uot` implements the same activation, global-noise and safety-restart contract
+for KL marginal penalties, with default `off` to preserve existing UOT solves.
+The auxiliary stage keeps rho and reference masses fixed; final acceptance uses
+the original-cost full-space KKT conditions. Its `Result.levels` records all cost
+stages, identified by each level's `cost_stage` diagnostic. Auxiliary work and
+discarded jump probes are included in whole-solve runtime and memory profiling.
+General-cost UOT diagnostics sum `finest_outer_iterations` over all cost stages;
+`original_final_outer_iterations` separately counts the last original-cost stage.
 
 For norm costs, index hash uses a shared FP32 approximate-remainder rule in NumPy, Torch, and native CUDA, with fixed operation order and FP64 amplitude multiplication. It is not an exact integer-modulo hash; boundary values may slightly exceed one and are not clipped.

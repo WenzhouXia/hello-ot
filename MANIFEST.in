@@ -16,7 +16,7 @@ include scripts/create_hello_ot_env.sh
 include scripts/install_native.sh
 include scripts/install_jax_gpu.sh
 include scripts/validate_release.py
-recursive-include src/hello_ot/_native *.c *.cpp *.cu *.h *.md LICENSE
+recursive-include src/hello_ot/_native *.c *.cpp *.cu *.h *.cuh *.md LICENSE
 prune src/hierarchical_ot
 prune paper_experiments
 prune experiments

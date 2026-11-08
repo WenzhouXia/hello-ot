@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hello-ot-cpp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Optional cpp extensions for HELLO"
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-dependencies = ["hello-ot==0.2.0", "threadpoolctl>=3,<4"]
+dependencies = ["hello-ot==0.3.0", "threadpoolctl>=3,<4"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from typing import Any, Dict, Literal, Optional, Tuple
 import numpy as np
 import torch
@@ -8,34 +7,17 @@ from hello_ot.kernels.scan_contract import (_TOPK_SLOT_BYTES, DualFeasibilityCer
 from hello_ot.costs.metric_perturbation import _fused_perturb_arguments
 
 MetricCostType = Literal["l1", "linf", "l2"]
-_NORM_COST_SCAN_EXT_MODULE = "hello_ot_native.hierot_norm_cost_scan_ext"
 _FUSED_TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
 _COST_TYPE_IDS = {"l1": 0, "linf": 1, "l2": 2}
 _COMPUTE_PRECISION_IDS = {"fp32": 0, "fp64": 1}
 
 def _require_norm_cost_scan_ext() -> Any:
     """
-    CN: 惰性加载安装时编译的 norm-cost scan CUDA 扩展；失败直接报错，
-        不提供 KeOps 回退。
-    EN: Lazily load the install-time compiled norm-cost scan CUDA extension;
-        fail hard without a KeOps fallback.
+    CN: 统一扫描负责initial/pricing/证书，稀疏点对扩展只在实际调用时加载。
+    EN: Unified scans handle initial, pricing and certificates; load sparse-pair extensions only when exercised.
     """
-    try:
-        module = importlib.import_module(_NORM_COST_SCAN_EXT_MODULE)
-        if not getattr(module, "supports_cost_perturbation", False):
-            raise RuntimeError("installed norm-cost extension predates cost perturbation; rebuild the native extensions")
-        if not getattr(module, "supports_fp64_accumulation", False):
-            raise RuntimeError("installed norm-cost extension predates FP64 cost accumulation; rebuild the native extensions")
-        if getattr(module, "index_hash_arithmetic", None) != "fp32_remainder_v1":
-            raise RuntimeError("installed norm-cost extension uses a different index hash; rebuild the native extensions")
-        return module
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "norm-cost hello requires the custom scan CUDA extension "
-            f"({_NORM_COST_SCAN_EXT_MODULE}); run `bash scripts/install_native.sh ENV_NAME`, "
-            "or build with `bash scripts/build_native_wheel.sh dist` and install the resulting "
-            "hello-ot-native wheel. There is no KeOps fallback in the metric chain."
-        ) from exc
+    from hello_ot.kernels.generic_scan import ScanExtension
+    return ScanExtension()
 
 
 def _fused_cost_type_id(cost_type: MetricCostType) -> int:
@@ -76,6 +58,8 @@ def _fused_metric_kmin(
     database_global_index: Optional[np.ndarray] = None,
     perturbation: Optional[Dict[str, Any]] = None,
     compute_precision: str = "fp32",
+    cost_statistics: Optional[Dict[str, Any]] = None,
+    prefer_database: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     CN: 用 fused kernel 计算每行 (cost+perturb-dual) 的 K 个最小值。
@@ -91,6 +75,9 @@ def _fused_metric_kmin(
     kernel_k = custom_topk_bucket(k_int, score_family="norm_cost")
     ext = _require_norm_cost_scan_ext()
     _require_compute_precision_capability(ext, compute_precision_id)
+    collect_statistics = (cost_statistics is not None and "denominator_sq" not in cost_statistics
+                          and bool(getattr(ext, "supports_assignment_statistics", False)))
+    fixed_statistics = torch.zeros(2, dtype=torch.float64, device="cuda") if collect_statistics else None
     if not bool(torch.cuda.is_available()):
         raise RuntimeError("custom norm-cost scan requires CUDA")
     query_np = np.asarray(query_points, dtype=np.float32, order="C")
@@ -110,6 +97,7 @@ def _fused_metric_kmin(
         available_bytes=int(available_bytes),
         driver_free_bytes=int(driver_free_bytes),
         reclaimable_cache_bytes=int(reclaimable_cache_bytes),
+        preferred_resident_side="target" if prefer_database else None,
     )
     streamed_count = (
         int(query_np.shape[0])
@@ -136,7 +124,7 @@ def _fused_metric_kmin(
             database_global_index=database_index,
             device=device,
         )
-        return ext.fused_gcost_topk(
+        outputs = ext.fused_gcost_topk(
             query_t,
             database_t,
             dual_t,
@@ -150,7 +138,22 @@ def _fused_metric_kmin(
             bool(query_is_source),
             coeffs,
             compute_precision_id,
+            *([True] if collect_statistics else []),
         )
+        if collect_statistics:
+            fixed_statistics[0].add_(outputs[2][0])
+            fixed_statistics[1].copy_(torch.maximum(fixed_statistics[1], outputs[2][1]))
+        return outputs[0], outputs[1]
+
+    def finish(values, indices):
+        """
+        CN: 完整 traversal 成功后才发布本层固定 cost 统计。
+        EN: Publish level-local fixed-cost statistics only after successful complete traversal.
+        """
+        if collect_statistics:
+            cost_statistics.update(denominator_sq=float(fixed_statistics[0]), cost_linf=float(fixed_statistics[1]),
+                                   pair_count=int(query_np.shape[0])*int(database_np.shape[0]))
+        return values, indices
 
     if memory_plan.resident_side == "target":
         database_t = torch.as_tensor(database_np, dtype=torch.float32, device=device).contiguous()
@@ -170,7 +173,7 @@ def _fused_metric_kmin(
             )
             values_parts.append(values_t[:, :k_int].contiguous())
             indices_parts.append(indices_t[:, :k_int].to(torch.int64).contiguous())
-        return torch.cat(values_parts, dim=0), torch.cat(indices_parts, dim=0)
+        return finish(torch.cat(values_parts, dim=0), torch.cat(indices_parts, dim=0))
 
     query_t = torch.as_tensor(query_np, dtype=torch.float32, device=device).contiguous()
     best_values = torch.full((int(query_np.shape[0]), k_int), torch.inf, dtype=torch.float64, device=device)
@@ -187,7 +190,7 @@ def _fused_metric_kmin(
         )
         best_values, order = torch.topk(candidate_values, k=k_int, dim=1, largest=False, sorted=True)
         best_indices = torch.gather(candidate_indices, 1, order).contiguous()
-    return best_values.contiguous(), best_indices.contiguous()
+    return finish(best_values.contiguous(), best_indices.contiguous())
 
 
 def detect_metric_violations_and_check_feasibility(
@@ -288,10 +291,6 @@ def detect_metric_violations_and_check_feasibility(
     max_violation = torch.zeros((), dtype=torch.float64, device=device)
     cost_linf = torch.zeros((), dtype=torch.float64, device=device)
     positive_count = torch.zeros((), dtype=torch.int64, device=device)
-    # CN: K=32 的通用 fused column reduction 在中等维度慢于三次 custom scan；专用归约完成前使用分解路径。
-    # EN: The generic K=32 fused column reduction is slower than three custom scans at medium d; use the decomposed path until a specialized reduction exists.
-    use_decomposed_large_k = int(kernel_k) >= 32
-
     for start in range(0, n_stream, stream_chunk):
         stop = min(n_stream, start + stream_chunk)
         query_t = torch.as_tensor(stream_points_np[start:stop], dtype=torch.float32, device=device).contiguous()
@@ -303,10 +302,11 @@ def detect_metric_violations_and_check_feasibility(
             database_global_index=resident_index,
             device=device,
         )
-        if use_decomposed_large_k:
-            q_cost_values, q_indices = ext.fused_gcost_topk(
+        q_values, q_indices, r_values, r_indices, num_t, den_t, max_t, cost_linf_t, count_t = (
+            ext.fused_gcost_bidir_certificate(
                 query_t,
                 resident_points_t,
+                query_dual_t,
                 resident_dual_t,
                 int(kernel_k),
                 int(_fused_cost_type_id(cost_type)),
@@ -319,58 +319,7 @@ def detect_metric_violations_and_check_feasibility(
                 coeffs,
                 compute_precision_id,
             )
-            r_cost_values, r_indices = ext.fused_gcost_topk(
-                resident_points_t,
-                query_t,
-                query_dual_t,
-                int(kernel_k),
-                int(_fused_cost_type_id(cost_type)),
-                d_idx_t,
-                q_idx_t,
-                float(sigma),
-                int(seed),
-                mode,
-                not bool(row_is_source),
-                coeffs,
-                compute_precision_id,
-            )
-            num_t, den_t, max_t, cost_linf_t, count_t = ext.fused_gcost_certificate(
-                query_t,
-                resident_points_t,
-                query_dual_t,
-                resident_dual_t,
-                int(_fused_cost_type_id(cost_type)),
-                q_idx_t,
-                d_idx_t,
-                float(sigma),
-                int(seed),
-                mode,
-                bool(row_is_source),
-                coeffs,
-                1,
-                compute_precision_id,
-            )
-            q_values = query_dual_t[:, None] - q_cost_values
-            r_values = resident_dual_t[:, None] - r_cost_values
-        else:
-            q_values, q_indices, r_values, r_indices, num_t, den_t, max_t, cost_linf_t, count_t = (
-                ext.fused_gcost_bidir_certificate(
-                    query_t,
-                    resident_points_t,
-                    query_dual_t,
-                    resident_dual_t,
-                    int(kernel_k),
-                    int(_fused_cost_type_id(cost_type)),
-                    q_idx_t,
-                    d_idx_t,
-                    float(sigma),
-                    int(seed),
-                    mode,
-                    bool(row_is_source),
-                    coeffs,
-                    compute_precision_id,
-                )
-            )
+        )
         stream_values_parts.append(q_values[:, :requested_k].contiguous())
         stream_indices_parts.append(q_indices[:, :requested_k].to(torch.int64).contiguous())
         candidate_values = torch.cat([resident_values, r_values[:, :requested_k]], dim=1)
@@ -409,6 +358,7 @@ def detect_metric_violations_and_check_feasibility(
         ),
         diagnostics={
             "scan_backend": "custom",
+            "kernel_backend": ext.last_backend,
             "score_family": "norm_cost",
             "cost_compute_precision": str(compute_precision),
             "resident_side": str(memory_plan.resident_side),
@@ -417,8 +367,8 @@ def detect_metric_violations_and_check_feasibility(
             "topk": int(requested_k),
             "topk_bucket": int(kernel_k),
             "certificate_mode": "l2_and_linf",
-            "pairwise_passes": 3 if use_decomposed_large_k else 1,
-            "scan_traversal": "decomposed_large_k_custom" if use_decomposed_large_k else "fused_one_pass_custom",
+            "pairwise_passes": 1,
+            "scan_traversal": "fused_one_pass_custom",
         },
     )
 

@@ -30,7 +30,7 @@ def main():
         destination = stage / "native_src"
         destination.mkdir()
         for name in (["solver.cpp", "scan.cpp"] if args.kind == "cpp" else
-                     ["inner_product_scan", "norm_cost_scan", "support_sparsifier", "cupdlpx"]):
+                     ["norm_cost_scan", "generic_scan", "support_sparsifier", "cupdlpx"]):
             path = source / "cpp" / name if args.kind == "cpp" else source / name
             if path.is_file():
                 shutil.copy2(path, destination / name)

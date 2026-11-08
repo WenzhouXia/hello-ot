@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+from hello_ot._source_build import load_native_module
 import json
 import platform
 from importlib import metadata
@@ -14,8 +14,9 @@ from hello_ot._native_compat import native_runtime_compatibility
 
 
 _NATIVE_MODULES = {
-    "inner_product_scan": "hello_ot_native.hierot_inner_product_scan_ext",
-    "norm_cost_scan": "hello_ot_native.hierot_norm_cost_scan_ext",
+    "sparse_pair_cost": "hello_ot_native.hierot_norm_cost_scan_ext",
+    **{f"scan_{part}": f"hello_ot_native.hierot_generic_{part}_ext"
+       for part in ("initial", "initial_small", "pricing", "pricing_small", "cost")},
     "support_sparsifier": "hello_ot_native._support_sparsifier_ext",
     "cupdlpx": "hello_ot_native.pycupdlpx",
 }
@@ -53,7 +54,7 @@ def _native_status() -> dict[str, dict[str, Any]]:
     status: dict[str, dict[str, Any]] = {}
     for name, module_name in _NATIVE_MODULES.items():
         try:
-            module = importlib.import_module(module_name)
+            module = load_native_module(module_name)
         except Exception as exc:  # pragma: no cover - depends on the installed binary stack
             status[name] = {
                 "available": False,

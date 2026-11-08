@@ -17,14 +17,60 @@ def cuda():
         pytest.skip("CUDA required")
     from hello_ot._native_compat import require_native_runtime_compatibility
     require_native_runtime_compatibility()
-    from hello_ot_native import pycupdlpx
+    from hello_ot._source_build import load_native_module
+    pycupdlpx = load_native_module("hello_ot_native.pycupdlpx")
     assert pycupdlpx.GPU_ARRAY_IO_VERSION >= 1, "rebuild native extensions"
     return torch.device("cuda", torch.cuda.current_device())
 
 
+@pytest.mark.parametrize("kind", ["l2^2", "l1", "l2", "linf"])
+@pytest.mark.parametrize("precision", ["fp32", "fp64"])
+@pytest.mark.parametrize("noise", [False, True])
+@pytest.mark.parametrize("k", [1, 3, 8, 17, 32])
+def test_unified_resident_scan_matches_dense(cuda, monkeypatch, kind, precision, noise, k):
+    """
+    CN: 覆盖常驻四成本、两种精度、扰动和非幂次k，强制两侧分块并独立核验证书。
+    EN: Cover resident costs, precisions, perturbations and irregular k with two-axis tiling and independent certificates.
+    """
+    from hello_ot.gpu_resident.cost import Cost, offsets, scan
+    from hello_ot.kernels import generic_scan as unified
+
+    monkeypatch.setattr(unified, "_tile_shape", lambda *a, **kw: (7, 11))
+    torch.manual_seed(914)
+    x, y = torch.randn(19, 33, device=cuda)/6, torch.randn(37, 33, device=cuda)/6
+    cost = Cost(x, y, kind, offsets(x), offsets(y), torch.arange(19, device=cuda)*7919,
+                torch.arange(37, device=cuda)*2011, precision=precision)
+    if noise:
+        cost = replace(cost, sigma=.043, seed=912,
+                       source_extra=torch.randn(19, 2, device=cuda)*.02,
+                       target_extra=torch.randn(37, 2, device=cuda)*.02)
+    dual = torch.randn(56, device=cuda, dtype=torch.float64)
+    matrix = cost.tile(0, 0, 19, 37)
+    row_score, col_score = dual[19:][None]-matrix, (dual[:19, None]-matrix).T
+    xv, xi, yv, yi, metrics = scan(cost, dual, k, certificate=True)
+    expected_x, expected_xi = row_score.topk(min(k, 37), dim=1)
+    expected_y, expected_yi = col_score.topk(min(k, 19), dim=1)
+    torch.testing.assert_close(xv, expected_x, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(yv, expected_y, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(xi, expected_xi, rtol=0, atol=0)
+    torch.testing.assert_close(yi, expected_yi, rtol=0, atol=0)
+    violation = (dual[:19, None]+dual[19:][None]-matrix).clamp_min(0)
+    assert metrics["count"] == int(torch.count_nonzero(violation))
+    assert metrics["l2"] == pytest.approx(float(violation.norm()/(1+matrix.norm())), rel=2e-5, abs=2e-5)
+    assert metrics["linf"] == pytest.approx(float(violation.max()/(1+matrix.abs().max())), rel=2e-5, abs=2e-5)
+    assert unified.scan_routes().get("gpu_resident:generic", 0) > 0
+    for direction, expected, expected_ids in (("source", expected_x, expected_xi), ("target", expected_y, expected_yi)):
+        one = scan(cost, dual, k, direction=direction)
+        offset = 0 if direction == "source" else 2
+        torch.testing.assert_close(one[offset], expected, rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(one[offset+1], expected_ids, rtol=0, atol=0)
+        assert one[2-offset] is None and one[3-offset] is None
+
+
 @pytest.mark.parametrize("cost", ["l2^2", "l1", "l2", "linf"])
 @pytest.mark.parametrize("perturbation", ["off", "on"])
-def test_gpu_solution_against_dense_pot(cuda, cost, perturbation):
+@pytest.mark.parametrize("precision", ["fp32", "fp64", "finest_fp64"])
+def test_gpu_solution_against_dense_pot(cuda, cost, perturbation, precision):
     import ot
     rng = np.random.default_rng(910)
     x = torch.tensor(rng.normal(size=(37, 7)), device=cuda, dtype=torch.float32)
@@ -35,7 +81,7 @@ def test_gpu_solution_against_dense_pot(cuda, cost, perturbation):
     result = hello_ot.solve(x, y, source_mass=torch.tensor(a, device=cuda), target_mass=b, cost=cost,
         options=hello_ot.SolverOptions(gpu_resident=True, consume_input_features=True,
             coarsest_size_threshold=8, assignment_topk=2, pricing_topk=2,
-            support_budget_factor=4, cost_perturbation=perturbation, verbose="off"))
+            support_budget_factor=4, cost_perturbation=perturbation, cost_precision=precision, verbose="off"))
     assert torch.equal(x, before_x) and torch.equal(y, before_y)
     solution = result.solution
     assert all(getattr(solution, k).is_cuda for k in ("rows", "cols", "values", "source_dual", "target_dual"))
@@ -229,7 +275,9 @@ def test_gpu_input_validation(cuda):
         hello_ot.solve(x, x.cpu(), options=options)
 
 
-def test_gpu_pipeline_host_arrays_only_at_explicit_exceptions(cuda, monkeypatch):
+@pytest.mark.parametrize("cost", ["l2^2", "l1", "l2", "linf"])
+@pytest.mark.parametrize("precision", ["fp32", "fp64"])
+def test_gpu_pipeline_host_arrays_only_at_explicit_exceptions(cuda, monkeypatch, cost, precision):
     from torch.utils._python_dispatch import TorchDispatchMode
     from hello_ot.gpu_resident.storage import Transfers
 
@@ -257,9 +305,9 @@ def test_gpu_pipeline_host_arrays_only_at_explicit_exceptions(cuda, monkeypatch)
     torch.manual_seed(23)
     x, y = torch.randn(35, 5, device=cuda), torch.randn(43, 5, device=cuda)
     with Guard():
-        result = hello_ot.solve(x, y, options=hello_ot.SolverOptions(gpu_resident=True,
+        result = hello_ot.solve(x, y, cost=cost, options=hello_ot.SolverOptions(gpu_resident=True,
             consume_input_features=True, coarsest_size_threshold=8, profile_memory=True,
-            record_trace=True, cost_perturbation="on", verbose="off"))
+            record_trace=True, cost_perturbation="on", cost_precision=precision, verbose="off"))
     assert result.metadata["memory_profile"]["lp_candidates"]
     assert result.peak_gpu_memory_mib > 0
 

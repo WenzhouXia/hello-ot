@@ -45,14 +45,15 @@ def _initialize(cost, a, b, previous, known_side, config):
         dual[:n] = previous[:n]
     else:
         dual = previous.clone()
-    xv, xi, yv, yi, _ = scan(cost, dual, config.assignment_topk)
+    direction = "source" if known_side == "target" else "target" if known_side == "source" else None
+    xv, xi, yv, yi, _ = scan(cost, dual, config.assignment_topk, direction=direction)
     propagation = time.perf_counter() - started
     if known_side == "target":
         dual[:n] = -xv[:, 0]
-        _, _, yv, yi, _ = scan(cost, dual, config.assignment_topk)
+        _, _, yv, yi, _ = scan(cost, dual, config.assignment_topk, direction="target")
     elif known_side == "source":
         dual[n:] = -yv[:, 0]
-        xv, xi, _, _, _ = scan(cost, dual, config.assignment_topk)
+        xv, xi, _, _, _ = scan(cost, dual, config.assignment_topk, direction="source")
     candidates = _candidates(xv, xi, yv, yi, dual, n, m)
     assignment_time = time.perf_counter() - started
     support = Support.initial(candidates, a, b)
@@ -234,7 +235,8 @@ def solve(problem, config):
     if config.stopping_norm == "finest_linf" and problem.cost_type != "l2^2":
         raise ValueError("finest_linf currently requires l2^2")
     require_native_runtime_compatibility()
-    from hello_ot_native import pycupdlpx
+    from hello_ot._source_build import load_native_module
+    pycupdlpx = load_native_module("hello_ot_native.pycupdlpx")
     if getattr(pycupdlpx, "GPU_ARRAY_IO_VERSION", 0) < 1:
         raise RuntimeError("GPU pipeline requires rebuilt CuPDLPx extensions with GPU array I/O")
     device = x.device

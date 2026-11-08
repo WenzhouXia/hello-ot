@@ -14,11 +14,22 @@ _THREAD_LOCK = RLock()
 @lru_cache(maxsize=2)
 def load_cpp_extension(kind: str):
     """
-    CN: 按需装载独立 CPU 扩展包；缺失时提供明确的安装指引，不启动运行时编译。
-    EN: Load the independent CPU extension on demand, reporting installation instructions without runtime compilation.
+    CN: 开发模式构建本地 CPU 内核；公开模式按需装载独立扩展包。
+    EN: Build local CPU kernels in development mode; load the independent extension package publicly.
     """
     if kind not in {"lp", "scan"}:
         raise ValueError("unknown C++ extension kind")
+    from hello_ot._source_build import source_mode, load_source_extension
+    if source_mode():
+        from pathlib import Path
+        import pybind11
+
+        source = Path(__file__).resolve().parent / "_native/cpp" / ("solver.cpp" if kind == "lp" else "scan.cpp")
+        return load_source_extension(
+            "_" + kind, [str(source)], extra_include_paths=[pybind11.get_include()],
+            extra_cflags=["-O3", "-std=c++17", "-fopenmp", "-ffp-contract=off"],
+            extra_ldflags=["-fopenmp"],
+        )
     try:
         package = importlib.import_module("hello_ot_cpp")
         if package.API_VERSION != 1:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import math
 import time
 from typing import Any, Dict
@@ -15,31 +14,20 @@ from hello_ot.kernels.scan_contract import (
 )
 
 _CUDA_CPP_DUAL_FEASIBILITY_EXT: Any = None
-_CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR: str | None = None
-_CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE = (
-    "hello_ot_native.hierot_inner_product_scan_ext"
-)
 _STREAMING_RAW_QUERY_TILE = 1024
 _STREAMING_RAW_DB_TILE = 8192
 
 
 def _load_cuda_cpp_dual_feasibility_extension() -> Any:
-    global _CUDA_CPP_DUAL_FEASIBILITY_EXT, _CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR
-    if _CUDA_CPP_DUAL_FEASIBILITY_EXT is not None:
-        return _CUDA_CPP_DUAL_FEASIBILITY_EXT
-    if _CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR is not None:
-        raise RuntimeError(_CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR)
-    try:
-        _CUDA_CPP_DUAL_FEASIBILITY_EXT = importlib.import_module(_CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE)
-        return _CUDA_CPP_DUAL_FEASIBILITY_EXT
-    except Exception as exc:  # noqa: BLE001
-        _CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR = (
-            f"Failed to import installed CUDA C++ dual feasibility extension "
-            f"{_CUDA_CPP_DUAL_FEASIBILITY_EXT_MODULE!r}. Install the matching hello-ot-native release "
-            "with bash scripts/install_native.sh ENV_NAME. "
-            f"Original error: {exc!r}"
-        )
-        raise RuntimeError(_CUDA_CPP_DUAL_FEASIBILITY_EXT_ERROR) from exc
+    """
+    CN: 独立判敛只需要统一证书适配器，无需加载旧top-k扩展。
+    EN: Standalone stopping needs only the unified certificate adapter, without loading the legacy top-k extension.
+    """
+    global _CUDA_CPP_DUAL_FEASIBILITY_EXT
+    if _CUDA_CPP_DUAL_FEASIBILITY_EXT is None:
+        from hello_ot.kernels.generic_scan import ScanExtension
+        _CUDA_CPP_DUAL_FEASIBILITY_EXT = ScanExtension()
+    return _CUDA_CPP_DUAL_FEASIBILITY_EXT
 
 
 def _cuda_feature_tensor(
@@ -213,7 +201,10 @@ def cuda_cpp_lowrank_dual_feasibility_infeasibility_streaming_raw(
             int(_STREAMING_RAW_DB_TILE),
             float(dot_scale),
         )
-        total_stats.add_(stats)
+        # CN: 平方和与计数相加，最大违反和最大成本必须跨块取最大值。
+        # EN: Add squared sums and counts, but reduce violation and cost maxima across chunks.
+        total_stats[:3].add_(stats[:3])
+        total_stats[3:].copy_(torch.maximum(total_stats[3:], stats[3:]))
         del stats, stream_feat, stream_cost, stream_dual
 
     stats_cpu = total_stats.detach().cpu().double()

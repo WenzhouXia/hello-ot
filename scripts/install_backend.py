@@ -3,12 +3,28 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 
-VERSION = "0.2.0"
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def project_version(path):
+    """
+    CN: 仅提取project.version，使主机Python无需额外TOML依赖即可选择发布包。
+    EN: Extract only project.version so host Python can select release artifacts without extra TOML dependencies.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    section = re.search(r"(?ms)^\[project\]\s*\n(.*?)(?=^\[|\Z)", text)
+    match = re.search(r'''(?m)^version\s*=\s*["']([^"']+)["']\s*(?:\#.*)?$''', section.group(1)) if section else None
+    if match is None or not re.fullmatch(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?", match.group(1)):
+        raise ValueError(f"Missing or unsupported project.version in {path}")
+    return match.group(1)
+
+
+VERSION = project_version(ROOT / "pyproject.toml")
 
 
 def environment_command(manager, environment, *command):
@@ -25,6 +41,7 @@ def main():
     EN: Report compatibility before installing the core and selected extension, then run its quickstart.
     """
     parser = argparse.ArgumentParser()
+    parser.add_argument("--print-version", action="version", version=VERSION)
     parser.add_argument("backend", choices=["native", "cpp"])
     parser.add_argument("environment", nargs="?", default="hello_ot")
     parser.add_argument("--wheel", help="local wheel path or release URL")

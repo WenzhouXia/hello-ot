@@ -1,5 +1,28 @@
 # Release checklist
 
+## Version 0.3.0
+
+`hello-ot`, `hello-ot-native` and `hello-ot-cpp` are version `0.3.0`.
+Both extensions require exactly `hello-ot==0.3.0`. The native package uses
+unified mixed-precision and FP64 scans; retired CUDA scan modules are excluded.
+Rebuild all three wheels and source archives from one exported snapshot.
+
+In the internal source checkout, the publication commands are:
+
+```bash
+bash export_hello_ot.sh export
+bash export_hello_ot.sh build
+bash export_hello_ot.sh push "release: HELLO-OT v0.3.0"
+```
+
+The version is read from the core `pyproject.toml`. Default artifacts are stored
+under `../hello-ot-release/0.3.0/`. `push` verifies the snapshot and saved artifact
+checksums, then creates `v0.3.0` as a stable release. An existing release or tag
+with that version stops the operation before source synchronization; older tags
+and release attachments are preserved. Candidate versions such as `0.3.0rc1`
+are marked as prereleases automatically. No build or publication is implied by
+editing package versions.
+
 ## Repository and distribution boundaries
 
 - `experiments/`: exploratory work.

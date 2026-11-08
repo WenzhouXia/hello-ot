@@ -4,7 +4,6 @@ import os
 from setuptools import setup
 
 
-INNER_PRODUCT_SCAN_EXT_DIR = "native_src/inner_product_scan"
 NORM_COST_SCAN_EXT_DIR = "native_src/norm_cost_scan"
 RESTRICTED_OT_EXT_DIR = "native_src/support_sparsifier"
 CUPDLPX_DIR = "native_src/cupdlpx/cupdlpx"
@@ -113,21 +112,6 @@ def _native_extensions() -> tuple[list[object], type]:
         return [support_extension], BuildExtension
     return [
         CUDAExtension(
-            name="hello_ot_native.hierot_inner_product_scan_ext",
-            sources=[
-                f"{INNER_PRODUCT_SCAN_EXT_DIR}/inner_product_scan_ext.cpp",
-                f"{INNER_PRODUCT_SCAN_EXT_DIR}/inner_product_stats_kernel.cu",
-                f"{INNER_PRODUCT_SCAN_EXT_DIR}/inner_product_scan_kernel.cu",
-            ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": ["-O3"],
-            },
-            extra_link_args=["-lcublas"] + extra_link_args,
-        ),
-        CUDAExtension(
             name="hello_ot_native.hierot_norm_cost_scan_ext",
             sources=[
                 f"{NORM_COST_SCAN_EXT_DIR}/norm_cost_scan_ext.cpp",
@@ -143,6 +127,18 @@ def _native_extensions() -> tuple[list[object], type]:
         ),
         support_extension,
         cupdlpx_extension,
+        *[
+            CUDAExtension(
+                name=f"hello_ot_native.hierot_generic_{component}_ext",
+                sources=[f"native_src/generic_scan/{component}.cu"],
+                libraries=["cublas"] if component in ("cost", "pricing_small") else [],
+                include_dirs=cuda_include_dirs,
+                library_dirs=cuda_library_dirs,
+                extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
+                extra_link_args=extra_link_args,
+            )
+            for component in ("initial", "initial_small", "pricing", "pricing_small", "cost")
+        ],
     ], BuildExtension
 
 

@@ -34,6 +34,7 @@ IGNORE = shutil.ignore_patterns("*.so", "*.pyc", "__pycache__", "*.egg-info")
 EXTRA_FILES = (
     ".github/workflows/ci.yml",
     "docs/algorithm.md",
+    "docs/generic_scan.md",
     "docs/release_checklist.md",
     "scripts/validate_gpu_release.py",
     "scripts/validate_variants_extended.py",

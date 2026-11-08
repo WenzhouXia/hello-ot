@@ -11,6 +11,9 @@ ROUNDING_REQUIRED_METHODS = frozenset(
     {
         "asymmetric_chain",
         "hello",
+        "flash_sinkhorn2",
+        "minibatch_ot",
+        "minibatch_ot_parallel",
         "mdot_tnt_dense",
         "mdot_tnt_keops",
         "mdot_tnt_pypi",

@@ -1,2 +1,2 @@
 include LICENSE
-recursive-include native_src *.cpp *.c *.cu *.h LICENSE
+recursive-include native_src *.cpp *.c *.cu *.h *.cuh LICENSE

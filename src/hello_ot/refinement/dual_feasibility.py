@@ -216,6 +216,7 @@ def run_lowrank_dual_feasibility_scan(
                 dual_uv,
                 diagnostics=diagnostics,
                 dot_scale=float(getattr(config, "dot_scale", 1.0)),
+                compute_precision=str(getattr(config, "cost_precision", "fp32")),
             )
             mem_tracker.tick()
         return LowrankDualFeasibilityScan(

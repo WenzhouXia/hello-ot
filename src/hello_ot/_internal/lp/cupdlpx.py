@@ -15,7 +15,9 @@ from ..instrumentation.memory_accounting import current_memory_recorder
 from .wrapper import LPSolver, SolverResult
 
 try:
-    from hello_ot_native import pycupdlpx
+    from hello_ot._source_build import LazyNativeModule, load_native_module, source_mode
+    pycupdlpx = (LazyNativeModule("hello_ot_native.pycupdlpx") if source_mode()
+                else load_native_module("hello_ot_native.pycupdlpx"))
 
     CUPDLPX_AVAILABLE = True
 except ImportError:

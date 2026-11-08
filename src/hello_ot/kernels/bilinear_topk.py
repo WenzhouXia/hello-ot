@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import importlib
+from hello_ot.kernels.scan_planner import (
+    streamed_memory_estimate_mib as _raw_memory_estimate_mib,
+    select_streamed_tiles,
+)
 import math
 import time
 from contextlib import nullcontext
@@ -18,7 +21,6 @@ from hello_ot.kernels.scan_contract import (
 
 _EXT_MODULE: Any = None
 _EXT_LOAD_ERROR: str | None = None
-_EXT_MODULE_NAME = "hello_ot_native.hierot_inner_product_scan_ext"
 
 
 @dataclass
@@ -35,27 +37,20 @@ class LowrankBidirScanResult:
 
 
 def _load_extension() -> Any:
+    """
+    CN: 加载统一扫描入口，并验证发行包中的成本扩展。
+    EN: Load unified scan entry points and verify the packaged cost extension.
+    """
     global _EXT_MODULE, _EXT_LOAD_ERROR
-    if _EXT_MODULE is not None:
-        return _EXT_MODULE
-    if _EXT_LOAD_ERROR is not None:
-        raise RuntimeError(_EXT_LOAD_ERROR)
-    try:
-        module = importlib.import_module(_EXT_MODULE_NAME)
-    except Exception as exc:  # noqa: BLE001
-        _EXT_LOAD_ERROR = (
-            f"Failed to import installed lowrank scan CUDA extension {_EXT_MODULE_NAME!r}. "
-            f"Run bash scripts/install_native.sh ENV_NAME to install hello-ot-native. Original error: {exc!r}"
-        )
-        raise RuntimeError(_EXT_LOAD_ERROR) from exc
-    if not hasattr(module, "fused_bidir_topk_stats_raw"):
-        _EXT_LOAD_ERROR = (
-            f"Installed CUDA extension {_EXT_MODULE_NAME!r} does not expose "
-            "fused_bidir_topk_stats_raw. Reinstall the matching hello-ot-native release."
-        )
-        raise RuntimeError(_EXT_LOAD_ERROR)
-    _EXT_MODULE = module
-    return module
+    if _EXT_MODULE is None:
+        from hello_ot.kernels.generic_scan import ScanExtension, _module
+        try:
+            _module("cost")
+        except Exception as exc:
+            _EXT_LOAD_ERROR = f"Unified scan CUDA extension unavailable; rebuild hello-ot-native: {exc!r}"
+            raise RuntimeError(_EXT_LOAD_ERROR) from exc
+        _EXT_MODULE = ScanExtension()
+    return _EXT_MODULE
 
 
 def extension_available() -> bool:
@@ -156,114 +151,14 @@ def _merge_topk(old_vals: torch.Tensor, old_idx: torch.Tensor, new_vals: torch.T
     return merged_vals.contiguous(), merged_idx.contiguous()
 
 
-def _raw_memory_estimate_mib(
-    *,
-    n_stream: int,
-    n_resident: int,
-    d: int,
-    topk: int,
-    stream_chunk: int,
-    query_tile: int,
-    db_tile: int,
-    feature_itemsize: int = 4,
-) -> Dict[str, float]:
-    stream_chunk_eff = max(1, min(int(stream_chunk), int(n_stream)))
-    query_tile_eff = max(1, min(int(query_tile), stream_chunk_eff))
-    db_tile_eff = max(1, min(int(db_tile), int(n_resident)))
-    mib = float(1024 * 1024)
-    resident_mib = float(n_resident) * (float(d * feature_itemsize) + 2.0 * 8.0) / mib
-    stream_chunk_mib = float(stream_chunk_eff) * (float(d * feature_itemsize) + 2.0 * 8.0) / mib
-    score_tile_mib = float(query_tile_eff) * float(db_tile_eff) * float(feature_itemsize) / mib
-    partial_resident_mib = float(math.ceil(float(stream_chunk_eff) / float(query_tile_eff))) * float(n_resident) * float(topk) * 8.0 / mib
-    final_outputs_mib = float(n_resident + stream_chunk_eff) * float(topk) * 8.0 / mib
-    est_peak_mib = resident_mib + stream_chunk_mib + score_tile_mib + partial_resident_mib + final_outputs_mib
-    return {
-        "resident_feature_mib": float(resident_mib),
-        "stream_chunk_mib": float(stream_chunk_mib),
-        "score_tile_mib": float(score_tile_mib),
-        "partial_resident_mib": float(partial_resident_mib),
-        "final_outputs_mib": float(final_outputs_mib),
-        "est_peak_mib": float(est_peak_mib),
-    }
+def _select_tiles(**kwargs):
+    """
+    CN: 扫描后端在同一规划入口申报工作区，执行器直接使用规划结果。
+    EN: Scan backends declare scratch through one planning entry point, and executors consume the resulting plan directly.
+    """
+    return select_streamed_tiles(**kwargs)
 
 
-def _select_tiles(
-    *,
-    n_stream: int,
-    n_resident: int,
-    d: int,
-    topk: int,
-    memory_floor_mib: float,
-    resident_multiplier: float,
-    max_budget_mib: float,
-    feature_itemsize: int = 4,
-) -> Dict[str, Any]:
-    resident_mib = _raw_memory_estimate_mib(
-        n_stream=int(n_stream),
-        n_resident=int(n_resident),
-        d=int(d),
-        topk=int(topk),
-        stream_chunk=1,
-        query_tile=1,
-        db_tile=1,
-        feature_itemsize=int(feature_itemsize),
-    )["resident_feature_mib"]
-    target_budget_mib = min(
-        float(max_budget_mib),
-        max(float(memory_floor_mib), float(resident_multiplier) * float(resident_mib)),
-    )
-    candidates: List[Dict[str, Any]] = []
-    seen: set[Tuple[int, int, int]] = set()
-    for query_candidate in (1024, 2048, 4096, 8192):
-        for stream_mult in (1, 2):
-            stream_chunk = min(int(n_stream), int(query_candidate) * int(stream_mult))
-            query_tile = min(int(query_candidate), int(stream_chunk))
-            if stream_chunk <= 0 or query_tile <= 0:
-                continue
-            for db_candidate in (8192, 16384, 32768, 65536):
-                db_tile = min(int(db_candidate), int(n_resident))
-                key = (int(stream_chunk), int(query_tile), int(db_tile))
-                if key in seen:
-                    continue
-                seen.add(key)
-                mem = _raw_memory_estimate_mib(
-                    n_stream=int(n_stream),
-                    n_resident=int(n_resident),
-                    d=int(d),
-                    topk=int(topk),
-                    stream_chunk=int(stream_chunk),
-                    query_tile=int(query_tile),
-                    db_tile=int(db_tile),
-                    feature_itemsize=int(feature_itemsize),
-                )
-                row: Dict[str, Any] = {
-                    "source_chunk": int(stream_chunk),
-                    "query_tile": int(query_tile),
-                    "db_tile": int(db_tile),
-                    "target_budget_mib": float(target_budget_mib),
-                    "fits_soft_budget": bool(mem["est_peak_mib"] <= target_budget_mib),
-                }
-                row.update(mem)
-                candidates.append(row)
-    preferred = [row for row in candidates if bool(row["fits_soft_budget"])]
-    if not preferred:
-        minimum_peak = min(float(row["est_peak_mib"]) for row in candidates)
-        raise RuntimeError(
-            "fused inner-product refinement exceeds single-GPU scratch capacity: "
-            f"minimum estimated peak is {minimum_peak:.1f} MiB, budget is {target_budget_mib:.1f} MiB."
-        )
-    pool = preferred
-
-    def _rank(row: Dict[str, Any]) -> Tuple[float, int, int, int]:
-        source_bonus = 1 if int(row["source_chunk"]) == int(row["query_tile"]) else 0
-        return (float(source_bonus), int(row["db_tile"]), int(row["query_tile"]), -int(row["source_chunk"]))
-
-    if not pool:
-        raise RuntimeError("no fused lowrank scan tile candidates were generated")
-    selected = dict(max(pool, key=_rank))
-    selected["candidate_count"] = int(len(candidates))
-    selected["preferred_candidate_count"] = int(len(preferred))
-    return selected
 
 
 def _flatten_positive_query_candidates(
@@ -437,19 +332,8 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         cols_parts: List[np.ndarray] = []
         max_violation = 0.0
         start_time = time.perf_counter()
-        # CN: 当前支持的 K<=32 均使用一次 fused 双向 traversal；旧的三遍 large-K
-        #     fallback 保留给未来更大的 bucket。
-        # EN: All currently supported K<=32 use one fused bidirectional traversal;
-        #     retain the three-pass large-K fallback for future larger buckets.
-        use_decomposed_large_k = int(kernel_k) > 32
-        certificate_indices = (
-            torch.tensor([0, 1, 2, 4], dtype=torch.int64, device=device)
-            if use_decomposed_large_k
-            else None
-        )
-
-        # CN: 分块上传 stream 侧数据；小 K 使用一次 fused traversal，大 K 使用三次 custom traversal。
-        # EN: Upload the streamed side chunk by chunk; use one fused traversal for small K and three custom traversals for large K.
+        # CN: 所有支持的k均在一次完整遍历中计算双向候选和证书。
+        # EN: Compute both candidate directions and the certificate in one traversal for every supported k.
         for chunk_index, start in enumerate(range(0, int(n_stream), int(source_chunk))):
             end = min(int(n_stream), int(start) + int(source_chunk))
             staging_slot = int(chunk_index % 2)
@@ -483,59 +367,23 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
             copy_complete.record(torch.cuda.current_stream(device))
             staging_events[staging_slot] = copy_complete
             query_bias = (query_dual - query_cost).contiguous()
-            if use_decomposed_large_k:
-                q_vals, q_idx = ext.fused_directional_topk_raw(
-                    query_feat,
-                    resident_feat,
-                    query_bias,
-                    resident_bias,
-                    int(query_tile),
-                    int(db_tile),
-                    int(kernel_k),
-                    float(dot_scale),
-                )
-                r_vals, r_idx = ext.fused_directional_topk_raw(
-                    resident_feat,
-                    query_feat,
-                    resident_bias,
-                    query_bias,
-                    int(query_tile),
-                    int(db_tile),
-                    int(kernel_k),
-                    float(dot_scale),
-                )
-                standalone_stats = ext.raw_lowrank_stats_only(
-                    query_feat,
-                    resident_feat,
-                    query_cost,
-                    resident_cost,
-                    query_dual,
-                    resident_dual,
-                    int(query_tile),
-                    int(db_tile),
-                    float(dot_scale),
-                )
-                stats = standalone_stats[certificate_indices]
-            else:
-                # CN: K<=8 由一次 pairwise traversal 同时返回双向 top-k 和 certificate。
-                # EN: For K<=8, one pairwise traversal returns bidirectional top-k and the certificate.
-                q_vals, q_idx, r_vals, r_idx, stats, _phase_ms = ext.fused_bidir_topk_stats_raw(
-                    query_feat,
-                    resident_feat,
-                    query_cost,
-                    resident_cost,
-                    query_bias,
-                    resident_bias,
-                    int(query_tile),
-                    int(db_tile),
-                    int(col_reduce_tile),
-                    int(kernel_k),
-                    True,
-                    bool(collect_linf_diagnostics),
-                    bool(collect_timing),
-                    int(col_kernel_id),
-                    float(dot_scale),
-                )
+            q_vals, q_idx, r_vals, r_idx, stats, _phase_ms = ext.fused_bidir_topk_stats_raw(
+                query_feat,
+                resident_feat,
+                query_cost,
+                resident_cost,
+                query_bias,
+                resident_bias,
+                int(query_tile),
+                int(db_tile),
+                int(col_reduce_tile),
+                int(kernel_k),
+                True,
+                bool(collect_linf_diagnostics),
+                False,
+                int(col_kernel_id),
+                float(dot_scale),
+            )
             # CN: query 侧 top-k 立即筛出正 dual-score 候选边并转回 CPU 保存。
             # EN: Query-side top-k candidates are filtered for positive dual score and copied back to CPU immediately.
             q_vals = q_vals[:, : int(k)].contiguous()
@@ -603,6 +451,8 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
         # EN: Diagnostics record scan results and tile selection; tile est_peak is a budget estimate, not a measured driver peak.
         diagnostics: Dict[str, Any] = {
             "dual_feasibility": float(dual_feas),
+            "kernel_backend": ext.last_backend,
+            "memory_estimate_scope": "active_geometry",
             "dual_feasibility_num_sq": float(num_sq),
             "dual_feasibility_den_sq": float(den_sq),
             "dual_feasibility_positive_count": int(positive_count),
@@ -617,8 +467,8 @@ def raw_lowrank_bidir_feasibility_pricing_scan(
             "fused_scan_topk": int(k),
             "fused_scan_topk_bucket": int(kernel_k),
             "fused_scan_col_kernel_id": int(col_kernel_id),
-            "pairwise_passes": 3 if use_decomposed_large_k else 1,
-            "scan_traversal": "decomposed_large_k_custom" if use_decomposed_large_k else "fused_one_pass_custom",
+            "pairwise_passes": 1,
+            "scan_traversal": "fused_one_pass_custom",
             "host_staging_mode": "bounded_double_buffer",
             "host_staging_rows": int(staging_rows),
             "host_staging_buffer_count": 2,

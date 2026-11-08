@@ -308,6 +308,8 @@ def _solve_impl_unscoped(problem: Problem | _PreparedOTProblem, config: _Algorit
         "coarsest_solver": "pot",
         "consume_input_features": bool(config.consume_input_features),
         "stopping_norm": str(config.stopping_norm),
+        "tolerance": float(config.lp_tolerance),
+        "dual_feasibility_tolerance": float(config.dual_feasibility_tolerance),
         "intermediate_stopping_norm": "l2",
         "finest_stopping_norm": finest_stopping_norm(config.stopping_norm),
         "cost_perturbation": raw.get("cost_perturbation", {"policy": "off", "activated": False}),

@@ -102,7 +102,7 @@ def _check_extension_sdist(source, workspace, name):
                     str(installed), str(wheel)], check=True)
     environment = dict(os.environ, PYTHONPATH=str(installed))
     code = f"import importlib, torch; m=importlib.import_module('{namespace}'); assert m.API_VERSION == 1; "
-    for module in (["_lp", "_scan"] if kind == "cpp" else ["pycupdlpx", "hierot_inner_product_scan_ext", "hierot_norm_cost_scan_ext", "_support_sparsifier_ext"]):
+    for module in (["_lp", "_scan"] if kind == "cpp" else ["pycupdlpx", "hierot_norm_cost_scan_ext", "_support_sparsifier_ext", *[f"hierot_generic_{part}_ext" for part in ("initial", "initial_small", "pricing", "pricing_small", "cost")]]):
         code += f"importlib.import_module('{namespace}.{module}'); "
     subprocess.run([sys.executable, "-c", code], cwd=workspace, env=environment, check=True)
     print(f"Independent extension sdist build/install passed: {name}")

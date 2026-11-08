@@ -71,8 +71,11 @@ class SolverOptions:
     cost_precision: CostPrecision = "fp32"
     gpu_resident: bool = False
     num_threads: Optional[int] = 16
+    tolerance: float = 1e-6
 
     def __post_init__(self) -> None:
+        if isinstance(self.tolerance, bool) or not math.isfinite(self.tolerance) or self.tolerance <= 0:
+            raise ValueError("tolerance must be finite and > 0")
         if not isinstance(self.gpu_resident, bool):
             raise ValueError("gpu_resident must be a boolean")
         if self.gpu_resident and (self.backend != "native" or self.torch_device == "cpu"):
@@ -137,6 +140,8 @@ class SolverOptions:
             cost_perturbation=self.cost_perturbation,
             cost_perturbation_relative_scale=self.cost_perturbation_relative_scale,
             cost_precision=self.cost_precision,
+            lp_tolerance=float(self.tolerance),
+            dual_feasibility_tolerance=float(self.tolerance),
         )
 
 

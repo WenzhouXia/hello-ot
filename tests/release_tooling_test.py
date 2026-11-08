@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,12 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_diagnostics_reports_all_native_extensions() -> None:
-    # CN: 诊断必须逐一报告四个扩展，缺失时也不能在收集阶段崩溃。
-    # EN: Diagnostics must report all four extensions without crashing when any are absent.
+    # CN: 诊断必须逐一报告全部扩展，缺失时也不能在收集阶段崩溃。
+    # EN: Diagnostics must report all required extensions without crashing when any are absent.
     report = collect_diagnostics()
     assert set(report["native_extensions"]) == {
-        "inner_product_scan",
-        "norm_cost_scan",
+        "sparse_pair_cost",
+        *{f"scan_{part}" for part in ("initial", "initial_small", "pricing", "pricing_small", "cost")},
         "support_sparsifier",
         "cupdlpx",
     }
@@ -41,6 +42,7 @@ def test_public_export_contains_release_entrypoints_and_valid_manifest(tmp_path:
     required = {
         "examples/quickstart.py",
         "examples/verify_native.py",
+        "docs/generic_scan.md",
         "scripts/create_hello_ot_env.sh",
         "scripts/install_native.sh",
         "scripts/install_jax_gpu.sh",
@@ -142,3 +144,178 @@ def test_layered_environment_installers_pin_compatible_stacks() -> None:
     assert 'ACTIVATE_DIR="$ENV_PREFIX/etc/conda/activate.d"' in jax
     assert 'LD_LIBRARY_PATH="$JAX_CUDNN_LIB' in jax
     assert "PYTORCH_CUDA_LIBS" in jax
+
+
+def test_readme_push_updates_only_docs_and_preserves_release_tag(tmp_path: Path) -> None:
+    """
+    CN: 用临时本地 Git 仓库验证文档快捷发布，检查范围、清单和已有 release tag。
+    EN: Verify fast README publishing using temporary local Git repositories, including scope, manifest and release tag.
+    """
+    script = ROOT / "export_hello_ot.sh"
+    if not script.is_file():
+        pytest.skip("publication orchestration is internal and excluded from public snapshots")
+
+    def git(directory, *args):
+        """
+        CN: 仅操作测试专用的本地仓库。
+        EN: Operate only on the local test repositories.
+        """
+        return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    public = tmp_path / "public"
+    subprocess.run(["git", "clone", str(remote), str(public)], check=True)
+    git(public, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(public, "config", "user.name", "Release test")
+    git(public, "config", "user.email", "release-test@example.invalid")
+    git(public, "config", "commit.gpgsign", "false")
+    git(public, "config", "tag.gpgsign", "false")
+    originals = {"README.md": "Old English\n", "README.zh-CN.md": "旧中文\n", "solver.py": "original runtime\n"}
+    for name, value in originals.items():
+        (public / name).write_text(value, encoding="utf-8")
+    (public / "PUBLIC_MANIFEST.sha256").write_text("".join(
+        f"{hashlib.sha256(value.encode()).hexdigest()}  {name}\n"
+        for name, value in sorted(originals.items())
+    ))
+    git(public, "add", "--", *originals, "PUBLIC_MANIFEST.sha256")
+    git(public, "commit", "-m", "test initial snapshot")
+    git(public, "tag", "v0.2.0")
+    git(public, "push", "origin", "main", "v0.2.0")
+    release_revision = git(remote, "rev-parse", "v0.2.0")
+
+    source = tmp_path / "source"
+    source.mkdir()
+    shutil.copy2(script, source / script.name)
+    (source / "scripts").mkdir()
+    shutil.copy2(ROOT / "scripts/install_backend.py", source / "scripts/install_backend.py")
+    shutil.copy2(ROOT / "pyproject.toml", source / "pyproject.toml")
+    (source / "README.md").write_text("New English\n")
+    (source / "README.zh-CN.md").write_text("新中文\n", encoding="utf-8")
+    (source / "solver.py").write_text("unrelated change\n")
+    environment = dict(os.environ, HELLO_OT_PUBLIC_REPO_DIR=str(public),
+                       HELLO_OT_REMOTE_URL=str(remote), HELLO_OT_REMOTE_NAME="origin",
+                       HELLO_OT_REMOTE_BRANCH="main", HELLO_OT_EXPORT_DIR=str(tmp_path / "unused-export"),
+                       HELLO_OT_ARTIFACT_DIR=str(tmp_path / "unused-artifacts"))
+    command = ["bash", str(source / script.name), "push-readme", "docs: test README update"]
+    subprocess.run(command, env=environment, check=True, capture_output=True, text=True)
+    assert set(git(public, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines()) == {
+        "README.md", "README.zh-CN.md", "PUBLIC_MANIFEST.sha256"}
+    assert (public / "solver.py").read_text() == originals["solver.py"]
+    for name in ("README.md", "README.zh-CN.md"):
+        assert (public / name).read_bytes() == (source / name).read_bytes()
+    for line in (public / "PUBLIC_MANIFEST.sha256").read_text().splitlines():
+        digest, name = line.split("  ", 1)
+        assert hashlib.sha256((public / name).read_bytes()).hexdigest() == digest
+    assert git(remote, "rev-parse", "v0.2.0") == release_revision
+    assert git(remote, "rev-parse", "main") == git(public, "rev-parse", "HEAD")
+    assert not (tmp_path / "unused-export").exists()
+    assert not (tmp_path / "unused-artifacts").exists()
+
+    (public / "solver.py").write_text("user work\n")
+    before = git(remote, "rev-parse", "main")
+    rejected = subprocess.run(command, env=environment, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "uncommitted changes" in rejected.stderr
+    assert (public / "solver.py").read_text() == "user work\n"
+    assert git(remote, "rev-parse", "main") == before
+
+
+@pytest.mark.parametrize("mode,version", [("new", "0.3.0"), ("new", "0.3.0rc1"),
+                                         ("release", "0.3.0"), ("tag", "0.3.0"),
+                                         ("api_error", "0.3.0"), ("stale", "0.3.0")])
+def test_versioned_publication_preserves_existing_releases(tmp_path, mode, version):
+    """
+    CN: 只用本地bare仓库和模拟gh验证新版本发布，已有版本、网络错误和旧快照在推送前停止。
+    EN: Use only a local bare repository and mocked gh to verify new releases and reject existing versions, network failures and stale snapshots before pushing.
+    """
+    import json
+
+    script = ROOT / "export_hello_ot.sh"
+    if not script.is_file():
+        pytest.skip("publication orchestration is internal and excluded from public snapshots")
+
+    def git(directory, *args):
+        """
+        CN: 仅操作测试专用的本地仓库。
+        EN: Operate only on test-owned local repositories.
+        """
+        return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
+
+    remote, public = tmp_path / "remote.git", tmp_path / "public"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    subprocess.run(["git", "clone", str(remote), str(public)], check=True)
+    git(public, "symbolic-ref", "HEAD", "refs/heads/main")
+    for key, value in (("user.name", "Release test"), ("user.email", "test@example.invalid"),
+                       ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
+        git(public, "config", key, value)
+    (public / "README.md").write_text("Previous release\n")
+    git(public, "add", "README.md")
+    git(public, "commit", "-m", "Previous release")
+    git(public, "tag", "v0.2.0")
+    git(public, "push", "origin", "main", "v0.2.0")
+    before = git(remote, "rev-parse", "main")
+    if mode == "tag":
+        git(public, "tag", f"v{version}")
+        git(public, "push", "origin", f"v{version}")
+
+    source, snapshot, artifacts = (tmp_path / name for name in ("source", "snapshot", "artifacts"))
+    for directory in (source, snapshot):
+        (directory / "scripts").mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/install_backend.py", directory / "scripts/install_backend.py")
+        selected = "0.2.0" if mode == "stale" and directory == snapshot else version
+        (directory / "pyproject.toml").write_text(f'[project]\nname = "hello-ot"\nversion = "{selected}"\n')
+    shutil.copy2(script, source / script.name)
+    (snapshot / "README.md").write_text("New release\n")
+    (snapshot / "PUBLIC_MANIFEST.sha256").write_text("".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(snapshot).as_posix()}\n"
+        for path in sorted(snapshot.rglob("*")) if path.is_file()))
+    artifacts.mkdir()
+    names = [f"hello_ot-{version}-py3-none-any.whl", f"hello_ot-{version}.tar.gz"]
+    for kind in ("native", "cpp"):
+        names += [f"hello_ot_{kind}-{version}-cp312-cp312-linux_x86_64.whl", f"hello_ot_{kind}-{version}.tar.gz"]
+    for name in names:
+        (artifacts / name).write_bytes(b"mock artifact\n")
+    (artifacts / "SHA256SUMS").write_text("".join(
+        f"{hashlib.sha256((artifacts / name).read_bytes()).hexdigest()}  {name}\n" for name in names))
+    (artifacts / "PUBLIC_SNAPSHOT.sha256").write_text(hashlib.sha256((snapshot / "PUBLIC_MANIFEST.sha256").read_bytes()).hexdigest()+"\n")
+    log, fake = tmp_path / "gh.jsonl", tmp_path / "gh"
+    fake.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+a=sys.argv[1:]
+with Path(os.environ["MOCK_GH_LOG"]).open("a") as f:f.write(json.dumps(a)+"\\n")
+if a[:2]==["auth","status"]:sys.exit(0)
+if a[0]=="api":
+    if os.environ["MOCK_GH_MODE"]=="api_error":sys.exit(1)
+    print("v0.2.0")
+    if os.environ["MOCK_GH_MODE"]=="release":print("v"+os.environ["MOCK_VERSION"])
+    sys.exit(0)
+if a[:2]==["release","create"]:
+    for p in a[3:a.index("--repo")]:assert Path(p).is_file(),p
+    sys.exit(0)
+raise SystemExit("Unexpected gh mutation: "+str(a))
+''')
+    fake.chmod(0o755)
+    environment = dict(os.environ, HELLO_OT_EXPORT_DIR=str(snapshot), HELLO_OT_ARTIFACT_DIR=str(artifacts),
+                       HELLO_OT_PUBLIC_REPO_DIR=str(public), HELLO_OT_REMOTE_URL=str(remote),
+                       HELLO_OT_REMOTE_NAME="origin", HELLO_OT_REMOTE_BRANCH="main",
+                       HELLO_OT_GH_COMMAND=str(fake), HELLO_OT_GITHUB_REPOSITORY="test/local",
+                       MOCK_GH_LOG=str(log), MOCK_GH_MODE=mode, MOCK_VERSION=version)
+    result = subprocess.run(["bash", str(source / script.name), "push", "Release test"],
+                            env=environment, capture_output=True, text=True)
+    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    assert git(remote, "rev-parse", "v0.2.0") == before
+    assert all(call[:2] != ["release", "delete"] for call in calls)
+    if mode == "new":
+        assert result.returncode == 0, result.stdout+result.stderr
+        create = next(call for call in calls if call[:2] == ["release", "create"])
+        assert create[2] == f"v{version}"
+        assert ("--prerelease" in create) == ("rc" in version)
+        assert create[create.index("--target")+1] == git(remote, "rev-parse", "main")
+        assert git(remote, "rev-parse", "main") != before
+    else:
+        assert result.returncode != 0
+        assert git(remote, "rev-parse", "main") == before
+        assert all(call[:2] != ["release", "create"] for call in calls)

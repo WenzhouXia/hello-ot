@@ -37,6 +37,7 @@ def solve_hello(
     cost_perturbation: str = "off",
     cost_perturbation_relative_scale: float = 0.01,
     hello_verbose: str = "off",
+    tolerance: float = 1e-6,
 ) -> LinearOTResult:
     """
     CN: 从 squared-L2 点云通过正式点云 API 运行 HELLO。
@@ -56,6 +57,7 @@ def solve_hello(
         cost_perturbation=cost_perturbation,
         cost_perturbation_relative_scale=cost_perturbation_relative_scale,
         hello_verbose=hello_verbose,
+        tolerance=tolerance,
     )
     return artifacts.result
 
@@ -75,6 +77,7 @@ def solve_hello_with_duals(
     cost_perturbation: str = "off",
     cost_perturbation_relative_scale: float = 0.01,
     hello_verbose: str = "off",
+    tolerance: float = 1e-6,
 ) -> HelloSolveArtifacts:
     """
     CN: 运行 HELLO，同时导出其最终 dual 供后续精确求解器 warm start。
@@ -90,6 +93,7 @@ def solve_hello_with_duals(
     if int(pricing_topk) != pricing_topk:
         raise ValueError("pricing_topk must be an integer")
     options = hello_ot.SolverOptions(
+        tolerance=float(tolerance),
         split_count=int(split_count), coarsest_size_threshold=int(coarsest_size_threshold),
         assignment_topk=int(assignment_topk), pricing_topk=int(pricing_topk),
         support_budget_factor=float(cleaning_threshold_factor),
@@ -111,7 +115,7 @@ def solve_hello_with_duals(
     coupling = result.solution.to_sparse_matrix()
     source_dual = np.ascontiguousarray(result.solution.source_dual, dtype=np.float64)
     target_dual = np.ascontiguousarray(result.solution.target_dual, dtype=np.float64)
-    converged, diag_metrics = _result_metrics(result, problem)
+    converged, diag_metrics = _result_metrics(result, problem, tolerance=tolerance)
     torch.cuda.synchronize()
     runtime_sec = float(time.perf_counter() - solve_t0)
     linear_result = LinearOTResult(
@@ -128,9 +132,9 @@ def solve_hello_with_duals(
             "split_count": int(split_count),
             "assignment_topk": int(assignment_topk),
             "pricing_topk": float(pricing_topk),
-            "dual_feasibility_tol": 1.0e-6,
+            "dual_feasibility_tol": float(tolerance),
             "cleaning_threshold_factor": float(cleaning_threshold_factor),
-            "tolerance": 1.0e-6,
+            "tolerance": float(tolerance),
             "max_inner_iter": int(max_inner_iter),
             "use_faiss_backend": False,
             "variable_bound_mode": "constant",
@@ -150,14 +154,14 @@ def solve_hello_with_duals(
 
 
 
-def _result_metrics(result, problem=None):
+def _result_metrics(result, problem=None, *, tolerance=1e-6):
     """
     CN: 缺失最终诊断时报错，不填造成功状态。
     EN: Reject missing final diagnostics instead of fabricating success.
     """
     levels = [level for level in result.solve_stage.levels if level.level_index == 0]
     if len(levels) == 1 and levels[0].kind == "coarsest" and problem is not None:
-        return _coarsest_metrics(result, problem)
+        return _coarsest_metrics(result, problem, tolerance=tolerance)
     if len(levels) != 1 or levels[0].kind != "refined" or not levels[0].solve.iterations:
         raise RuntimeError("Missing final HELLO refinement diagnostics")
     level = levels[0]
@@ -173,7 +177,7 @@ def _result_metrics(result, problem=None):
     }
 
 
-def _coarsest_metrics(result, problem):
+def _coarsest_metrics(result, problem, *, tolerance=1e-6):
     """
     CN: 单层精确解没有 refinement 记录，直接重算原问题 KKT。
     EN: A single-level exact solve has no refinement record; recompute its original KKT.
@@ -199,7 +203,7 @@ def _coarsest_metrics(result, problem):
             maximum = max(maximum, float(violation.max()))
     feasibility = num**0.5 / (1 + den**0.5)
     values = (primal, gap, feasibility, objective, dual, maximum, result.objective)
-    converged = bool(all(np.isfinite(t) for t in values) and max(primal, gap, feasibility) < 1e-6
+    converged = bool(all(np.isfinite(t) for t in values) and max(primal, gap, feasibility) < tolerance
                      and np.isfinite(plan.data).all() and np.all(plan.data >= -1e-10)
                      and abs(objective-result.objective) / max(1, abs(objective)) < 1e-6)
     return converged, {
