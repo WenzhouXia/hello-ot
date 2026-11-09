@@ -56,8 +56,7 @@ Raw FP64 scans consume FP64 coordinates and use cuBLAS DGEMM, preserving caller
 costs, general biases and score association. Native raw initial streaming and
 small-pricing wrappers share their implementations across both dot types.
 FP64 norm scratch planning includes eight bytes per base cost and sixteen bytes
-when the base and perturbed tiles coexist. Certified-pricing assignment bounds,
-cached-edge readout and original-final stage protections remain unchanged.
+when the base and perturbed tiles coexist.
 
 For perturbed norm scans, generate a bounded FP32 base-cost tile and add the
 established CUDA noise in FP64. Global source/target indices, seed, coefficient
