@@ -1,18 +1,97 @@
 from __future__ import annotations
 
 import inspect
+from copy import deepcopy
 import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
 
 import hello_ot
+import hello_ot.variants.unbalanced.correction as correction
+from hello_ot.variants.unbalanced.dual_atoms import DualAtomMixture
 from hello_ot.variants._validation import matrix, positive_mass, probability_mass
 from hello_ot.variants import (
     GromovIterationRecord,
     SemiDiscreteIterationRecord,
     UOTIterationRecord,
 )
+
+
+def test_uot_normalized_weight_gradient() -> None:
+    """
+    CN: 检查非单位总和和零权重边界上的链式梯度，以及退化变量保护。
+    EN: Check the chain-rule gradient at nonunit sums and zero-weight boundaries, plus degenerate-variable protection.
+    """
+    from scipy.optimize import check_grad
+    target = np.array([0.2, 0.3, 0.5])
+    objective = lambda w: (0.5 * np.dot(w - target, w - target), w - target)
+    for variables in (np.array([0.7, 0.2, 0.3]), np.array([0.0, 0.4, 0.3])):
+        wrapped = lambda z: correction._normalized_weight_objective(z, objective)
+        assert check_grad(lambda z: wrapped(z)[0], lambda z: wrapped(z)[1], variables) < 1e-7
+    value, gradient = correction._normalized_weight_objective(np.zeros(3), objective)
+    assert np.isfinite(value) and value > 1e50
+    np.testing.assert_array_equal(gradient, np.zeros(3))
+    assert "correction_solver" not in inspect.signature(hello_ot.solve_unbalanced).parameters
+
+
+def test_uot_lbfgsb_reaches_simplex_boundary() -> None:
+    """
+    CN: 从另一顶点出发，校正可达到含零权重的 simplex 边界最优解。
+    EN: Starting at another vertex, correction can attain a boundary optimum with zero weights.
+    """
+    target = np.array([0.2, 0.8, 0.0])
+    objective = lambda w: (0.5 * np.dot(w - target, w - target), w - target)
+    result = correction._minimize_atom_weights(objective, np.array([0., 0., 1.]),
+                                               max_iter=200, ftol=1e-12)
+    np.testing.assert_allclose(result.x, target, rtol=0., atol=1e-6)
+
+
+@pytest.mark.parametrize("seed", [2, 11])
+def test_uot_lbfgsb_correction_matches_legacy_objective(monkeypatch, seed) -> None:
+    """
+    CN: 两种校正在同一 atoms 上保持 simplex 可行性、dual 不下降及相近最优值。
+    EN: Both corrections preserve simplex feasibility, nondecreasing dual and comparable optima on the same atoms.
+    """
+    rng = np.random.default_rng(seed)
+    mixture = DualAtomMixture(rng.normal(size=(7, 4)), rng.normal(size=(8, 4)),
+                              np.array([0.4, 0.6, 0.0, 0.0]))
+    legacy = deepcopy(mixture)
+    arguments = (np.log(np.full(7, 1 / 7)), np.log(np.full(8, 1 / 8)), 1., 1., 1., 1.)
+
+    def dual(state):
+        return correction.compute_translated_dual_state(*state.current(), *arguments)["dual_objective"]
+
+    before = dual(mixture)
+    correction.fully_correct_atom_weights(mixture, *arguments)
+    with monkeypatch.context() as context:
+        context.setattr(correction, "_minimize_atom_weights", correction._minimize_atom_weights_slsqp)
+        correction.fully_correct_atom_weights(legacy, *arguments)
+    assert np.min(mixture.weights) >= 0.0
+    assert np.sum(mixture.weights) == pytest.approx(1.)
+    assert dual(mixture) >= before - 1e-12
+    assert dual(mixture) == pytest.approx(dual(legacy), abs=1e-8)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), 0.0])
+def test_uot_correction_rejects_invalid_optimizer_output(monkeypatch, invalid) -> None:
+    """
+    CN: 即使优化器报告成功，非法权重也必须回退到可行的线段初值。
+    EN: Even a reported optimizer success must fall back to feasible segment weights when its output is invalid.
+    """
+    from scipy.optimize import OptimizeResult
+    captured = []
+
+    def invalid_minimize(function, initial, **kwargs):
+        captured.append(initial.copy())
+        return OptimizeResult(x=np.full_like(initial, invalid), success=True, status=0, nit=0, nfev=1)
+
+    monkeypatch.setattr(correction, "minimize", invalid_minimize)
+    rng = np.random.default_rng(4)
+    mixture = DualAtomMixture(rng.normal(size=(5, 3)), rng.normal(size=(6, 3)), np.array([.5, .5, 0.]))
+    correction.fully_correct_atom_weights(mixture, np.log(np.full(5, .2)), np.log(np.full(6, 1 / 6)),
+                                         1., 1., 1., 1.)
+    np.testing.assert_allclose(mixture.weights, captured[0], rtol=0., atol=1e-14)
 
 
 def test_variants_public_surface() -> None:

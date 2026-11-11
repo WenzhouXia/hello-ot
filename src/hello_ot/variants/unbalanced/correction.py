@@ -1,13 +1,59 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
 
 from .dual_atoms import DualAtomMixture
 from .objective import compute_translated_dual_state
+
+
+def _normalized_weight_objective(
+    variables: np.ndarray,
+    objective: Callable[[np.ndarray], Tuple[float, np.ndarray]],
+) -> Tuple[float, np.ndarray]:
+    """
+    CN: 将非负变量归一化为 simplex 权重，并计算链式法则梯度。
+    EN: Normalize nonnegative variables to simplex weights and compute the chain-rule gradient.
+    """
+    total = float(np.sum(variables))
+    if not np.isfinite(total) or total <= 0.0:
+        return 1e100, np.zeros_like(variables)
+    weights = variables / total
+    value, gradient = objective(weights)
+    return value, (gradient - np.dot(gradient, weights)) / total
+
+
+def _minimize_atom_weights_slsqp(objective, initial_weights, *, max_iter, ftol):
+    """
+    CN: 保留旧 SLSQP 实现供内部数值回归，不增加公开求解器选项。
+    EN: Retain the legacy SLSQP implementation for internal regression without a public solver option.
+    """
+    return minimize(
+        objective, initial_weights, method="SLSQP", jac=True,
+        bounds=[(0.0, 1.0)] * len(initial_weights),
+        constraints={"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0),
+                     "jac": lambda w: np.ones_like(w)},
+        options={"maxiter": int(max_iter), "ftol": float(ftol), "disp": False},
+    )
+
+
+def _minimize_atom_weights(objective, initial_weights, *, max_iter, ftol):
+    """
+    CN: L-BFGS-B 优化同一 simplex 问题，允许精确的零权重。
+    EN: Optimize the same simplex problem with L-BFGS-B, allowing exact zero weights.
+    """
+    result = minimize(
+        lambda z: _normalized_weight_objective(z, objective), initial_weights,
+        method="L-BFGS-B", jac=True, bounds=[(0.0, 1.0)] * len(initial_weights),
+        options={"maxiter": int(max_iter), "ftol": float(ftol), "gtol": float(ftol)},
+    )
+    total = float(np.sum(result.x))
+    if np.isfinite(result.x).all() and total > 0.0:
+        result.x = result.x / total
+    return result
 
 
 def _directional_derivative(
@@ -127,8 +173,8 @@ def fully_correct_atom_weights(
     ftol: float = 1e-12,
 ) -> Dict[str, Any]:
     """
-    CN: 对 DualAtomMixture 中的所有 atoms 求解概率单纯形上的非线性凹规划，完成完全矫正。
-    EN: Fully correct atom weights by solving a concave maximization over the probability simplex.
+    CN: 用 L-BFGS-B 对所有 atoms 的 simplex 权重完成完全矫正。
+    EN: Fully correct all atoms' simplex weights using L-BFGS-B.
     """
     k = mixture.atom_count
     if k <= 1:
@@ -168,8 +214,8 @@ def fully_correct_atom_weights(
     initial_weights[:-1] = (1.0 - alpha_opt) * old_normalized
     initial_weights[-1] = alpha_opt
 
-    # CN: 2. SLSQP 单纯形完全矫正
-    # EN: 2. SLSQP fully corrective optimization on probability simplex
+    # CN: 2. L-BFGS-B 单纯形完全矫正
+    # EN: 2. L-BFGS-B fully corrective optimization on probability simplex
     source_atoms = mixture.source_atoms
     target_atoms = mixture.target_atoms
 
@@ -193,36 +239,22 @@ def fully_correct_atom_weights(
         return -float(state["dual_objective"]), -grad
 
     t0 = time.perf_counter()
-    opt_result = minimize(
+    opt_result = _minimize_atom_weights(
         objective_and_gradient,
         initial_weights,
-        method="SLSQP",
-        jac=True,
-        bounds=[(0.0, 1.0)] * k,
-        constraints={
-            "type": "eq",
-            "fun": lambda w: float(np.sum(w) - 1.0),
-            "jac": lambda w: np.ones_like(w),
-        },
-        options={
-            "maxiter": int(max_iter),
-            "ftol": float(ftol),
-            "disp": False,
-        },
+        max_iter=max_iter,
+        ftol=ftol,
     )
     wall_time = float(time.perf_counter() - t0)
 
-    if opt_result.success or opt_result.status == 0:
-        mixture.weights = np.asarray(opt_result.x, dtype=np.float64)
-    else:
-        # CN: 若 SLSQP 未收敛但未恶化，保留较优权重
-        # EN: If SLSQP fails to report success, keep the better of initial vs current
-        f_init = objective_and_gradient(initial_weights)[0]
-        f_curr = objective_and_gradient(opt_result.x)[0]
-        if f_curr <= f_init:
-            mixture.weights = np.asarray(opt_result.x, dtype=np.float64)
-        else:
-            mixture.weights = initial_weights
+    # CN: 仅接受有限、可行且不恶化的权重；异常退出时保留线段搜索初值。
+    # EN: Accept only finite, feasible, nonworsening weights; otherwise retain the segment-search initialization.
+    candidate = np.asarray(opt_result.x, dtype=np.float64)
+    valid = (np.isfinite(candidate).all() and np.all(candidate >= 0.0)
+             and np.isclose(candidate.sum(), 1.0, rtol=0.0, atol=1e-10))
+    f_init = objective_and_gradient(initial_weights)[0]
+    f_curr = objective_and_gradient(candidate)[0] if valid else float("inf")
+    mixture.weights = candidate if np.isfinite(f_curr) and f_curr <= f_init else initial_weights
 
     mixture.normalize_weights()
     return {
